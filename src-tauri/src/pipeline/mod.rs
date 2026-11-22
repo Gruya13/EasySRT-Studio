@@ -214,86 +214,89 @@ async fn run_project_llm_stage(
     );
 
     let mut llama_guard = None;
-    let endpoint = match provider {
-        TranslationProviderKind::LocalLlama => {
-            let llama_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::LlamaBin)?;
-            let llm_model = setup_manager::resolve_active_llm_model_path(app)?;
-            emit_job_progress(
-                app,
-                &job_id,
-                phase,
-                5.0,
-                "Starting local llama-server...",
-            );
-            let guard = llama_server::LlamaServerGuard::start(
-                &llama_bin,
-                &llm_model,
-                config.translation.context_window,
-                cancel_flag,
-            )
-            .await?;
-            let ep = LlmEndpointConfig {
-                base_url: guard.base_url().to_string(),
-                model: "local-llm".to_string(),
-                api_key: None,
-                batch_size: config.translation.batch_size,
-            };
-            llama_guard = Some(guard);
-            ep
-        }
-        TranslationProviderKind::DeepSeek => {
-            let api_key = storage::get_api_key(app, TranslationProviderKind::DeepSeek)?
-                .map(|k| k.trim().to_string())
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "DeepSeek API key is not configured. Please add your key in Settings -> Cloud API."
-                    )
-                })?;
-            let model = if config.translation.deepseek_model.trim().is_empty() {
-                "deepseek-chat".to_string()
-            } else {
-                config.translation.deepseek_model.trim().to_string()
-            };
-            LlmEndpointConfig {
-                base_url: "https://api.deepseek.com/v1".to_string(),
-                model,
-                api_key: Some(api_key),
-                batch_size: config.translation.batch_size,
+    let op_res: Result<()> = async {
+        let endpoint = match provider {
+            TranslationProviderKind::LocalLlama => {
+                let llama_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::LlamaBin)?;
+                let llm_model = setup_manager::resolve_active_llm_model_path(app)?;
+                emit_job_progress(
+                    app,
+                    &job_id,
+                    phase,
+                    5.0,
+                    "Starting local llama-server...",
+                );
+                let guard = llama_server::LlamaServerGuard::start(
+                    &llama_bin,
+                    &llm_model,
+                    config.translation.context_window,
+                    cancel_flag,
+                )
+                .await?;
+                let ep = LlmEndpointConfig {
+                    base_url: guard.base_url().to_string(),
+                    model: "local-llm".to_string(),
+                    api_key: None,
+                    batch_size: config.translation.batch_size,
+                };
+                llama_guard = Some(guard);
+                ep
             }
-        }
-        TranslationProviderKind::CustomOpenAi => {
-            let api_key = storage::get_api_key(app, TranslationProviderKind::CustomOpenAi)?;
-            let base_url = config.translation.custom_base_url.trim().to_string();
-            if base_url.is_empty() {
-                return Err(anyhow!(
-                    "Custom OpenAI-compatible base URL is not configured in Settings."
-                ));
+            TranslationProviderKind::DeepSeek => {
+                let api_key = storage::get_api_key(app, TranslationProviderKind::DeepSeek)?
+                    .map(|k| k.trim().to_string())
+                    .filter(|k| !k.is_empty())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "DeepSeek API key is not configured. Please add your key in Settings -> Cloud API."
+                        )
+                    })?;
+                let model = if config.translation.deepseek_model.trim().is_empty() {
+                    "deepseek-chat".to_string()
+                } else {
+                    config.translation.deepseek_model.trim().to_string()
+                };
+                LlmEndpointConfig {
+                    base_url: "https://api.deepseek.com/v1".to_string(),
+                    model,
+                    api_key: Some(api_key),
+                    batch_size: config.translation.batch_size,
+                }
             }
-            let model = if config.translation.custom_model.trim().is_empty() {
-                "default".to_string()
-            } else {
-                config.translation.custom_model.trim().to_string()
-            };
-            LlmEndpointConfig {
-                base_url,
-                model,
-                api_key,
-                batch_size: config.translation.batch_size,
+            TranslationProviderKind::CustomOpenAi => {
+                let api_key = storage::get_api_key(app, TranslationProviderKind::CustomOpenAi)?;
+                let base_url = config.translation.custom_base_url.trim().to_string();
+                if base_url.is_empty() {
+                    return Err(anyhow!(
+                        "Custom OpenAI-compatible base URL is not configured in Settings."
+                    ));
+                }
+                let model = if config.translation.custom_model.trim().is_empty() {
+                    "default".to_string()
+                } else {
+                    config.translation.custom_model.trim().to_string()
+                };
+                LlmEndpointConfig {
+                    base_url,
+                    model,
+                    api_key,
+                    batch_size: config.translation.batch_size,
+                }
             }
-        }
-    };
+        };
 
-    let op_res = translator::run_batch_operation(
-        project,
-        operation,
-        &endpoint,
-        cancel_flag,
-        |proj| storage::save_checkpoint(app, proj),
-        |pct, detail| {
-            emit_job_progress(app, &job_id, phase, pct, detail);
-        },
-    )
+        translator::run_batch_operation(
+            project,
+            operation,
+            &endpoint,
+            cancel_flag,
+            |proj| storage::save_checkpoint(app, proj),
+            |pct, detail| {
+                emit_job_progress(app, &job_id, phase, pct, detail);
+            },
+        )
+        .await
+    }
     .await;
 
     // Guarantee local llama-server is stopped immediately after batch operation completes

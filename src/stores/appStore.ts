@@ -1125,6 +1125,16 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               syncProjectIntoQueueAndState(project);
             } catch (err) {
               const msg = err instanceof Error ? err.message : String(err);
+              const recovered = await loadCheckpoint(item.jobId).catch(
+                () => null,
+              );
+              if (recovered && recovered.cues.length > 0) {
+                syncProjectIntoQueueAndState({
+                  ...recovered,
+                  phase: "failed",
+                  errorMessage: msg,
+                });
+              }
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
@@ -1175,6 +1185,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           syncProjectIntoQueueAndState(translated);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
+          syncProjectIntoQueueAndState({
+            ...projectWithUpdatedOptions,
+            phase: "failed",
+            errorMessage: msg,
+          });
           set({
             banner: {
               type: "error",
@@ -1206,6 +1221,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           syncProjectIntoQueueAndState(polished);
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
+          syncProjectIntoQueueAndState({
+            ...projectWithUpdatedOptions,
+            phase: "failed",
+            errorMessage: msg,
+          });
           set({
             banner: {
               type: "error",
