@@ -5,12 +5,13 @@
 
 use anyhow::{Context, Result};
 use easysrt_studio_lib::models::{
-    ExportFormat, ExportOptions, JobOptions, JobPhase, SegmentRules, SerbianScript, SubtitleProject,
-    TranslationProviderKind,
+    ExportFormat, ExportOptions, JobOptions, JobPhase, SegmentRules, SerbianScript, StorageMode,
+    StoragePaths, SubtitleProject, TranslationProviderKind,
 };
 use easysrt_studio_lib::pipeline::{
     exporter, ffmpeg, llama_server, segmenter, sr_script, translator, whisper,
 };
+use easysrt_studio_lib::storage;
 use serde::Serialize;
 use std::collections::BTreeMap;
 use std::fs;
@@ -79,6 +80,49 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&checkpoints_dir)?;
     fs::create_dir_all(&temp_dir)?;
 
+    let args: Vec<String> = std::env::args().collect();
+    let use_deepseek = args.iter().any(|a| a == "--provider=deepseek")
+        || args.windows(2).any(|w| w == ["--provider", "deepseek"])
+        || std::env::var("BENCH_PROVIDER").is_ok_and(|v| v.eq_ignore_ascii_case("deepseek"));
+
+    let storage_paths = StoragePaths {
+        mode: StorageMode::Installed,
+        root_dir: app_data.to_string_lossy().to_string(),
+        bin_dir: app_data.join("bin").to_string_lossy().to_string(),
+        models_dir: app_data.join("models").to_string_lossy().to_string(),
+        data_dir: app_data.join("data").to_string_lossy().to_string(),
+        config_path: app_data.join("config.json").to_string_lossy().to_string(),
+    };
+
+    if let Ok(env_key) = std::env::var("DEEPSEEK_API_KEY") {
+        let trimmed = env_key.trim();
+        if !trimmed.is_empty() {
+            let key_status = storage::set_api_key_for_paths(
+                &storage_paths,
+                TranslationProviderKind::DeepSeek,
+                trimmed,
+                false,
+            )?;
+            println!(
+                "Persisted DeepSeek API key via '{}' backend (hasDeepSeekKey={})",
+                key_status.storage_backend, key_status.has_deep_seek_key
+            );
+        }
+    }
+
+    let deepseek_api_key = if use_deepseek {
+        let loaded = storage::get_api_key_for_paths(
+            &storage_paths,
+            TranslationProviderKind::DeepSeek,
+            false,
+        )?
+        .filter(|k| !k.trim().is_empty())
+        .context("DeepSeek API key not found in credential store or DEEPSEEK_API_KEY")?;
+        Some(loaded)
+    } else {
+        None
+    };
+
     let mut mp3_files: Vec<PathBuf> = fs::read_dir(&samples_dir)?
         .filter_map(|e| e.ok().map(|entry| entry.path()))
         .filter(|p| {
@@ -94,7 +138,8 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "Running EasySRT Studio benchmark on {} files from {}\n",
+        "Running EasySRT Studio benchmark (provider={}) on {} files from {}\n",
+        if use_deepseek { "deepseek" } else { "localLlama" },
         mp3_files.len(),
         samples_dir.display()
     );
@@ -114,7 +159,11 @@ async fn main() -> Result<()> {
             .and_then(|s| s.to_str())
             .unwrap_or("sample")
             .to_string();
-        let job_id = format!("bench-{stem}");
+        let job_id = if use_deepseek {
+            format!("bench-deepseek-{stem}")
+        } else {
+            format!("bench-{stem}")
+        };
         let temp_wav = temp_dir.join(format!("{job_id}.16k.wav"));
 
         let total_t0 = Instant::now();
@@ -170,7 +219,11 @@ async fn main() -> Result<()> {
                 segment_rules: rules,
                 glossary: glossary.clone(),
                 polish_serbian: true,
-                provider_override: Some(TranslationProviderKind::LocalLlama),
+                provider_override: Some(if use_deepseek {
+                    TranslationProviderKind::DeepSeek
+                } else {
+                    TranslationProviderKind::LocalLlama
+                }),
             },
             words: whisper_out.words,
             cues,
@@ -192,18 +245,36 @@ async fn main() -> Result<()> {
         }
         .to_string();
 
-        // 4. Local llama-server start + batch translate/polish + stop
+        // 4. LLM endpoint setup (local llama-server OR DeepSeek API) + batch translate/polish
         let llama_t0 = Instant::now();
-        let mut guard =
-            llama_server::LlamaServerGuard::start(&llama_bin, &llm_model, 2048, &cancel_flag)
-                .await?;
-        let llama_start_ms = llama_t0.elapsed().as_millis();
-
-        let endpoint = translator::LlmEndpointConfig {
-            base_url: guard.base_url().to_string(),
-            model: "local-llm".to_string(),
-            api_key: None,
-            batch_size: 25,
+        let mut llama_guard = None;
+        let (llama_start_ms, endpoint) = if let Some(api_key) = deepseek_api_key.as_ref() {
+            (
+                0u128,
+                translator::LlmEndpointConfig {
+                    base_url: "https://api.deepseek.com/v1".to_string(),
+                    model: "deepseek-chat".to_string(),
+                    api_key: Some(api_key.clone()),
+                    batch_size: 25,
+                },
+            )
+        } else {
+            let guard = llama_server::LlamaServerGuard::start(
+                &llama_bin,
+                &llm_model,
+                2048,
+                &cancel_flag,
+            )
+            .await?;
+            let start_ms = llama_t0.elapsed().as_millis();
+            let ep = translator::LlmEndpointConfig {
+                base_url: guard.base_url().to_string(),
+                model: "local-llm".to_string(),
+                api_key: None,
+                batch_size: 25,
+            };
+            llama_guard = Some(guard);
+            (start_ms, ep)
         };
 
         let infer_t0 = Instant::now();
@@ -223,7 +294,9 @@ async fn main() -> Result<()> {
         )
         .await?;
         let llm_infer_ms = infer_t0.elapsed().as_millis();
-        guard.stop();
+        if let Some(mut guard) = llama_guard.take() {
+            guard.stop();
+        }
         let llama_total_ms = llama_t0.elapsed().as_millis();
 
         project.phase = JobPhase::Completed;
@@ -314,7 +387,11 @@ async fn main() -> Result<()> {
         });
     }
 
-    let report_path = Path::new("/tmp/voice_samples_benchmark_report.json");
+    let report_path = if use_deepseek {
+        Path::new("/tmp/voice_samples_deepseek_report.json")
+    } else {
+        Path::new("/tmp/voice_samples_benchmark_report.json")
+    };
     fs::write(report_path, serde_json::to_string_pretty(&results)?)?;
     println!("\nSaved full JSON benchmark report to {}", report_path.display());
 
