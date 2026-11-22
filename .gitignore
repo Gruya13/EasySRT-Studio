@@ -1,0 +1,33 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+dist-ssr/
+
+# Rust / Tauri build artifacts
+target/
+src-tauri/target/
+src-tauri/gen/
+
+# Local runtime / portable test data
+portable.flag
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Environment & secrets
+.env
+.env.local
+.env.*.local
+*.key
+*.pem
+
+# Editor & OS files
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
