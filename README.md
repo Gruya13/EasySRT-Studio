@@ -1,4 +1,4 @@
-# EasySRT Studio
+# EasySRT Studio (v0.1.1)
 
 **EasySRT Studio** je profesionalni *offline-first* desktop studio za automatsku transkripciju audio i video fajlova, pametnu segmentaciju titlova, prevođenje i jezičko poliranje na srpski jezik (ekavski standard, **latinica** i **ćirilica**), uvoz postojećih `.srt`/`.vtt` titlova i višestruki izvoz (`.srt`, `.vtt`, `.txt`).
 
@@ -10,20 +10,21 @@ Detaljan tehnički opis sistema nalazi se u dokumentu [`docs/ARCHITECTURE.md`](d
 
 ## Ključne funkcionalnosti
 
-- **3 Pametna režima rada jednim klikom (Workflow Presets)**:
+- **3 Pametna režima rada i dvofazni lokalni batch (v0.1.1)**:
   - **⚡ Hibridni Turbo (`GPU + DeepSeek`)**: Lokalni Whisper na GPU + brzi DeepSeek Cloud prevod uz **protočni (*pipelined*) batch engine** koji preklapa transkripciju fajla `N+1` sa prevodom fajla `N`.
-  - **🔒 100% Offline (`Lokalni AI`)**: Potpuna privatnost bez interneta (Whisper + lokalni `Gemma 3 4B` / `Gemma 4` / `Qwen 3` GGUF model uz automatsko prilagođavanje 4 GB VRAM grafičkim karticama).
+  - **🔒 100% Offline (`Lokalni AI` + Dvofazni batch `run_local_llm_batch`)**: Potpuna privatnost bez interneta. Pri obradi više fajlova u offline režimu, **Faza 1** transkribuje sve fajlove uz potpuno oslobađanje VRAM-a nakon svakog fajla, a **Faza 2** pokreće `llama-server` **samo jednom** za ceo batch i obrađuje sve checkpoint-e nad toplim kešom modela.
   - **🎙️ Samo Transkripcija (`Bez LLM-a`)**: Ultra-brz Whisper ASR sa Silero VAD filtriranjem i direktnim izvozom izvornih titlova.
 - **100% Offline AI Pipeline (NVIDIA CUDA / Vulkan / CPU)**:
   - **FFmpeg** automatska normalizacija bilo kog audio/video fajla (`.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.mp4`, `.mkv`, `.webm`) u `16 kHz mono PCM WAV`.
-  - **whisper.cpp (`whisper-cli`) + Silero VAD v6.2.0**: Precizna transkripcija na nivou pojedinačnih reči (`-ojf`), ograničenje niti na fizička jezgra (`-bs 1 -bo 1 -nf -fa`), eliminacija halucinacija u tišini i podrška za korisnički rečnik pojmova (`--prompt`).
+  - **whisper.cpp (`whisper-cli`) + Silero VAD v6.2.0 + Runtime Pre-Flight Probe**: Precizna transkripcija na nivou pojedinačnih reči (`-ojf`), ograničenje niti na fizička jezgra (`-bs 1 -bo 1 -nf -fa`), eliminacija halucinacija u tišini, podrška za pojmovnik (`--prompt`), kao i `probe_whisper_binary_runnable()` pre-flight provera koja automatski prelazi na CPU fallback ukoliko GPU binarni fajl nema potrebne deljene biblioteke (npr. `libvulkan.so.1`).
   - **Sekvencijalno upravljanje VRAM memorijom i 4 GB Auto-Fit**: `whisper-cli` se u potpunosti gasi i oslobađa 100% GPU VRAM-a pre nego što se pokrene `llama-server` (`-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0` uz automatski CPU fallback ako zatreba), čime se omogućava rad vrhunskih modela čak i na laptop grafičkim karticama sa **4 GB VRAM-a** (npr. RTX 3050).
 - **Pametna segmentacija i profili titlova**:
   - **Standard (TV / Film)**: do 2 linije, maks. 42 karaktera po liniji, trajanje 1.0s – 7.0s, maks. 17.0 CPS (*Characters Per Second*), uz penalizaciju preloma iza veznika i kratkih funkcionalnih reči.
   - **Reels / TikTok / Shorts**: 1 kratka dinamična linija, maks. 20 karaktera, trajanje 0.6s – 3.5s, maks. 18.0 CPS.
   - **Custom**: Potpuna kontrola nad brojem linija, dužinom reda, minimalnim/maksimalnim trajanjem i CPS pragom, uz trenutno preračunavanje bez ponovne transkripcije.
-- **ID-zaključano kontekstualno prevođenje, CPS budžet i poliranje srpskog jezika**:
+- **ID-zaključano kontekstualno prevođenje, dvokolonska ispravka ASR-a i CPS budžet**:
   - Prevođenje u paketima (`batch_size = 25`) sa klizećim kontekstualnim prozorom (**3 prethodna + N ciljnih + 3 naredna titla**), per-cue `max_chars` budžetom čitljivosti, strogom `json_schema` validacijom za lokalne modele i automatskom rekurzivnom podelom paketa (*sub-batch retry*) koja garantuje 1:1 očuvanje ID-jeva i vremenskih oznaka.
+  - **Dvokolonska ispravka izvornog ASR-a (`Ispravi izvorni ASR` / `correctSourceAsr`)**: Kada je uključena tokom prevoda, LLM u istom prolazu (`{"source": "...", "text": "..."}`) ispravlja očigledne fonetske/homofone greške Whisper transkripcije direktno u izvornom tekstu (npr. *"Aesip"* → *"Aesop"*) pre upisivanja i prevoda.
   - **Lokalni LLM (`llama-server`)** ili **Cloud OpenAI-kompatibilni API (DeepSeek / Custom)** sa eksplicitnom zaštitom privatnosti (`OnlineConfirmModal`).
   - **1-Klik „Sažmi preduge (CPS)" (*Auto-Fit CPS*)**: Kada titlovi prekorače maksimalni CPS ili dužinu linije (`high_cps` / `line_too_long`), ciljani prolaz automatski skraćuje isključivo problematične titlove uz očuvanje smisla i konteksta.
   - **Poliranje srpskog ASR izlaza i deterministički Ekavski normalizator**: Automatska ispravka grešaka prepoznavanja govora, interpunkcije i determinističko uklanjanje zaostalih ijekavskih oblika (*mlijeko → mleko*, *grijati → grejati*, *posjetite → posetite*, *prijevod → prevod* itd.) pre konverzije pisma.
@@ -31,11 +32,12 @@ Detaljan tehnički opis sistema nalazi se u dokumentu [`docs/ARCHITECTURE.md`](d
   - Trenutna konverzija jednim klikom uz pravilno kapitalizovanje digrafa (`Љубав` ↔ `Ljubav`, `ЉУБАВ` ↔ `LJUBAV`, `Његош` ↔ `Njegoš`, `Џеп` ↔ `Džep`).
   - Rečnik morfoloških izuzetaka na granicama prefiksa (`injekcija` → `инјекција`, `konjugacija` → `конјугација`, `nadživeti` → `надживети`, `podžanr` → `поджанр`, `Tanjug` → `Танјуг`) i očuvanje HTML/ASS tagova (`<i>`, `{\an8}`), URL adresa i `[...]` oznaka.
 - **Direktan uvoz `.SRT` i `.VTT` titlova**:
-  - Prevucite postojeći `.srt` ili `.vtt` fajl (ili kliknite na **„Uvezi .SRT / .VTT"**) za direktno prevođenje, lekturu, preslovljavanje u ćirilicu/latinicu, pretragu i zamenu ili izvoz.
-- **Interaktivni Studio Editor**:
-  - Tabelarni prikaz sa inline izmenom izvornog i prevedenog teksta, CPS bedževima, upozorenjima (`high_cps`, `line_too_long`, `duration_too_short`, `duration_too_long`) i dugmetom **„Sažmi preduge (CPS)"** za automatsko skraćivanje isključivo problematičnih titlova.
-  - **Audio plejer po segmentu**: Preslušavanje tačnog isečka `[startMs, endMs]` sa automatskim zaustavljanjem i finim pomeranjem vremena (`-0.1s` / `+0.1s`).
-  - **Pretraga i zamena (`Ctrl+H`)**, **Undo / Redo (`Ctrl+Z` / `Ctrl+Y`)**, deljenje i spajanje titlova.
+  - Prevucite postojeći `.srt` ili `.vtt` fajl u panel fajlova za direktno prevođenje, lekturu, preslovljavanje u ćirilicu/latinicu, uređivanje na timeline-u ili izvoz.
+- **Redizajnirani Studio UI (v0.1.1)**:
+  - **Prilagođena gornja traka (`TopBar`)**: Prikaz verzije `v0.1.1`, drag-region i nativne kontrole prozora (`Minimize`, `Maximize/Restore`, `Close`).
+  - **Gornji studio red (`FilesPanel` + `SettingsPanel`)**: Levo je panel **„Ubačeni fajlovi“** sa drag-and-drop podrškom, statusom obrade i batch kontrolama; desno je **6-tabni panel podešavanja** (`Obrada`, `Titlovi`, `Modeli`, `Cloud API`, `Izvoz`, `Opšte`) sa `OFFLINE` / `ONLINE` indikatorom.
+  - **Srednji red — Dvostruke kartice za uređivanje (`DualEditorBand`)**: `Original transcript` (indigo) i `Prevod` (smaragdna kartica) sa brojačem znakova/CPS-a, `Ctrl+S` čuvanjem, poništavanjem izmena i brzim AI akcijama (`Prevedi`, `Poliraj`, `Sažmi CPS`).
+  - **Donji red — 3-kanalni interaktivni Waveform Timeline (`WaveformTimeline`)**: HiDPI `<canvas>` talasni oblik (`MP3`), sinhronizovane trake `Original transcript` i `Prevod`, klik/dvoklik za uređivanje, povlačenje ivica za trimovanje vremena (`startMs`/`endMs`), pomeranje playhead-a, `Mute`/`Visibility`/`Lock` kontrole po traci, zumiranje (`100%–300%`) i **Undo / Redo (`Ctrl+Z` / `Ctrl+Y`)**.
   - **Atomični checkpoint-i**: Svaka faza i svaki prevedeni paket se automatski čuvaju u `data/checkpoints/<job_id>.easysrt.json` za siguran nastavak prekinutih poslova.
 
 ---
@@ -155,8 +157,8 @@ cargo check --all-targets
 # Pokretanje kompletne unit i End-to-End test suite-e
 cargo test
 
-# Statika analiza koda (Clippy)
-cargo clippy --all-targets
+# Statika analiza koda (Clippy sa nulom tolerancije za upozorenja)
+cargo clippy --all-targets -- -D warnings
 
 # Kompajliranje produkcijskog binarnog fajla
 cargo build --release
@@ -180,7 +182,7 @@ Pre objavljivanja potpisanog izdanja:
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: lozinka postavljena pri generisanju ključa
 4. **Objavite novu verziju**:
    ```bash
-   git tag v0.1.0
-   git push origin v0.1.0
+   git tag v0.1.1
+   git push origin v0.1.1
    ```
-   GitHub Actions workflow (`.github/workflows/release.yml`) će automatski izvršiti `npm test` i `cargo test`, izgraditi i potpisati Windows NSIS instaler, Windows Portable ZIP (`EasySRT-Studio-windows-x64-portable.zip`) i Linux AppImage, i direktno objaviti `latest.json` (`releaseDraft: false`).
+   GitHub Actions workflow (`.github/workflows/release.yml`) će automatski izvršiti `npm test` i `cargo test`, izgraditi i potpisati Windows NSIS instaler, Windows Portable ZIP (`EasySRT-Studio-windows-x64-portable.zip`), Linux AppImage i Linux Vulkan `whisper-cli` paket (`whisper-bin-ubuntu-vulkan-x64.tar.gz`, kompajliran iz `whisper.cpp` `b5907` sa `-DGGML_VULKAN=ON`), i direktno objaviti `latest.json` (`releaseDraft: false`).

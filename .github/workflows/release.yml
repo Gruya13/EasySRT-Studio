@@ -140,3 +140,83 @@ jobs:
         with:
           name: EasySRT-Studio-windows-x64-portable
           path: EasySRT-Studio-windows-x64-portable.zip
+
+      - name: Build Linux Vulkan whisper-cli tarball
+        if: matrix.platform == 'ubuntu-22.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libvulkan-dev cmake build-essential
+          if apt-cache show glslc >/dev/null 2>&1; then
+            sudo apt-get install -y glslc
+          else
+            # Ubuntu 22.04 lacks the glslc apt package; install glslc from the official LunarG SDK tarball
+            curl -fsSL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz
+            mkdir -p /tmp/vulkan-sdk
+            tar -xf /tmp/vulkan-sdk.tar.xz -C /tmp/vulkan-sdk --strip-components=1
+            GLSLC_DIR="$(dirname "$(find /tmp/vulkan-sdk -type f -name glslc | head -n 1)")"
+            export PATH="$GLSLC_DIR:$PATH"
+          fi
+
+          GLSLC_BIN="$(command -v glslc)"
+          test -n "$GLSLC_BIN"
+
+          rm -rf /tmp/whisper-cpp-src /tmp/whisper-cpp-build whisper-bin-ubuntu-vulkan-x64
+          git clone --depth 1 --branch b5907 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-cpp-src
+          cmake -S /tmp/whisper-cpp-src -B /tmp/whisper-cpp-build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DBUILD_SHARED_LIBS=OFF \
+            -DGGML_VULKAN=ON \
+            -DVulkan_GLSLC_EXECUTABLE="$GLSLC_BIN" \
+            -DWHISPER_BUILD_TESTS=OFF \
+            -DWHISPER_BUILD_EXAMPLES=ON
+          cmake --build /tmp/whisper-cpp-build --target whisper-cli -j"$(nproc)"
+
+          mkdir -p whisper-bin-ubuntu-vulkan-x64
+          WHISPER_CLI_PATH="$(find /tmp/whisper-cpp-build -type f -name 'whisper-cli' | head -n 1)"
+          test -n "$WHISPER_CLI_PATH"
+          cp "$WHISPER_CLI_PATH" whisper-bin-ubuntu-vulkan-x64/whisper-cli
+          find /tmp/whisper-cpp-build -name '*.so*' -exec cp -P {} whisper-bin-ubuntu-vulkan-x64/ \; || true
+          patchelf --set-rpath '$ORIGIN' whisper-bin-ubuntu-vulkan-x64/whisper-cli || true
+          chmod +x whisper-bin-ubuntu-vulkan-x64/whisper-cli
+
+          tar -czf whisper-bin-ubuntu-vulkan-x64.tar.gz whisper-bin-ubuntu-vulkan-x64
+          sha256sum whisper-bin-ubuntu-vulkan-x64.tar.gz > whisper-bin-ubuntu-vulkan-x64.tar.gz.sha256
+          rm -rf /tmp/whisper-cpp-src /tmp/whisper-cpp-build /tmp/vulkan-sdk /tmp/vulkan-sdk.tar.xz whisper-bin-ubuntu-vulkan-x64
+
+      - name: Upload Linux Vulkan whisper-cli tarball to GitHub Release
+        if: matrix.platform == 'ubuntu-22.04' && steps.tauri-build.outputs.releaseUploadUrl != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.tauri-build.outputs.releaseId }}
+          UPLOAD_URL: ${{ steps.tauri-build.outputs.releaseUploadUrl }}
+        run: |
+          ASSET_NAME="whisper-bin-ubuntu-vulkan-x64.tar.gz"
+          BASE_UPLOAD_URL="${UPLOAD_URL%\{*}"
+          if [ -n "$RELEASE_ID" ]; then
+            EXISTING_URL=$(curl -fsSL \
+              -H "Authorization: Bearer $GITHUB_TOKEN" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/releases/$RELEASE_ID/assets" \
+              | node -e "const fs = require('fs'); const data = JSON.parse(fs.readFileSync(0, 'utf8')); const match = data.find(a => a.name === '$ASSET_NAME'); if (match) process.stdout.write(match.url);")
+            if [ -n "$EXISTING_URL" ]; then
+              curl -fsSL -X DELETE \
+                -H "Authorization: Bearer $GITHUB_TOKEN" \
+                -H "Accept: application/vnd.github+json" \
+                "$EXISTING_URL"
+            fi
+          fi
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GITHUB_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "Content-Type: application/gzip" \
+            --data-binary "@$ASSET_NAME" \
+            "${BASE_UPLOAD_URL}?name=$ASSET_NAME"
+
+      - name: Upload Linux Vulkan whisper-cli workflow artifact
+        if: matrix.platform == 'ubuntu-22.04'
+        uses: actions/upload-artifact@v4
+        with:
+          name: whisper-bin-ubuntu-vulkan-x64
+          path: |
+            whisper-bin-ubuntu-vulkan-x64.tar.gz
+            whisper-bin-ubuntu-vulkan-x64.tar.gz.sha256

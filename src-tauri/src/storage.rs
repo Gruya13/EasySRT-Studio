@@ -445,17 +445,18 @@ pub fn set_api_key_for_paths(
 
     let cred_path = credentials_file_path(paths);
 
-    if paths.mode != StorageMode::Portable && !force_file_fallback {
-        if try_keyring_set(user, trimmed).is_ok() {
-            // If fallback file also had an entry, clean it up so keyring is authoritative
-            if cred_path.is_file() {
-                let mut creds = read_credentials_file(&cred_path);
-                if creds.entries.remove(user).is_some() {
-                    let _ = write_credentials_file(&cred_path, &creds);
-                }
+    if paths.mode != StorageMode::Portable
+        && !force_file_fallback
+        && try_keyring_set(user, trimmed).is_ok()
+    {
+        // If fallback file also had an entry, clean it up so keyring is authoritative
+        if cred_path.is_file() {
+            let mut creds = read_credentials_file(&cred_path);
+            if creds.entries.remove(user).is_some() {
+                let _ = write_credentials_file(&cred_path, &creds);
             }
-            return get_api_key_status_for_paths(paths, force_file_fallback);
         }
+        return get_api_key_status_for_paths(paths, force_file_fallback);
     }
 
     let mut creds = read_credentials_file(&cred_path);

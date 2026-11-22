@@ -163,6 +163,7 @@ export interface JobOptions {
   segmentRules: SegmentRules;
   glossary: Record<string, string>;
   polishSerbian: boolean;
+  correctSourceAsr?: boolean;
   providerOverride: TranslationProviderKind | null;
 }
 

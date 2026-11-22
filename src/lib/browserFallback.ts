@@ -277,24 +277,30 @@ let mockApiKeyStatus: ApiKeyStatus = {
 const downloadListeners = new Set<(event: DownloadProgressEvent) => void>();
 const jobListeners = new Set<(event: JobProgressEvent) => void>();
 
-function createDemoProject(
+export function createDemoProject(
   audioPath = "C:/Media/Podcast_Ep14_AI_Production.mp3",
   options?: JobOptions,
   jobId = "demo-session-01",
 ): SubtitleProject {
-  const effectiveOptions: JobOptions = options ?? {
-    sourceLanguage: "en",
-    targetLanguage: "sr",
-    script: mockConfig.defaultScript,
-    segmentRules: mockConfig.defaultSegmentRules,
-    glossary: {
-      "EasySRT Studio": "EasySRT Studio",
-      "whisper.cpp": "whisper.cpp",
-      "NVIDIA RTX": "NVIDIA RTX",
-    },
-    polishSerbian: true,
-    providerOverride: null,
-  };
+  const effectiveOptions: JobOptions = options
+    ? {
+        ...options,
+        correctSourceAsr: options.correctSourceAsr ?? false,
+      }
+    : {
+        sourceLanguage: "en",
+        targetLanguage: "sr",
+        script: mockConfig.defaultScript,
+        segmentRules: mockConfig.defaultSegmentRules,
+        glossary: {
+          "EasySRT Studio": "EasySRT Studio",
+          "whisper.cpp": "whisper.cpp",
+          "NVIDIA RTX": "NVIDIA RTX",
+        },
+        polishSerbian: true,
+        correctSourceAsr: false,
+        providerOverride: null,
+      };
 
   const rawCues: Array<Omit<SubtitleCue, "cps" | "warnings">> = [
     {
@@ -302,36 +308,52 @@ function createDemoProject(
       startMs: 400,
       endMs: 3900,
       sourceText:
-        "Welcome back to the studio! Today we are testing offline subtitle generation.",
+        "Welcome back to the studio! Today we test offline subtitles.",
       translatedText:
-        "Dobro došli nazad u studio!\nDanas testiramo offline generisanje titlova.",
+        "Dobro došli nazad u studio! Danas testiramo offline titlove.",
     },
     {
       id: 2,
       startMs: 4200,
       endMs: 8100,
       sourceText:
-        "With whisper.cpp and local CUDA acceleration, transcription runs directly on your NVIDIA RTX card.",
+        "With whisper.cpp and CUDA, transcription runs on NVIDIA RTX.",
       translatedText:
-        "Uz whisper.cpp i lokalno CUDA ubrzanje,\ntranskripcija radi direktno na NVIDIA RTX kartici.",
+        "Uz whisper.cpp i CUDA ubrzanje, radi na NVIDIA RTX kartici.",
     },
     {
       id: 3,
       startMs: 8400,
-      endMs: 10300,
-      sourceText:
-        "This segment has a deliberately fast reading speed so you can inspect the CPS warning indicator in the editor.",
-      translatedText:
-        "Ovaj segment namerno ima veoma brz govor kako biste videli CPS indikator upozorenja u tabeli titlova.",
+      endMs: 10500,
+      sourceText: "Fast speech segment for CPS check.",
+      translatedText: "Brz govor za proveru CPS indikatora.",
     },
     {
       id: 4,
-      startMs: 10700,
+      startMs: 10900,
       endMs: 14900,
       sourceText:
-        "You can switch between Serbian Latin and Cyrillic scripts with a single click at any moment.",
+        "Switch between Serbian Latin and Cyrillic with a single click.",
       translatedText:
-        "Možete prebacivati između srpske latinice\ni ćirilice jednim klikom u svakom trenutku.",
+        "Menjajte latinicu i ćirilicu jednim klikom u svakom trenutku.",
+    },
+    {
+      id: 5,
+      startMs: 15300,
+      endMs: 19400,
+      sourceText:
+        "Custom glossary terms like Njegoš and Tanjug stay accurate.",
+      translatedText:
+        "Pojmovi poput Njegoš i Tanjug ostaju tačni pri promeni pisma.",
+    },
+    {
+      id: 6,
+      startMs: 19800,
+      endMs: 23500,
+      sourceText:
+        "Export clean SRT, VTT, or plain text ready for editing.",
+      translatedText:
+        "Izvezite čist SRT, VTT ili tekst spreman za montažu.",
     },
   ];
 
@@ -359,7 +381,7 @@ function createDemoProject(
     jobId,
     audioPath,
     audioFileName: fileName,
-    durationMs: 15500,
+    durationMs: 24000,
     detectedLanguage:
       effectiveOptions.sourceLanguage === "auto"
         ? "en"
@@ -573,11 +595,17 @@ export const browserFallback = {
         }),
       );
     }
-    const project = createDemoProject(
-      audioPath,
-      { ...options, targetLanguage: "none" },
-      id,
-    );
+    const baseProject = createDemoProject(audioPath, options, id);
+    const project: SubtitleProject = {
+      ...baseProject,
+      options: {
+        ...baseProject.options,
+        ...options,
+      },
+      cues: baseProject.cues.map((cue) =>
+        recalculateCue({ ...cue, translatedText: "" }, options.segmentRules),
+      ),
+    };
     mockCheckpoints = [
       project,
       ...mockCheckpoints.filter((c) => c.jobId !== id),
@@ -762,6 +790,90 @@ export const browserFallback = {
       ...mockCheckpoints.filter((c) => c.jobId !== id),
     ];
     return project;
+  },
+
+  async runLocalLlmBatch(
+    projects: SubtitleProject[],
+  ): Promise<SubtitleProject[]> {
+    const results: SubtitleProject[] = [];
+    for (let i = 0; i < projects.length; i++) {
+      const p = projects[i];
+      const rawSrc =
+        p.detectedLanguage && p.detectedLanguage !== "auto"
+          ? p.detectedLanguage
+          : p.options.sourceLanguage;
+      const srcLang = rawSrc.trim().toLowerCase();
+      const dstLang = p.options.targetLanguage.trim().toLowerCase();
+      const isSameSerbian =
+        (srcLang === "sr" || srcLang === "hr" || srcLang === "bs") &&
+        dstLang === "sr";
+      const needsTranslate =
+        Boolean(dstLang) &&
+        dstLang !== "none" &&
+        srcLang !== dstLang &&
+        !isSameSerbian;
+      const needsPolish =
+        !needsTranslate &&
+        p.options.polishSerbian &&
+        (srcLang === "sr" ||
+          srcLang === "hr" ||
+          srcLang === "bs" ||
+          dstLang === "sr");
+
+      let updated: SubtitleProject;
+      if (needsTranslate) {
+        jobListeners.forEach((fn) =>
+          fn({
+            jobId: p.jobId,
+            phase: "translating",
+            percent: 15,
+            detail: `Local LLM batch (${i + 1}/${projects.length})`,
+          }),
+        );
+        updated = await this.translateProject(p);
+      } else if (needsPolish || p.phase === "polishing") {
+        jobListeners.forEach((fn) =>
+          fn({
+            jobId: p.jobId,
+            phase: "polishing",
+            percent: 15,
+            detail: `Local LLM batch polish (${i + 1}/${projects.length})`,
+          }),
+        );
+        updated = await this.polishProject(p);
+      } else if (p.phase === "translating") {
+        jobListeners.forEach((fn) =>
+          fn({
+            jobId: p.jobId,
+            phase: "translating",
+            percent: 15,
+            detail: `Local LLM batch (${i + 1}/${projects.length})`,
+          }),
+        );
+        updated = await this.translateProject(p);
+      } else {
+        updated = {
+          ...p,
+          phase: "completed",
+          updatedAt: new Date().toISOString(),
+        };
+      }
+
+      jobListeners.forEach((fn) =>
+        fn({
+          jobId: updated.jobId,
+          phase: "completed",
+          percent: 100,
+          detail: "Batch LLM stage completed",
+        }),
+      );
+      mockCheckpoints = [
+        updated,
+        ...mockCheckpoints.filter((c) => c.jobId !== updated.jobId),
+      ];
+      results.push(updated);
+    }
+    return results;
   },
 
   async cancelJob(_jobId: string): Promise<void> {

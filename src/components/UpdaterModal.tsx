@@ -130,7 +130,7 @@ export function UpdaterModal() {
         <div className="space-y-4 p-5 text-xs">
           <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/70 px-3.5 py-2.5">
             <span className="text-slate-400">{t.updater.currentVersion}</span>
-            <span className="font-mono font-bold text-emerald-300">v0.1.0</span>
+            <span className="font-mono font-bold text-emerald-300">v0.1.1</span>
           </div>
 
           {!updateObj && checkedOnce && !errorMessage && (

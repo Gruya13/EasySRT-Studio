@@ -1,9 +1,11 @@
 import { create } from "zustand";
 import { normalizeUiLanguage, type UiLanguage } from "../i18n";
+import { createDemoProject } from "../lib/browserFallback";
 import {
   calculateCueMetrics,
   convertSerbianScriptText,
   getPresetSegmentRules,
+  isTauriRuntime,
   parseSubtitleFileText,
   recalculateCue,
 } from "../lib/subtitleUtils";
@@ -30,6 +32,7 @@ import {
   polishProject,
   resegmentProject,
   runFullPipeline,
+  runLocalLlmBatch,
   saveConfig,
   setApiKey,
   transcribeAudio,
@@ -132,6 +135,7 @@ const DEFAULT_JOB_OPTIONS: JobOptions = {
   segmentRules: DEFAULT_SEGMENT_RULES,
   glossary: {},
   polishSerbian: true,
+  correctSourceAsr: false,
   providerOverride: null,
 };
 
@@ -461,6 +465,52 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         const shouldShowSetup =
           !config.hasCompletedSetup && !setupStatus.readyForOffline;
 
+        const stateBeforeInit = get();
+        let nextActiveProject = stateBeforeInit.activeProject;
+        let nextActiveJobId = stateBeforeInit.activeJobId;
+        let nextActiveCueId = stateBeforeInit.activeCueId;
+        let nextBatchQueue = stateBeforeInit.batchQueue;
+
+        if (nextActiveProject === null) {
+          const seededProject =
+            checkpoints.length > 0
+              ? checkpoints[0]
+              : createDemoProject("C:/Media/Podcast_Ep14_AI_Production.mp3", {
+                  ...jobOptions,
+                  sourceLanguage: "en",
+                  targetLanguage: "sr",
+                  glossary: {
+                    "EasySRT Studio": "EasySRT Studio",
+                    "whisper.cpp": "whisper.cpp",
+                    "NVIDIA RTX": "NVIDIA RTX",
+                  },
+                });
+          nextActiveProject = seededProject;
+          nextActiveJobId = seededProject.jobId;
+          nextActiveCueId = seededProject.cues.some((c) => c.id === 2)
+            ? 2
+            : (seededProject.cues[0]?.id ?? null);
+        }
+
+        if (
+          nextBatchQueue.length === 0 &&
+          nextActiveProject !== null &&
+          (!isTauriRuntime() || checkpoints.length === 0)
+        ) {
+          nextBatchQueue = [
+            {
+              jobId: nextActiveProject.jobId,
+              audioPath: nextActiveProject.audioPath,
+              audioFileName: nextActiveProject.audioFileName,
+              phase: nextActiveProject.phase,
+              percent: nextActiveProject.phase === "completed" ? 100 : 0,
+              detail: nextActiveProject.phase,
+              project: nextActiveProject,
+              errorMessage: nextActiveProject.errorMessage,
+            },
+          ];
+        }
+
         set({
           initialized: true,
           setupStatus,
@@ -470,6 +520,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           checkpoints,
           jobOptions,
           isSetupOpen: shouldShowSetup,
+          activeProject: nextActiveProject,
+          activeJobId: nextActiveJobId,
+          activeCueId: nextActiveCueId,
+          batchQueue: nextBatchQueue,
         });
       } catch (err) {
         set({
@@ -983,11 +1037,18 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!item) {
         return;
       }
-      resetUndoHistory();
+      const isSameJob = get().activeJobId === jobId;
+      if (!isSameJob) {
+        resetUndoHistory();
+      }
       set({
         activeJobId: jobId,
         activeProject: item.project ?? get().activeProject,
-        activeCueId: null,
+        activeCueId: isSameJob
+          ? get().activeCueId
+          : item.project
+            ? (item.project.cues[0]?.id ?? null)
+            : get().activeCueId,
       });
     },
 
@@ -997,9 +1058,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         resetUndoHistory();
         syncProjectIntoQueueAndState(project);
         set({
-          jobOptions: { ...project.options },
+          jobOptions: {
+            ...DEFAULT_JOB_OPTIONS,
+            ...project.options,
+            correctSourceAsr: Boolean(project.options.correctSourceAsr),
+          },
           isCheckpointsOpen: false,
-          activeCueId: null,
+          activeCueId: project.cues[0]?.id ?? null,
         });
       } catch (err) {
         set({
@@ -1069,10 +1134,28 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           let queue = get().batchQueue;
           if (queue.length === 0 && get().activeProject) {
             const active = get().activeProject!;
-            get().enqueueAudioFiles([active.audioPath]);
-            queue = get().batchQueue;
+            if (!(isTauriRuntime() && active.jobId === "demo-session-01")) {
+              get().enqueueAudioFiles([active.audioPath]);
+              queue = get().batchQueue;
+            }
           }
-          if (queue.length === 0) {
+
+          const pendingItems = queue.filter(
+            (item) =>
+              item.phase === "queued" ||
+              item.phase === "failed" ||
+              item.phase === "cancelled",
+          );
+          const runnable =
+            pendingItems.length > 0
+              ? pendingItems
+              : queue.filter(
+                  (item) =>
+                    item.phase === "completed" &&
+                    !(isTauriRuntime() && item.jobId === "demo-session-01"),
+                );
+
+          if (runnable.length === 0) {
             set({
               banner: {
                 type: "info",
@@ -1087,14 +1170,6 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
           set({ isRunningBatch: true });
 
-          const runnable = queue.filter(
-            (item) =>
-              item.phase === "queued" ||
-              item.phase === "failed" ||
-              item.phase === "cancelled" ||
-              item.phase === "completed",
-          );
-
           const effectiveProvider =
             get().jobOptions.providerOverride ??
             get().config.translation.provider;
@@ -1103,6 +1178,75 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             runnable.length > 1 &&
             (effectiveProvider === "deepSeek" ||
               effectiveProvider === "customOpenAi");
+          const canPipelineLocal =
+            mode === "full" &&
+            runnable.length > 1 &&
+            effectiveProvider === "localLlama";
+
+          const handleJobError = async (
+            jobId: string,
+            audioFileName: string,
+            err: unknown,
+            fallbackProject?: SubtitleProject,
+          ) => {
+            const msg = err instanceof Error ? err.message : String(err);
+            const recovered =
+              fallbackProject ??
+              (await loadCheckpoint(jobId).catch(() => null));
+            if (recovered && recovered.cues.length > 0) {
+              syncProjectIntoQueueAndState({
+                ...recovered,
+                phase: "failed",
+                errorMessage: msg,
+              });
+            }
+            set((s) => ({
+              batchQueue: s.batchQueue.map((q) =>
+                q.jobId === jobId
+                  ? {
+                      ...q,
+                      phase: "failed",
+                      errorMessage: msg,
+                    }
+                  : q,
+              ),
+              banner: {
+                type: "error",
+                message: `${audioFileName}: ${msg}`,
+              },
+            }));
+          };
+
+          const classifyLlmStage = (
+            project: SubtitleProject,
+            options: JobOptions,
+          ): "translating" | "polishing" | null => {
+            const rawSrc =
+              project.detectedLanguage && project.detectedLanguage !== "auto"
+                ? project.detectedLanguage
+                : options.sourceLanguage;
+            const srcLang = rawSrc.trim().toLowerCase();
+            const dstLang = options.targetLanguage.trim().toLowerCase();
+            const isSameSerbian =
+              (srcLang === "sr" || srcLang === "hr" || srcLang === "bs") &&
+              dstLang === "sr";
+
+            if (
+              Boolean(dstLang) &&
+              dstLang !== "none" &&
+              srcLang !== dstLang &&
+              !isSameSerbian
+            ) {
+              return "translating";
+            }
+            if (
+              (srcLang === "sr" || srcLang === "hr" || srcLang === "bs") &&
+              options.polishSerbian
+            ) {
+              return "polishing";
+            }
+            return null;
+          };
 
           if (canPipelineCloud) {
             // Pipeline GPU Whisper transcription (sequential on GPU) with
@@ -1133,22 +1277,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                 );
                 syncProjectIntoQueueAndState(transcribed);
 
-                const srcLang = (
-                  transcribed.detectedLanguage ??
-                  currentOptions.sourceLanguage
-                ).toLowerCase();
-                const dstLang = currentOptions.targetLanguage.toLowerCase();
-                const needsTranslate =
-                  dstLang !== "none" && srcLang !== dstLang;
-                const needsPolish =
-                  !needsTranslate &&
-                  (srcLang === "sr" || srcLang === "hr" || srcLang === "bs") &&
-                  currentOptions.polishSerbian;
-
-                if (needsTranslate || needsPolish) {
-                  const stagePhase = needsTranslate
-                    ? "translating"
-                    : "polishing";
+                const stagePhase = classifyLlmStage(
+                  transcribed,
+                  currentOptions,
+                );
+                if (stagePhase) {
                   set((s) => ({
                     batchQueue: s.batchQueue.map((q) =>
                       q.jobId === item.jobId
@@ -1168,73 +1301,129 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
                   const cloudTask = (async () => {
                     try {
-                      const finished = needsTranslate
-                        ? await translateProject(projectForLlm)
-                        : await polishProject(projectForLlm);
+                      const finished =
+                        stagePhase === "translating"
+                          ? await translateProject(projectForLlm)
+                          : await polishProject(projectForLlm);
                       syncProjectIntoQueueAndState(finished);
                     } catch (err) {
-                      const msg =
-                        err instanceof Error ? err.message : String(err);
-                      const recovered = await loadCheckpoint(item.jobId).catch(
-                        () => null,
+                      await handleJobError(
+                        item.jobId,
+                        item.audioFileName,
+                        err,
                       );
-                      if (recovered && recovered.cues.length > 0) {
-                        syncProjectIntoQueueAndState({
-                          ...recovered,
-                          phase: "failed",
-                          errorMessage: msg,
-                        });
-                      }
-                      set((s) => ({
-                        batchQueue: s.batchQueue.map((q) =>
-                          q.jobId === item.jobId
-                            ? {
-                                ...q,
-                                phase: "failed",
-                                errorMessage: msg,
-                              }
-                            : q,
-                        ),
-                        banner: {
-                          type: "error",
-                          message: `${item.audioFileName}: ${msg}`,
-                        },
-                      }));
                     }
                   })();
                   pendingCloudTasks.push(cloudTask);
                 }
               } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                const recovered = await loadCheckpoint(item.jobId).catch(
-                  () => null,
-                );
-                if (recovered && recovered.cues.length > 0) {
-                  syncProjectIntoQueueAndState({
-                    ...recovered,
-                    phase: "failed",
-                    errorMessage: msg,
-                  });
-                }
-                set((s) => ({
-                  batchQueue: s.batchQueue.map((q) =>
-                    q.jobId === item.jobId
-                      ? {
-                          ...q,
-                          phase: "failed",
-                          errorMessage: msg,
-                        }
-                      : q,
-                  ),
-                  banner: {
-                    type: "error",
-                    message: `${item.audioFileName}: ${msg}`,
-                  },
-                }));
+                await handleJobError(item.jobId, item.audioFileName, err);
               }
             }
 
             await Promise.all(pendingCloudTasks);
+          } else if (canPipelineLocal) {
+            // Two-Phase Local Offline Batch:
+            // Phase 1: Transcribe all files sequentially while Whisper owns GPU VRAM.
+            // Phase 2: Translate/polish all qualifying projects in a single warm llama-server session.
+            const transcribedEntries: Array<{
+              project: SubtitleProject;
+              options: JobOptions;
+            }> = [];
+
+            for (const item of runnable) {
+              const currentOptions = { ...get().jobOptions };
+              set((s) => ({
+                activeJobId: item.jobId,
+                batchQueue: s.batchQueue.map((q) =>
+                  q.jobId === item.jobId
+                    ? {
+                        ...q,
+                        phase: "convertingAudio",
+                        percent: 5,
+                        errorMessage: null,
+                      }
+                    : q,
+                ),
+              }));
+
+              try {
+                const transcribed = await transcribeAudio(
+                  item.audioPath,
+                  currentOptions,
+                  item.jobId,
+                );
+                const normalizedTranscribed: SubtitleProject = {
+                  ...transcribed,
+                  options: {
+                    ...currentOptions,
+                    segmentRules: transcribed.options.segmentRules,
+                  },
+                };
+                syncProjectIntoQueueAndState(normalizedTranscribed);
+                transcribedEntries.push({
+                  project: normalizedTranscribed,
+                  options: currentOptions,
+                });
+              } catch (err) {
+                await handleJobError(item.jobId, item.audioFileName, err);
+              }
+            }
+
+            const projectsForLlm: SubtitleProject[] = [];
+            const llmStageByJobId = new Map<
+              string,
+              "translating" | "polishing"
+            >();
+
+            for (const { project, options: itemOptions } of transcribedEntries) {
+              const stagePhase = classifyLlmStage(project, itemOptions);
+              if (stagePhase) {
+                llmStageByJobId.set(project.jobId, stagePhase);
+                projectsForLlm.push({
+                  ...project,
+                  phase: stagePhase,
+                });
+              }
+            }
+
+            if (projectsForLlm.length > 0) {
+              set((s) => ({
+                batchQueue: s.batchQueue.map((q) => {
+                  const stagePhase = llmStageByJobId.get(q.jobId);
+                  return stagePhase
+                    ? {
+                        ...q,
+                        phase: stagePhase,
+                        percent: 55,
+                      }
+                    : q;
+                }),
+              }));
+
+              try {
+                const finishedProjects = await runLocalLlmBatch(projectsForLlm);
+                for (const proj of finishedProjects) {
+                  syncProjectIntoQueueAndState(proj);
+                }
+              } catch (err) {
+                for (const proj of projectsForLlm) {
+                  const recovered = await loadCheckpoint(proj.jobId).catch(
+                    () => null,
+                  );
+                  if (recovered && recovered.phase === "completed") {
+                    syncProjectIntoQueueAndState(recovered);
+                  } else {
+                    await handleJobError(
+                      proj.jobId,
+                      proj.audioFileName,
+                      err,
+                      recovered && recovered.cues.length > 0 ? recovered : proj,
+                    );
+                  }
+                }
+              }
+            }
           } else {
             for (const item of runnable) {
               const currentOptions = { ...get().jobOptions };
@@ -1267,32 +1456,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                       );
                 syncProjectIntoQueueAndState(project);
               } catch (err) {
-                const msg = err instanceof Error ? err.message : String(err);
-                const recovered = await loadCheckpoint(item.jobId).catch(
-                  () => null,
-                );
-                if (recovered && recovered.cues.length > 0) {
-                  syncProjectIntoQueueAndState({
-                    ...recovered,
-                    phase: "failed",
-                    errorMessage: msg,
-                  });
-                }
-                set((s) => ({
-                  batchQueue: s.batchQueue.map((q) =>
-                    q.jobId === item.jobId
-                      ? {
-                          ...q,
-                          phase: "failed",
-                          errorMessage: msg,
-                        }
-                      : q,
-                  ),
-                  banner: {
-                    type: "error",
-                    message: `${item.audioFileName}: ${msg}`,
-                  },
-                }));
+                await handleJobError(item.jobId, item.audioFileName, err);
               }
             }
           }

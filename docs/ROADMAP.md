@@ -75,31 +75,26 @@ Spot inspection across the generated `.sr.srt` tracks revealed clear behavioral 
 3. **Keyed `json_schema` Constrained Decoding (`pipeline::translator`)**: Upgraded `PromptCueItem` responses on `llama-server` to strict keyed `json_schema` (`{"1": "...", "2": "..."}`, `additionalProperties: false`) and `batch_size = 25` (`context_window = 2048`), eliminating dropped-ID recursive subdivision retries on 4B models.
 4. **Dangling Function-Word Segmentation Penalty (`pipeline::segmenter`)**: Penalized subtitle splits immediately after short connectors, prepositions, and conjunctions (*and, of, the, to, da, je, su, u, na, i, a, za*) for cleaner phrasing.
 5. **Expanded Deterministic Ekavian Normalizer (`pipeline::sr_script`)**: Added 140+ exact words and prefix stems (`grijati→grejati`, `vidjel→videl`, `posjet→poset`, `cvjet→cvet`, `potjer→poter`, `prijevod→prevod`, `savjet→savet`, `izvješt→izvešt`, etc.) applied post-LLM prior to Cyrillic transliteration, while guarding valid Ekavian words (`sjedinjenje`, `Sjedinjene`).
-6. **Per-Cue `max_chars` CPS Budget & 1-Click "Auto-Fit CPS" (`CondenseCps`)**: Embedded calculated `max_chars` limits inside LLM payloads and wired the `condense_project_cps` backend command + `"Sažmi preduge (CPS)" / "Auto-Fit CPS"` button in `SubtitleTable.tsx` (skips compliant batches and rewrites only offending cues).
+6. **Per-Cue `max_chars` CPS Budget & 1-Click "Auto-Fit CPS" (`CondenseCps`)**: Embedded calculated `max_chars` limits inside LLM payloads and wired the `condense_project_cps` backend command + `"Sažmi preduge (CPS)" / "Auto-Fit CPS"` controls (skips compliant batches and rewrites only offending cues).
 7. **Pipelined Cloud Batch Engine (`appStore`, `voice_samples_benchmark.rs`)**: Overlaps sequential GPU Whisper transcription of queued file `i + 1` with asynchronous DeepSeek/CustomOpenAI translation of file `i`.
-8. **3 Smart Workflow Presets (`JobWorkspace.tsx`)**: Added single-click mode switching between **Hybrid Turbo (GPU + DeepSeek)**, **100% Offline (Local AI)**, and **Transcribe Only (No LLM)**.
+8. **3 Smart Workflow Presets (`Obrada` / `Cloud API` settings)**: Single-click mode switching between **Hybrid Turbo (GPU + DeepSeek)**, **100% Offline (Local AI)**, and **Transcribe Only (No LLM)**.
+9. **Two-Phase Local Offline Batch (`v0.1.1`, `pipeline::run_local_llm_batch`, `appStore`)**: When running multi-file offline `LocalLlama` batches (`runnable.length > 1`), **Phase 1** transcribes all queued files sequentially via `whisper-cli` (freeing 100% GPU VRAM after every file and saving checkpoints), and **Phase 2** starts `LlamaServerGuard` **once**, runs translation/Serbian polishing sequentially across all transcribed projects against the single warm server, and stops `llama-server` once at the end (even on error) — eliminating ~`3.6 s × (N - 1)` of redundant model reload overhead.
+10. **Dual-Column Source ASR Correction (`v0.1.1`, `JobOptions.correct_source_asr`, `pipeline::translator`)**: Single-pass structured translation mode (`{"1": {"source": "...", "text": "..."}}` with strict `json_schema` on local `llama-server`) that fixes obvious Whisper phonetic/homophone errors (e.g., *"Aesip"* → *"Aesop"*) directly in `cue.source_text` (re-wrapped with balanced lines) alongside `cue.translated_text`, improving both preview accuracy and dual `.source.srt` exports.
+11. **Linux Vulkan `whisper-cli` CI Build & Runtime Fallback Probe (`v0.1.1`, `.github/workflows/release.yml`, `pipeline::whisper`)**: Added a Linux (`ubuntu-22.04`) CI build step compiling `whisper.cpp` `b5907` with `-DGGML_VULKAN=ON` into `whisper-bin-ubuntu-vulkan-x64.tar.gz`, and implemented `probe_whisper_binary_runnable()` (`whisper-cli --help` via `configure_command_env`) with shared-library failure diagnostics and automatic fallback to a runnable CPU binary when Vulkan/CUDA runtime libraries are missing.
+12. **Redesigned Studio UI v0.1.1 (`TopBar`, `FilesPanel`, `SettingsPanel`, `DualEditorBand`, `WaveformTimeline`)**: Borderless ambient-glow studio workspace featuring custom window controls (`core:window:allow-*` capabilities), Top-Left queue panel (`Ubačeni fajlovi`), Top-Right 6-tab settings (`Obrada`, `Titlovi`, `Modeli`, `Cloud API`, `Izvoz`, `Opšte`), Dual Editor Cards (`Original transcript` indigo glow & `Prevod` emerald glow), and an interactive 3-Track Waveform Timeline (`MP3` canvas waveform, `Original transcript` & `Prevod` cue blocks with draggable trim handles, zoom 100%–300%, and playhead scrubbing).
 
 ---
 
 ## 5. Planned Engineering Roadmap
 
-### Priority 1 — Linux GPU (`Vulkan` / `CUDA`) `whisper-cli` Distribution (`catalog.json` & CI)
-- **Current Gap:** Official `ggml.org/whisper.cpp` releases do not ship prebuilt Linux GPU binaries (`whisper-linux-x64` in `src-tauri/resources/catalog.json` is currently `b5907-cpu`, which takes `73.9 s` vs `3.28 s` on a 89 s clip).
-- **Plan:**
-  - Build static/portable **Vulkan** (`libvulkan.so.1`) and **CUDA 12.x** Linux `whisper-cli` tarballs in `.github/workflows/release.yml` using `-DGGML_VULKAN=ON` (cross-vendor NVIDIA/AMD/Intel) and `-DGGML_CUDA=ON`.
-  - Publish hashed assets on GitHub Releases, register Linux GPU entries in `src-tauri/resources/catalog.json`, and run an `ldd`/driver compatibility probe in `setup_manager.rs` with automatic fallback to CPU if system Vulkan/CUDA libs are missing.
+### Priority 1 — Linux GPU (`Vulkan` / `CUDA`) Catalog Registration (`catalog.json`)
+- **Shipped in v0.1.1:** `.github/workflows/release.yml` now builds `whisper-bin-ubuntu-vulkan-x64.tar.gz` (`b5907`, `-DGGML_VULKAN=ON`) and uploads it as a release asset, and `pipeline::whisper::probe_whisper_binary_runnable` handles runtime shared-library probing and automatic fallback to CPU.
+- **Next:** Register the published `whisper-bin-ubuntu-vulkan-x64.tar.gz` SHA-256 checksum in `src-tauri/resources/catalog.json` (plus an optional Linux CUDA tarball) so Linux Setup Wizard auto-selects GPU Whisper out of the box.
 
-### Priority 2 — Two-Phase Offline Local Batch Execution
-- **Current Gap:** In offline multi-file batches (`LocalLlama`), sequential `run_full_pipeline` restarts `llama-server` once per audio file (`10 × ~3.64 s = 36.4 s` wasted on startup overhead across 10 files).
-- **Plan:** Refactor offline `batch_size > 1` execution into two clean global phases:
-  - **Phase 1:** Run FFmpeg + Whisper across all queued files (`whisper-cli` exits and frees VRAM between/after files), saving all checkpoints.
-  - **Phase 2:** Start `LlamaServerGuard` **once**, translate/polish every transcribed checkpoint sequentially against the warm KV/weight cache, and stop `llama-server` once at the end. Expected savings: **~33 s per 10 files** (~10% speedup on offline batches).
+### Priority 2 — Standalone Source-Only ASR Proofreading (`target_language == "none"`)
+- **Shipped in v0.1.1:** Dual-column contextual source ASR correction (`correct_source_asr`) runs in a single pass during `BatchOperation::Translate`.
+- **Next:** Extend `correct_source_asr` to support a standalone non-Serbian source proofreading pass when `target_language == "none"` (no translation selected).
 
-### Priority 3 — Dual-Column Contextual Source ASR Correction
-- **Current Gap:** Even when DeepSeek accurately infers Whisper's phonetic English errors (`"Aesip"` → `"Ezopove basne"`), the `source_text` column still retains `"Aesip"`, which affects dual-language `.source.srt` exports.
-- **Plan:** Add an optional pre-translation or combined-schema `corrected_source` field when running cloud LLMs (especially DeepSeek) so users can inspect/accept contextual spelling fixes on English/German source tracks alongside Serbian translations.
-
-### Priority 4 — Interactive Waveform Timeline & Speaker Diarization
-- **Plan:**
-  - Add a compact canvas waveform scrubber synced with `SubtitleTable` and WebAudio segment playback for dragging cue `[startMs, endMs]` boundaries visually.
-  - Evaluate optional lightweight speaker change detection / diarization markers (`[Govornik 1]`) between Silero VAD speech segments.
+### Priority 3 — Speaker Diarization & Multi-Speaker Labels
+- **Shipped in v0.1.1:** The 3-Track Interactive Waveform Timeline (`WaveformTimeline`) with `MP3` waveform canvas, draggable cue trim handles, track mute/visibility/lock toggles, and zoom scrubbing is live.
+- **Next:** Evaluate optional lightweight speaker change detection / diarization markers (`[Govornik 1]`) between Silero VAD speech segments.

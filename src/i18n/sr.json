@@ -71,6 +71,8 @@
     "resegmentNow": "Primeni novu segmentaciju",
     "polishSerbian": "LLM poliranje srpskog transkripta",
     "polishSerbianHint": "Ispravlja padeže, interpunkciju i greške prepoznavanja govora",
+    "correctSourceAsr": "Ispravi izvorni ASR",
+    "correctSourceAsrHint": "Popravlja greške prepoznavanja u izvornom transkriptu tokom prevoda",
     "translationProvider": "Pogon za prevod i obradu",
     "providerLocal": "Lokalni LLM (Offline CUDA)",
     "providerDeepSeek": "DeepSeek API (Online)",

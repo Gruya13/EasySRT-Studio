@@ -179,6 +179,103 @@ async fn transcribe_audio_with_flag(
     Ok(project)
 }
 
+fn resolved_source_and_target_lang(project: &SubtitleProject) -> (String, String) {
+    let src_lang = project
+        .detected_language
+        .as_deref()
+        .filter(|s| !s.is_empty() && *s != "auto")
+        .unwrap_or(&project.options.source_language)
+        .trim()
+        .to_lowercase();
+    let target_lang = project.options.target_language.trim().to_lowercase();
+    (src_lang, target_lang)
+}
+
+fn determine_llm_operation(project: &SubtitleProject) -> Option<BatchOperation> {
+    let (src_lang, target_lang) = resolved_source_and_target_lang(project);
+    let is_same_serbian =
+        (src_lang == "sr" || src_lang == "hr" || src_lang == "bs") && target_lang == "sr";
+
+    if !target_lang.is_empty()
+        && target_lang != "none"
+        && src_lang != target_lang
+        && !is_same_serbian
+    {
+        Some(BatchOperation::Translate)
+    } else if project.options.polish_serbian
+        && (target_lang == "sr" || src_lang == "sr" || src_lang == "hr" || src_lang == "bs")
+    {
+        Some(BatchOperation::PolishSerbian)
+    } else {
+        None
+    }
+}
+
+fn build_local_endpoint(
+    guard: &llama_server::LlamaServerGuard,
+    config: &crate::models::AppConfig,
+) -> LlmEndpointConfig {
+    LlmEndpointConfig {
+        base_url: guard.base_url().to_string(),
+        model: "local-llm".to_string(),
+        api_key: None,
+        batch_size: config.translation.batch_size,
+    }
+}
+
+fn resolve_cloud_endpoint(
+    app: &AppHandle,
+    config: &crate::models::AppConfig,
+    provider: TranslationProviderKind,
+) -> Result<LlmEndpointConfig> {
+    match provider {
+        TranslationProviderKind::DeepSeek => {
+            let api_key = storage::get_api_key(app, TranslationProviderKind::DeepSeek)?
+                .map(|k| k.trim().to_string())
+                .filter(|k| !k.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "DeepSeek API key is not configured. Please add your key in Settings -> Cloud API."
+                    )
+                })?;
+            let model = if config.translation.deepseek_model.trim().is_empty() {
+                "deepseek-chat".to_string()
+            } else {
+                config.translation.deepseek_model.trim().to_string()
+            };
+            Ok(LlmEndpointConfig {
+                base_url: "https://api.deepseek.com/v1".to_string(),
+                model,
+                api_key: Some(api_key),
+                batch_size: config.translation.batch_size,
+            })
+        }
+        TranslationProviderKind::CustomOpenAi => {
+            let api_key = storage::get_api_key(app, TranslationProviderKind::CustomOpenAi)?;
+            let base_url = config.translation.custom_base_url.trim().to_string();
+            if base_url.is_empty() {
+                return Err(anyhow!(
+                    "Custom OpenAI-compatible base URL is not configured in Settings."
+                ));
+            }
+            let model = if config.translation.custom_model.trim().is_empty() {
+                "default".to_string()
+            } else {
+                config.translation.custom_model.trim().to_string()
+            };
+            Ok(LlmEndpointConfig {
+                base_url,
+                model,
+                api_key,
+                batch_size: config.translation.batch_size,
+            })
+        }
+        TranslationProviderKind::LocalLlama => Err(anyhow!(
+            "resolve_cloud_endpoint called with LocalLlama provider"
+        )),
+    }
+}
+
 async fn run_project_llm_stage(
     app: &AppHandle,
     project: &mut SubtitleProject,
@@ -234,56 +331,11 @@ async fn run_project_llm_stage(
                     cancel_flag,
                 )
                 .await?;
-                let ep = LlmEndpointConfig {
-                    base_url: guard.base_url().to_string(),
-                    model: "local-llm".to_string(),
-                    api_key: None,
-                    batch_size: config.translation.batch_size,
-                };
+                let ep = build_local_endpoint(&guard, &config);
                 llama_guard = Some(guard);
                 ep
             }
-            TranslationProviderKind::DeepSeek => {
-                let api_key = storage::get_api_key(app, TranslationProviderKind::DeepSeek)?
-                    .map(|k| k.trim().to_string())
-                    .filter(|k| !k.is_empty())
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "DeepSeek API key is not configured. Please add your key in Settings -> Cloud API."
-                        )
-                    })?;
-                let model = if config.translation.deepseek_model.trim().is_empty() {
-                    "deepseek-chat".to_string()
-                } else {
-                    config.translation.deepseek_model.trim().to_string()
-                };
-                LlmEndpointConfig {
-                    base_url: "https://api.deepseek.com/v1".to_string(),
-                    model,
-                    api_key: Some(api_key),
-                    batch_size: config.translation.batch_size,
-                }
-            }
-            TranslationProviderKind::CustomOpenAi => {
-                let api_key = storage::get_api_key(app, TranslationProviderKind::CustomOpenAi)?;
-                let base_url = config.translation.custom_base_url.trim().to_string();
-                if base_url.is_empty() {
-                    return Err(anyhow!(
-                        "Custom OpenAI-compatible base URL is not configured in Settings."
-                    ));
-                }
-                let model = if config.translation.custom_model.trim().is_empty() {
-                    "default".to_string()
-                } else {
-                    config.translation.custom_model.trim().to_string()
-                };
-                LlmEndpointConfig {
-                    base_url,
-                    model,
-                    api_key,
-                    batch_size: config.translation.batch_size,
-                }
-            }
+            other => resolve_cloud_endpoint(app, &config, other)?,
         };
 
         translator::run_batch_operation(
@@ -516,32 +568,17 @@ pub async fn run_full_pipeline(
         )
         .await?;
 
-        let src_lang = project
-            .detected_language
-            .as_deref()
-            .filter(|s| !s.is_empty() && *s != "auto")
-            .unwrap_or(&project.options.source_language)
-            .to_lowercase();
-        let target_lang = project.options.target_language.trim().to_lowercase();
-
-        let is_same_serbian =
-            (src_lang == "sr" || src_lang == "hr" || src_lang == "bs") && target_lang == "sr";
-
-        if !target_lang.is_empty() && src_lang != target_lang && !is_same_serbian {
-            project.completed_translation_batches = 0;
-            run_project_llm_stage(app, &mut project, BatchOperation::Translate, &cancel_flag)
-                .await?;
-        } else if project.options.polish_serbian && (target_lang == "sr" || src_lang == "sr") {
-            project.completed_translation_batches = 0;
-            run_project_llm_stage(
-                app,
-                &mut project,
-                BatchOperation::PolishSerbian,
-                &cancel_flag,
-            )
-            .await?;
-        } else if target_lang == "sr" || src_lang == "sr" {
-            project.cues = convert_cues_script(project.cues, project.options.script)?;
+        match determine_llm_operation(&project) {
+            Some(operation) => {
+                project.completed_translation_batches = 0;
+                run_project_llm_stage(app, &mut project, operation, &cancel_flag).await?;
+            }
+            None => {
+                let (src_lang, target_lang) = resolved_source_and_target_lang(&project);
+                if target_lang == "sr" || src_lang == "sr" {
+                    project.cues = convert_cues_script(project.cues, project.options.script)?;
+                }
+            }
         }
 
         project.phase = JobPhase::Completed;
@@ -576,6 +613,208 @@ pub async fn run_full_pipeline(
             Err(err)
         }
     }
+}
+
+/// Phase 2 of the offline batch pipeline: starts `llama-server` ONCE (when effective
+/// provider is `LocalLlama`), runs translation / Serbian polishing across all `projects`
+/// against the single warm server, checkpoints each project, and stops `llama-server`
+/// once at the end (even on error).
+pub async fn run_local_llm_batch(
+    app: &AppHandle,
+    state: &PipelineState,
+    mut projects: Vec<SubtitleProject>,
+) -> Result<Vec<SubtitleProject>> {
+    if projects.is_empty() {
+        return Ok(projects);
+    }
+
+    let config = storage::load_config(app)?;
+
+    let mut project_flags: Vec<(String, Arc<AtomicBool>)> = Vec::with_capacity(projects.len());
+    for project in &projects {
+        let flag = state.register_job(&project.job_id).await;
+        project_flags.push((project.job_id.clone(), flag));
+    }
+
+    let mut llama_guard: Option<llama_server::LlamaServerGuard> = None;
+
+    let batch_res: Result<()> = async {
+        let needs_local_llama = projects.iter().any(|p| {
+            let provider = p
+                .options
+                .provider_override
+                .unwrap_or(config.translation.provider);
+            provider == TranslationProviderKind::LocalLlama
+                && determine_llm_operation(p).is_some()
+        });
+
+        let local_endpoint = if needs_local_llama {
+            let llama_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::LlamaBin)?;
+            let llm_model = setup_manager::resolve_active_llm_model_path(app)?;
+
+            for project in &projects {
+                if let Some(op) = determine_llm_operation(project) {
+                    let phase = match op {
+                        BatchOperation::Translate => JobPhase::Translating,
+                        BatchOperation::PolishSerbian | BatchOperation::CondenseCps => {
+                            JobPhase::Polishing
+                        }
+                    };
+                    emit_job_progress(
+                        app,
+                        &project.job_id,
+                        phase,
+                        3.0,
+                        "Starting local llama-server...",
+                    );
+                }
+            }
+
+            let startup_cancel = Arc::new(AtomicBool::new(false));
+            let startup_cancel_clone = Arc::clone(&startup_cancel);
+            let flags_to_watch: Vec<Arc<AtomicBool>> =
+                project_flags.iter().map(|(_, f)| Arc::clone(f)).collect();
+            let watcher = tokio::spawn(async move {
+                loop {
+                    if flags_to_watch.iter().any(|f| f.load(Ordering::SeqCst)) {
+                        startup_cancel_clone.store(true, Ordering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+            });
+
+            let guard_res = llama_server::LlamaServerGuard::start(
+                &llama_bin,
+                &llm_model,
+                config.translation.context_window,
+                &startup_cancel,
+            )
+            .await;
+            watcher.abort();
+            let guard = guard_res?;
+            let ep = build_local_endpoint(&guard, &config);
+            llama_guard = Some(guard);
+            Some(ep)
+        } else {
+            None
+        };
+
+        for (idx, project) in projects.iter_mut().enumerate() {
+            let job_id = project.job_id.clone();
+            let cancel_flag = &project_flags[idx].1;
+
+            if cancel_flag.load(Ordering::SeqCst) {
+                project.phase = JobPhase::Cancelled;
+                project.error_message = Some("Job cancelled".to_string());
+                project.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = storage::save_checkpoint(app, project);
+                emit_job_progress(app, &job_id, JobPhase::Cancelled, 0.0, "Job cancelled");
+                return Err(anyhow!("Job cancelled"));
+            }
+
+            let op = determine_llm_operation(project);
+            if let Some(operation) = op {
+                let phase = match operation {
+                    BatchOperation::Translate => JobPhase::Translating,
+                    BatchOperation::PolishSerbian | BatchOperation::CondenseCps => {
+                        JobPhase::Polishing
+                    }
+                };
+                let provider = project
+                    .options
+                    .provider_override
+                    .unwrap_or(config.translation.provider);
+                let endpoint = match provider {
+                    TranslationProviderKind::LocalLlama => local_endpoint
+                        .clone()
+                        .ok_or_else(|| anyhow!("Local llama-server endpoint unavailable"))?,
+                    other => resolve_cloud_endpoint(app, &config, other)?,
+                };
+
+                project.phase = phase;
+                project.error_message = None;
+                project.updated_at = chrono::Utc::now().to_rfc3339();
+                let _ = storage::save_checkpoint(app, project);
+
+                emit_job_progress(
+                    app,
+                    &job_id,
+                    phase,
+                    5.0,
+                    match operation {
+                        BatchOperation::Translate => "Translating subtitles...",
+                        BatchOperation::PolishSerbian => "Polishing Serbian subtitles...",
+                        BatchOperation::CondenseCps => "Condensing subtitle CPS...",
+                    },
+                );
+
+                let res = translator::run_batch_operation(
+                    project,
+                    operation,
+                    &endpoint,
+                    cancel_flag,
+                    |proj| storage::save_checkpoint(app, proj),
+                    |pct, detail| {
+                        emit_job_progress(app, &job_id, phase, pct, detail);
+                    },
+                )
+                .await;
+
+                if let Err(err) = res {
+                    let is_cancelled = cancel_flag.load(Ordering::SeqCst);
+                    project.phase = if is_cancelled {
+                        JobPhase::Cancelled
+                    } else {
+                        JobPhase::Failed
+                    };
+                    project.error_message = Some(err.to_string());
+                    project.updated_at = chrono::Utc::now().to_rfc3339();
+                    let _ = storage::save_checkpoint(app, project);
+                    emit_job_progress(app, &job_id, project.phase, 0.0, err.to_string());
+                    return Err(err);
+                }
+            } else {
+                let (src_lang, target_lang) = resolved_source_and_target_lang(project);
+                if target_lang == "sr" || src_lang == "sr" {
+                    project.cues = convert_cues_script(
+                        std::mem::take(&mut project.cues),
+                        project.options.script,
+                    )?;
+                }
+            }
+
+            project.phase = JobPhase::Completed;
+            project.error_message = None;
+            project.updated_at = chrono::Utc::now().to_rfc3339();
+            storage::save_checkpoint(app, project)?;
+            emit_job_progress(
+                app,
+                &job_id,
+                JobPhase::Completed,
+                100.0,
+                match op {
+                    Some(BatchOperation::PolishSerbian) => "Serbian subtitle polishing completed.",
+                    _ => "Translation completed.",
+                },
+            );
+        }
+
+        Ok(())
+    }
+    .await;
+
+    // Guarantee local llama-server is stopped once at the end (even on error)
+    if let Some(mut guard) = llama_guard.take() {
+        guard.stop();
+    }
+
+    for (job_id, _) in project_flags {
+        state.finish_job(&job_id).await;
+    }
+
+    batch_res?;
+    Ok(projects)
 }
 
 pub fn convert_cues_script(
@@ -965,6 +1204,7 @@ EOF
                 segment_rules: standard_rules.clone(),
                 glossary,
                 polish_serbian: true,
+                correct_source_asr: false,
                 provider_override: Some(TranslationProviderKind::CustomOpenAi),
             },
             words: whisper_out.words,
@@ -1114,6 +1354,208 @@ EOF
             assert_eq!(en_cue.end_ms, orig.end_ms);
             assert_eq!(en_cue.source_text, orig.source_text);
         }
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn determines_llm_operation_for_translate_polish_and_none() {
+        let base = |detected: Option<&str>, src: &str, dst: &str, polish: bool| SubtitleProject {
+            job_id: "op-test".to_string(),
+            audio_path: "/tmp/a.mp3".to_string(),
+            audio_file_name: "a.mp3".to_string(),
+            duration_ms: 1000,
+            detected_language: detected.map(str::to_string),
+            options: JobOptions {
+                source_language: src.to_string(),
+                target_language: dst.to_string(),
+                polish_serbian: polish,
+                ..JobOptions::default()
+            },
+            words: vec![],
+            cues: vec![],
+            phase: JobPhase::Completed,
+            completed_translation_batches: 0,
+            error_message: None,
+            updated_at: "2026-11-22T22:00:00Z".to_string(),
+        };
+
+        assert_eq!(
+            determine_llm_operation(&base(Some("en"), "auto", "sr", true)),
+            Some(BatchOperation::Translate)
+        );
+        assert_eq!(
+            determine_llm_operation(&base(Some("sr"), "auto", "sr", true)),
+            Some(BatchOperation::PolishSerbian)
+        );
+        assert_eq!(
+            determine_llm_operation(&base(Some("hr"), "auto", "sr", true)),
+            Some(BatchOperation::PolishSerbian)
+        );
+        assert_eq!(
+            determine_llm_operation(&base(Some("sr"), "sr", "none", true)),
+            Some(BatchOperation::PolishSerbian)
+        );
+        assert_eq!(
+            determine_llm_operation(&base(Some("en"), "en", "none", true)),
+            None
+        );
+        assert_eq!(
+            determine_llm_operation(&base(Some("sr"), "sr", "sr", false)),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn single_warm_llama_server_processes_multiple_projects_and_stops_once() {
+        use crate::models::AppConfig;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_warm_batch_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let data_dir = temp_dir.join("data");
+        fs::create_dir_all(&data_dir).unwrap();
+
+        let mock_model = temp_dir.join("dummy.gguf");
+        fs::write(&mock_model, b"GGUF").unwrap();
+
+        let startup_log = temp_dir.join("startups.log");
+        let mock_bin = temp_dir.join("mock-llama-server");
+
+        let script = format!(
+            r#"#!/usr/bin/env python3
+import http.server
+import json
+import sys
+
+args = sys.argv[1:]
+with open({startup_log:?}, "a", encoding="utf-8") as f:
+    f.write("started\n")
+
+port = int(args[args.index("--port") + 1])
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health":
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b'{{"status":"ok"}}')
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def do_POST(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        body = json.loads(self.rfile.read(length).decode("utf-8"))
+        user_payload = json.loads(body["messages"][1]["content"])
+        sys_prompt = body["messages"][0]["content"]
+        is_polish = "Serbian subtitle editor" in sys_prompt
+        out = {{}}
+        for cue in user_payload["translate_cues"]:
+            cid = str(cue["id"])
+            out[cid] = "Ispoliran tekst." if is_polish else "Preveden tekst."
+        resp = json.dumps({{"choices": [{{"message": {{"role": "assistant", "content": json.dumps(out)}}}}]}}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(resp)))
+        self.end_headers()
+        self.wfile.write(resp)
+
+    def log_message(self, format, *args):
+        pass
+
+http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
+"#,
+            startup_log = startup_log.to_string_lossy().to_string(),
+        );
+
+        fs::write(&mock_bin, script).unwrap();
+        let mut perms = fs::metadata(&mock_bin).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&mock_bin, perms).unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut guard = llama_server::LlamaServerGuard::start_with_timeout(
+            &mock_bin,
+            &mock_model,
+            2048,
+            &cancel,
+            std::time::Duration::from_secs(10),
+        )
+        .await
+        .unwrap();
+
+        let endpoint = build_local_endpoint(&guard, &AppConfig::default());
+
+        let mut p1 = SubtitleProject {
+            job_id: "batch-p1".to_string(),
+            audio_path: "/tmp/p1.mp3".to_string(),
+            audio_file_name: "p1.mp3".to_string(),
+            duration_ms: 2000,
+            detected_language: Some("en".to_string()),
+            options: JobOptions::default(),
+            words: vec![],
+            cues: vec![SubtitleCue {
+                id: 1,
+                start_ms: 0,
+                end_ms: 2000,
+                source_text: "Hello world.".to_string(),
+                translated_text: String::new(),
+                cps: 6.0,
+                warnings: vec![],
+            }],
+            phase: JobPhase::Translating,
+            completed_translation_batches: 0,
+            error_message: None,
+            updated_at: "2026-11-22T22:00:00Z".to_string(),
+        };
+
+        let mut p2 = SubtitleProject {
+            job_id: "batch-p2".to_string(),
+            audio_path: "/tmp/p2.mp3".to_string(),
+            audio_file_name: "p2.mp3".to_string(),
+            duration_ms: 2000,
+            detected_language: Some("sr".to_string()),
+            options: JobOptions::default(),
+            words: vec![],
+            cues: vec![SubtitleCue {
+                id: 1,
+                start_ms: 0,
+                end_ms: 2000,
+                source_text: "Lijepo vrijeme.".to_string(),
+                translated_text: String::new(),
+                cps: 7.5,
+                warnings: vec![],
+            }],
+            phase: JobPhase::Polishing,
+            completed_translation_batches: 0,
+            error_message: None,
+            updated_at: "2026-11-22T22:00:00Z".to_string(),
+        };
+
+        for p in [&mut p1, &mut p2] {
+            let op = determine_llm_operation(p).unwrap();
+            translator::run_batch_operation(
+                p,
+                op,
+                &endpoint,
+                &cancel,
+                |proj| storage::save_checkpoint_to_data_dir(&data_dir, proj),
+                |_, _| {},
+            )
+            .await
+            .unwrap();
+        }
+
+        guard.stop();
+
+        let startups = fs::read_to_string(&startup_log).unwrap();
+        assert_eq!(startups.lines().count(), 1);
+        assert_eq!(p1.cues[0].translated_text, "Preveden tekst.");
+        assert_eq!(p2.cues[0].translated_text, "Ispoliran tekst.");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

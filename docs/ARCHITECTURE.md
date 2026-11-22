@@ -27,36 +27,38 @@ flowchart TD
 
     subgraph LLM["3. VRAM Handoff / Cloud Pipeline & LLM Processing"]
         E --> F{"Translation / Polishing Provider"}
-        F -->|"Offline (LocalLlama)"| G["LlamaServerGuard (-np 1 -fitc 2048 -ctk q8_0)\nEphemeral 127.0.0.1:<port>/v1"]
-        F -->|"Online (DeepSeek / CustomOpenAi)\nCan overlap with Whisper on next queued file"| H["HTTPS OpenAI-Compatible API\n(api.deepseek.com/v1)"]
-        G --> J["ID-Locked Context-Window Batch Engine\n(Translate / PolishSerbian / CondenseCps + max_chars)"]
+        F -->|"Offline (LocalLlama)<br/>Two-Phase Batch: single warm guard"| G["LlamaServerGuard (-np 1 -fitc 2048 -ctk q8_0)<br/>Ephemeral 127.0.0.1:&lt;port&gt;/v1"]
+        F -->|"Online (DeepSeek / CustomOpenAi)<br/>Can overlap with Whisper on next queued file"| H["HTTPS OpenAI-Compatible API<br/>(api.deepseek.com/v1)"]
+        G --> J["ID-Locked Context-Window Batch Engine<br/>(Translate + optional correct_source_asr / PolishSerbian / CondenseCps)"]
         H --> J
     end
 
     subgraph Post["4. Deterministic Post-Processing & Export"]
-        J -->|"LlamaServerGuard::drop kills & reaps llama-server"| K["Ekavian Normalizer + Script Converter\n(pipeline::sr_script: normalize_ekavian & Latin <-> Cyrillic)"]
+        J -->|"LlamaServerGuard::drop kills & reaps llama-server"| K["Ekavian Normalizer + Script Converter<br/>(pipeline::sr_script: normalize_ekavian & Latin <-> Cyrillic)"]
         K --> L["Balanced Line Wrapper & CPS / Warning Metrics"]
-        L --> M["Interactive Subtitle Studio\n(Inline Edit, Auto-Fit CPS, Audio Player, Search & Replace, Undo/Redo)"]
-        M --> N["Multi-Format Exporter\n(pipeline::exporter: .SRT, .VTT, .TXT + Optional UTF-8 BOM)"]
+        L --> M["Redesigned Studio UI (v0.1.1)<br/>(FilesPanel, 6-Tab SettingsPanel, DualEditorBand, 3-Track WaveformTimeline)"]
+        M --> N["Multi-Format Exporter<br/>(pipeline::exporter: .SRT, .VTT, .TXT + Optional UTF-8 BOM)"]
     end
 ```
 
-### Module Breakdown (`src-tauri/src/`)
+### Module Breakdown (`src-tauri/src/` & `src/components/`)
 
 | Module | Responsibility |
 | :--- | :--- |
-| `models.rs` | Canonical `camelCase` data contract shared 1:1 with `src/types/models.ts`. |
+| `models.rs` | Canonical `camelCase` data contract shared 1:1 with `src/types/models.ts` (including `JobOptions.correct_source_asr`). |
 | `hardware.rs` | `nvidia-smi` GPU probing (`CREATE_NO_WINDOW` on Windows), multi-GPU max-VRAM selection, and `VramTier` classification (`CpuOnly`, `Vram4Gb`, `Vram8Gb`, `Vram12GbPlus`). |
 | `storage.rs` | `Portable` (`portable.flag`) vs `Installed` path resolution, atomic `config.json` and checkpoint persistence (`<job_id>.easysrt.json`), and OS Keyring + portable credential fallback. |
 | `setup_manager.rs` | Curated catalog loader (`resources/catalog.json`), resumable HTTP `Range` downloader (`.part` files), SHA-256 verification, ZIP/TAR.GZ extractor, and custom `.bin`/`.gguf` model management. |
 | `pipeline/ffmpeg.rs` | Spawns `ffmpeg -y -i <input> -vn -acodec pcm_s16le -ar 16000 -ac 1 <temp.16k.wav>` with cancellation polling and WAV header duration calculation. |
-| `pipeline/whisper.rs` | Runs `whisper-cli -ojf` with Silero VAD (`--vad -vm`), glossary hints (`--prompt`), physical-thread cap, and `-bs 1 -bo 1 -nf -fa` decoding; parses BPE subword tokens into `Vec<TimedWord>` with proportional fallback. |
+| `pipeline/whisper.rs` | Runs `whisper-cli -ojf` with Silero VAD (`--vad -vm`), glossary hints (`--prompt`), physical-thread cap, `-bs 1 -bo 1 -nf -fa` decoding, plus `probe_whisper_binary_runnable()` pre-flight probe and automatic CPU binary fallback on missing shared libraries (`libvulkan.so.1` / CUDA DLLs). |
 | `pipeline/segmenter.rs` | Groups `TimedWord`s into `SubtitleCue`s using punctuation, pause (`>= 350ms`), dangling-word penalty (`is_dangling_function_word`), duration, and character limits (`Standard` 2×42, `Reels` 1×20, `Custom`), balanced 2-line wrapping, and CPS metrics. |
 | `pipeline/llama_server.rs` | RAII `LlamaServerGuard` binding an ephemeral localhost TCP port with 4 GB VRAM auto-fit (`-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0`), automatic `-ngl 0` CPU fallback, `/health` polling, and `Drop` process reaping. |
-| `pipeline/translator.rs` | ID-locked sliding context-window batch translator, Serbian ASR polisher, and targeted CPS condenser (`BatchOperation::CondenseCps`) with per-cue `max_chars` budgets, keyed `json_schema` / `json_object` decoding, recursive subdivision retry, and per-batch atomic checkpointing. |
+| `pipeline/translator.rs` | ID-locked sliding context-window batch translator (supporting optional single-pass `correct_source_asr` dual-column output `{"source", "text"}`), Serbian ASR polisher, and targeted CPS condenser (`BatchOperation::CondenseCps`) with per-cue `max_chars` budgets, keyed `json_schema` / `json_object` decoding, recursive subdivision retry, and per-batch atomic checkpointing. |
+| `pipeline/mod.rs` | Top-level pipeline orchestration including `run_full_pipeline` and Two-Phase Local Offline Batch (`run_local_llm_batch`) reusing a single warm `LlamaServerGuard` across multiple transcribed projects. |
 | `pipeline/sr_script.rs` | Deterministic Ijekavian→Ekavian lexical/stem normalizer (`normalize_ekavian`) and Serbian Cyrillic ↔ Latin converter with smart digraph casing (`Љ`/`Њ`/`Џ`) and morphological prefix-boundary exception handling. |
 | `pipeline/importer.rs` | Parses `.srt` and `.vtt` files (UTF-8 BOM, CRLF/LF, comma/dot timestamps, WebVTT headers and cue settings) into `SubtitleProject` instances. |
 | `pipeline/exporter.rs` | Formats `.srt`, `.vtt`, and `.txt` outputs with optional UTF-8 BOM (`\u{FEFF}`) and dual source + translated `.srt` export (`includeSourceSrt`). |
+| `src/components/` (v0.1.1 Studio UI) | Borderless 3-row workspace: `TopBar` (custom drag-region & `core:window:allow-*` window buttons), `FilesPanel` (top-left queue & drag-drop), `SettingsPanel` (top-right 6-tab settings + mode pill), `DualEditorBand` (dual indigo `Original transcript` & emerald `Prevod` cards), and `WaveformTimeline` (3-track `MP3` canvas waveform + `Original` & `Prevod` cue tracks with trim handles & zoom), alongside `SetupWizard`, `ExportModal`, `OnlineConfirmModal`, and `UpdaterModal`. |
 
 ---
 
@@ -77,12 +79,17 @@ EasySRT Studio eliminates VRAM contention through strict **Sequential Process Li
    - `llama-server` binds to an ephemeral `127.0.0.1:<port>` with `-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0 -c <contextWindow>` (and automatically retries with `-ngl 0` CPU fallback if GPU layer fitting fails on constrained cards), having the entire GPU VRAM budget exclusively to itself.
    - The moment batch translation or polishing finishes (or if the user cancels the job or an error occurs), `LlamaServerGuard::stop()` and `Drop` explicitly `kill()` and `wait()` on the child process, immediately returning all GPU VRAM to the OS.
 
-### 2.1 Pipelined Cloud Batch Overlap & Smart Workflow Presets
-While local `llama-server` batches must serialize GPU access per stage, cloud endpoints (`DeepSeek`, `CustomOpenAI`) use virtually zero local VRAM. When running a multi-file batch (`runnable.length > 1`) in `Full` mode with a cloud provider, `appStore::startBatchPipeline` pipelines execution:
-- **`transcribeAudio` (Stage 1)** runs sequentially on the GPU across queued audio files.
-- Immediately after file `i` completes ASR + segmentation, its **cloud `translateProject` / `polishProject` call (Stage 2)** is launched asynchronously alongside GPU transcription of file `i + 1`.
-- Both stages surface in the `BatchQueuePanel` simultaneously, reducing end-to-end multi-file cloud wall time to roughly $\max(\sum T_{\text{whisper}}, T_{\text{cloud}})$.
-- In `JobWorkspace.tsx`, **3 Smart Workflow Presets** (`Hybrid Turbo: GPU + DeepSeek`, `100% Offline: Local AI`, `Transcribe Only: No LLM`) switch both `targetLanguage`/`polishSerbian` and `providerOverride` in a single click.
+### 2.1 Two-Phase Local Offline Batch & Pipelined Cloud Batch Overlap
+EasySRT Studio optimizes multi-file batch pipelines separately for offline and online backends inside `appStore::startBatchPipeline`:
+- **Two-Phase Local Offline Batch (`LocalLlama`, `runnable.length > 1`)**:
+  - **Phase 1 (ASR)**: Runs `transcribeAudio` sequentially across every queued file (`whisper-cli` exits and releases 100% VRAM after each file, saving each transcribed checkpoint).
+  - **Phase 2 (Single Warm LLM)**: Invokes `commands::run_local_llm_batch` -> `pipeline::run_local_llm_batch`, which registers per-project cancel flags, starts `LlamaServerGuard::start` **once** for the entire batch, processes every project needing `Translate` or `PolishSerbian` against the single warm `127.0.0.1:<port>/v1` server (checkpointing and emitting `JobProgressEvent`s per `job_id`), and stops `LlamaServerGuard` once at the end (even on error).
+- **Pipelined Cloud Batch (`DeepSeek` / `CustomOpenAi`, `runnable.length > 1`)**:
+  - **`transcribeAudio` (Stage 1)** runs sequentially on the local GPU across queued audio files while each completed file's **cloud `translateProject` / `polishProject` call (Stage 2)** runs concurrently over HTTPS, reducing multi-file cloud wall time to roughly $\max(\sum T_{\text{whisper}}, T_{\text{cloud}})$.
+
+### 2.2 Linux Whisper Binary Probe & Vulkan CI Artifact
+- In `.github/workflows/release.yml`, the Linux (`ubuntu-22.04`) job builds `whisper.cpp` tag `b5907` with `-DGGML_VULKAN=ON` and publishes `whisper-bin-ubuntu-vulkan-x64.tar.gz`.
+- At runtime, `pipeline::whisper::probe_whisper_binary_runnable()` runs a fast pre-flight `whisper-cli --help` check via `configure_command_env`. When a GPU or custom binary fails due to missing shared libraries (e.g., `libvulkan.so.1` or CUDA DLLs), `run_whisper_cli` automatically searches for a runnable sibling/`PATH` CPU binary fallback or returns an actionable diagnostic.
 
 ### Hardware Tier Matrix
 
@@ -142,11 +149,12 @@ For every batch `all_cues[start..end]` (default `batch_size = 25`):
 - `translate_cues`: The target slice `all_cues[start..end]`, each carrying its immutable 1-based `{ "id": u32, "text": "...", "max_chars": u32 }` where `max_chars` encodes the per-cue character budget (`clamp(floor(duration_sec * max_cps), 12, max_chars_per_line * max_lines)`).
 - `context_after`: Up to **3 following cues** (`all_cues[end..(end + 3).min(len)]`) provided read-only so the model knows how a split clause continues.
 
-### 4.2 Operations, Serbian Ekavian Enforcement & Constrained JSON Schema
+### 4.2 Operations, Dual-Column Source ASR Correction, Ekavian & Constrained JSON Schema
 - **Translation (`BatchOperation::Translate`)**: When `target_language == "sr"`, the system prompt mandates idiomatic Serbian in strict **Ekavian standard** (*mleko*, *devojka*, *vreme*, *gde*, *lepo* — never Ijekavian/Croatian forms) and injects user glossary pairs (`source => target`) under `MANDATORY GLOSSARY TERMS`.
+- **Dual-Column Source ASR Correction (`JobOptions.correct_source_asr`)**: When enabled during `BatchOperation::Translate`, the LLM also fixes obvious phonetic/homophone speech-to-text mistakes in `source_text` (e.g., *"Aesip"* → *"Aesop"*) without rewriting the speaker's words, returning `{"1": {"source": "...", "text": "..."}}`. `parse_and_validate_batch_response()` returns `ParsedCueText { source: Option<String>, text: String }` accepting both plain string values and `{source, text}` objects; `run_batch_operation()` wraps any non-empty `source` via `segmenter::wrap_balanced_lines` into `cue.source_text` before updating `cue.translated_text` and recomputing cue metrics.
 - **Serbian ASR Polishing (`BatchOperation::PolishSerbian`)**: When the audio is already in Serbian (or `sr`/`hr`/`bs` -> `sr` with `polish_serbian: true`), the LLM proofreads speech-to-text errors, restores punctuation/capitalization, and normalizes Ijekavian/Croatian transcripts into Serbian Ekavian without altering speaker meaning or cue timestamps.
-- **Targeted CPS Condensing (`BatchOperation::CondenseCps`)**: Invoked via the **"Sažmi preduge (CPS)" / "Auto-Fit CPS"** button (`condense_project_cps`) when cues trigger `high_cps` or `line_too_long`. Batches with zero warning cues are skipped without calling the LLM, and only offending cues are sent with their exact `max_chars` budget to tighten phrasing by ~15–30%.
-- **Structured Output (`build_response_format`)**: Local `llama-server` endpoints receive a strict keyed JSON Schema (`{ "type": "json_schema", "schema": { "required": ["1", "2", ...], "additionalProperties": false } }`) which eliminates missing-ID retries and boosts throughput; cloud endpoints use `{"type": "json_object"}`.
+- **Targeted CPS Condensing (`BatchOperation::CondenseCps`)**: Invoked via `"Sažmi preduge (CPS)" / "Auto-Fit CPS"` (`condense_project_cps`) when cues trigger `high_cps` or `line_too_long`. Batches with zero warning cues are skipped without calling the LLM, and only offending cues are sent with their exact `max_chars` budget to tighten phrasing by ~15–30%.
+- **Structured Output (`build_response_format`)**: Local `llama-server` endpoints receive a strict keyed JSON Schema (`{ "type": "json_schema", "schema": { "required": ["1", "2", ...], "additionalProperties": false } }`) — using `{ "type": "string" }` per cue by default, or `{ "type": "object", "properties": { "source": { "type": "string" }, "text": { "type": "string" } }, "required": ["source", "text"], "additionalProperties": false }` when `correct_source_asr && operation == BatchOperation::Translate`. Cloud endpoints use `{"type": "json_object"}`.
 
 ### 4.3 `<think>` Tag & Markdown Fence Stripping
 Reasoning and instruct models occasionally wrap JSON output in `<think>...</think>` blocks or ```` ```json ... ``` ```` fences. `clean_llm_json_response()` strips all `(?is)<think>.*?</think>` spans, removes markdown fences, parses either a keyed `{"1": "...", ...}` object or legacy `[{ "id": 1, "text": "..." }]` array/envelope, and validates that **every expected cue `id` in `translate_cues` is present and non-empty**.
@@ -230,6 +238,6 @@ EasySRT Studio integrates `tauri-plugin-updater` configured in `src-tauri/tauri.
    - `TAURI_SIGNING_PRIVATE_KEY`: Contents of `~/.tauri/easysrt-studio.key`
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: Password used when generating the keypair
 4. **Automated Verification & Publishing (`.github/workflows/release.yml`)**:
-   - Triggered on `v*` tags (`git tag v0.1.0 && git push origin v0.1.0`).
+   - Triggered on `v*` tags (`git tag v0.1.1 && git push origin v0.1.1`).
    - Runs `npm run typecheck`, `npm test` (frontend unit test suite), and `cargo test --manifest-path src-tauri/Cargo.toml` (Rust backend unit + E2E test suite) **before** building bundles.
-   - Publishes signed Windows NSIS installer, Linux AppImage, `latest.json` (`releaseDraft: false`, `includeUpdaterJson: true`), and packages `EasySRT-Studio-windows-x64-portable.zip` (with `EasySRT Studio.exe`, `resources/catalog.json`, and `portable.flag`) directly to the GitHub Release.
+   - Publishes signed Windows NSIS installer, Linux AppImage, `latest.json` (`releaseDraft: false`, `includeUpdaterJson: true`), `EasySRT-Studio-windows-x64-portable.zip` (with `EasySRT Studio.exe`, `resources/catalog.json`, and `portable.flag`), and `whisper-bin-ubuntu-vulkan-x64.tar.gz` (`whisper.cpp` `b5907` compiled with `-DGGML_VULKAN=ON` on `ubuntu-22.04`) directly to the GitHub Release.

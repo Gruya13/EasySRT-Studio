@@ -307,6 +307,8 @@ pub struct JobOptions {
     pub segment_rules: SegmentRules,
     pub glossary: BTreeMap<String, String>,
     pub polish_serbian: bool,
+    #[serde(default)]
+    pub correct_source_asr: bool,
     pub provider_override: Option<TranslationProviderKind>,
 }
 
@@ -319,6 +321,7 @@ impl Default for JobOptions {
             segment_rules: SegmentRules::default(),
             glossary: BTreeMap::new(),
             polish_serbian: true,
+            correct_source_asr: false,
             provider_override: None,
         }
     }
@@ -449,5 +452,21 @@ mod tests {
         assert!(keys.get("hasDeepSeekKey").is_some());
         assert!(keys.get("hasCustomApiKey").is_some());
         assert!(keys.get("storageBackend").is_some());
+
+        let opts = serde_json::to_value(JobOptions::default()).unwrap();
+        assert_eq!(opts.get("correctSourceAsr"), Some(&json!(false)));
+
+        // Legacy JobOptions JSON without `correctSourceAsr` must deserialize with false
+        let legacy_json = json!({
+            "sourceLanguage": "en",
+            "targetLanguage": "sr",
+            "script": "latin",
+            "segmentRules": SegmentRules::default(),
+            "glossary": {},
+            "polishSerbian": true,
+            "providerOverride": null
+        });
+        let deserialized: JobOptions = serde_json::from_value(legacy_json).unwrap();
+        assert!(!deserialized.correct_source_asr);
     }
 }

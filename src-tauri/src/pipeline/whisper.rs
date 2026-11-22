@@ -7,7 +7,7 @@ use anyhow::{anyhow, Context, Result};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
@@ -267,10 +267,138 @@ pub fn parse_whisper_ojf_json(json_str: &str) -> Result<WhisperOutput> {
     })
 }
 
-/// Runs `whisper-cli` on a 16 kHz mono WAV file and parses the resulting `-ojf` JSON output.
-/// Guarantees that the `whisper-cli` process exits before returning so GPU VRAM is 100% freed.
+#[derive(Debug)]
+enum WhisperProbeResult {
+    Runnable,
+    MissingSharedLibrary(String),
+    NonFatalProbeExit(String),
+    Unexecutable(String),
+}
+
+fn is_missing_shared_library_error(code: Option<i32>, stderr: &str) -> bool {
+    let lower = stderr.to_ascii_lowercase();
+    lower.contains("error while loading shared libraries")
+        || lower.contains("cannot open shared object file")
+        || lower.contains("library not loaded")
+        || lower.contains("the specified module could not be found")
+        || lower.contains("was not found")
+        || matches!(code, Some(127) | Some(-1073741515) | Some(-1073741511))
+}
+
+async fn probe_whisper_binary_detailed(whisper_bin: &Path) -> WhisperProbeResult {
+    if !whisper_bin.is_file() {
+        return WhisperProbeResult::Unexecutable(format!(
+            "Whisper binary not found at {}",
+            whisper_bin.display()
+        ));
+    }
+
+    let mut cmd = Command::new(whisper_bin);
+    configure_command_env(&mut cmd, whisper_bin);
+    cmd.arg("--help")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    match tokio::time::timeout(Duration::from_secs(5), cmd.output()).await {
+        Err(_) => WhisperProbeResult::Unexecutable(format!(
+            "Timed out probing {} --help",
+            whisper_bin.display()
+        )),
+        Ok(Err(err)) => WhisperProbeResult::Unexecutable(format!(
+            "Failed to execute {} --help: {err}",
+            whisper_bin.display()
+        )),
+        Ok(Ok(output)) => {
+            if output.status.success() {
+                return WhisperProbeResult::Runnable;
+            }
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            let detail = if !stderr.is_empty() {
+                stderr
+            } else if !stdout.is_empty() {
+                stdout
+            } else {
+                format!("exited with status {}", output.status)
+            };
+
+            if is_missing_shared_library_error(output.status.code(), &detail) {
+                WhisperProbeResult::MissingSharedLibrary(detail)
+            } else {
+                WhisperProbeResult::NonFatalProbeExit(detail)
+            }
+        }
+    }
+}
+
+/// Lightweight pre-flight check verifying `whisper-cli --help` runs cleanly with
+/// `configure_command_env` (detecting missing shared libraries such as `libvulkan.so.1`
+/// or CUDA DLLs before running transcription).
+pub async fn probe_whisper_binary_runnable(whisper_bin: &Path) -> bool {
+    matches!(
+        probe_whisper_binary_detailed(whisper_bin).await,
+        WhisperProbeResult::Runnable
+    )
+}
+
+async fn find_fallback_whisper_binary(failed_bin: &Path) -> Option<PathBuf> {
+    let failed_canon = fs::canonicalize(failed_bin).ok();
+    let mut candidates = Vec::new();
+
+    if let Some(parent) = failed_bin.parent() {
+        let mut search_roots = vec![parent.to_path_buf()];
+        if let Some(grandparent) = parent.parent() {
+            search_roots.push(grandparent.to_path_buf());
+        }
+        for root in search_roots {
+            candidates.push(root.join("whisper-bin-ubuntu-x64").join("whisper-cli"));
+            candidates.push(root.join("whisper-cpu").join("whisper-cli"));
+            candidates.push(root.join("whisper-cli"));
+            candidates.push(root.join("Release").join("whisper-cli.exe"));
+            candidates.push(root.join("cpu").join("whisper-cli.exe"));
+        }
+    }
+
+    if let Some(path_var) = std::env::var_os("PATH") {
+        let names: &[&str] = if cfg!(windows) {
+            &["whisper-cli.exe", "whisper-cpp.exe"]
+        } else {
+            &["whisper-cli", "whisper-cpp"]
+        };
+        for dir in std::env::split_paths(&path_var) {
+            for name in names {
+                candidates.push(dir.join(name));
+            }
+        }
+    }
+
+    for cand in candidates {
+        if !cand.is_file() {
+            continue;
+        }
+        if let Some(ref fc) = failed_canon {
+            if fs::canonicalize(&cand).ok().as_ref() == Some(fc) {
+                continue;
+            }
+        } else if cand == failed_bin {
+            continue;
+        }
+        if probe_whisper_binary_runnable(&cand).await {
+            return Some(cand);
+        }
+    }
+
+    None
+}
+
+enum WhisperExecError {
+    MissingSharedLibrary(String),
+    Other(anyhow::Error),
+}
+
 #[allow(clippy::too_many_arguments)]
-pub async fn run_whisper_cli<F>(
+async fn execute_whisper_once<F>(
     whisper_bin: &Path,
     whisper_model_path: &Path,
     vad_model_path: Option<&Path>,
@@ -278,36 +406,14 @@ pub async fn run_whisper_cli<F>(
     source_language: &str,
     glossary: &BTreeMap<String, String>,
     cancel_flag: &Arc<AtomicBool>,
-    mut on_progress: F,
-) -> Result<WhisperOutput>
+    on_progress: &mut F,
+) -> std::result::Result<WhisperOutput, WhisperExecError>
 where
     F: FnMut(f64, String),
 {
-    if cancel_flag.load(Ordering::SeqCst) {
-        return Err(anyhow!("Job cancelled"));
-    }
-
-    if !whisper_bin.exists() {
-        return Err(anyhow!(
-            "Whisper binary not found at {}",
-            whisper_bin.to_string_lossy()
-        ));
-    }
-    if !whisper_model_path.exists() {
-        return Err(anyhow!(
-            "Whisper model not found at {}",
-            whisper_model_path.to_string_lossy()
-        ));
-    }
-    if !wav_path.exists() {
-        return Err(anyhow!(
-            "Input WAV file not found at {}",
-            wav_path.to_string_lossy()
-        ));
-    }
-
     let output_prefix = wav_path.with_extension("whisper_out");
-    let expected_json_path = Path::new(&format!("{}.json", output_prefix.to_string_lossy())).to_path_buf();
+    let expected_json_path =
+        Path::new(&format!("{}.json", output_prefix.to_string_lossy())).to_path_buf();
     let _ = fs::remove_file(&expected_json_path);
 
     let lang = {
@@ -360,11 +466,11 @@ where
 
     on_progress(15.0, "Starting Whisper ASR transcription...".to_string());
 
-    let mut child = cmd.spawn().with_context(|| {
-        format!(
-            "Failed to spawn whisper-cli at {}",
+    let mut child = cmd.spawn().map_err(|err| {
+        WhisperExecError::Other(anyhow!(
+            "Failed to spawn whisper-cli at {}: {err}",
             whisper_bin.to_string_lossy()
-        )
+        ))
     })?;
 
     let mut stderr_pipe = child.stderr.take();
@@ -375,18 +481,23 @@ where
             let _ = child.kill().await;
             let _ = child.wait().await;
             let _ = fs::remove_file(&expected_json_path);
-            return Err(anyhow!("Job cancelled"));
+            return Err(WhisperExecError::Other(anyhow!("Job cancelled")));
         }
 
-        match child.try_wait().context("Failed polling whisper-cli process")? {
-            Some(status) => break status,
-            None => {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
                 tick_count += 1;
-                if tick_count % 20 == 0 {
+                if tick_count.is_multiple_of(20) {
                     let step = ((tick_count / 20) as f64 * 2.5).min(70.0);
                     on_progress(15.0 + step, "Transcribing audio with Whisper...".to_string());
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(err) => {
+                return Err(WhisperExecError::Other(anyhow!(
+                    "Failed polling whisper-cli process: {err}"
+                )));
             }
         }
     };
@@ -398,23 +509,159 @@ where
 
     if !status.success() {
         let _ = fs::remove_file(&expected_json_path);
-        return Err(anyhow!(
+        let trimmed = stderr_buf.trim().to_string();
+        if is_missing_shared_library_error(status.code(), &trimmed) {
+            return Err(WhisperExecError::MissingSharedLibrary(trimmed));
+        }
+        return Err(WhisperExecError::Other(anyhow!(
             "whisper-cli failed (status {}): {}",
             status,
-            stderr_buf.trim()
-        ));
+            trimmed
+        )));
     }
 
-    let raw_json = fs::read_to_string(&expected_json_path).with_context(|| {
-        format!(
-            "whisper-cli exited cleanly but JSON output was not found at {}",
+    let raw_json = fs::read_to_string(&expected_json_path).map_err(|err| {
+        WhisperExecError::Other(anyhow!(
+            "whisper-cli exited cleanly but JSON output was not found at {}: {err}",
             expected_json_path.to_string_lossy()
-        )
+        ))
     })?;
     let _ = fs::remove_file(&expected_json_path);
 
     on_progress(90.0, "Parsing Whisper word timestamps...".to_string());
-    parse_whisper_ojf_json(&raw_json)
+    parse_whisper_ojf_json(&raw_json).map_err(WhisperExecError::Other)
+}
+
+/// Runs `whisper-cli` on a 16 kHz mono WAV file and parses the resulting `-ojf` JSON output.
+/// Guarantees that the `whisper-cli` process exits before returning so GPU VRAM is 100% freed.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_whisper_cli<F>(
+    whisper_bin: &Path,
+    whisper_model_path: &Path,
+    vad_model_path: Option<&Path>,
+    wav_path: &Path,
+    source_language: &str,
+    glossary: &BTreeMap<String, String>,
+    cancel_flag: &Arc<AtomicBool>,
+    mut on_progress: F,
+) -> Result<WhisperOutput>
+where
+    F: FnMut(f64, String),
+{
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err(anyhow!("Job cancelled"));
+    }
+
+    if !whisper_bin.exists() {
+        return Err(anyhow!(
+            "Whisper binary not found at {}",
+            whisper_bin.to_string_lossy()
+        ));
+    }
+    if !whisper_model_path.exists() {
+        return Err(anyhow!(
+            "Whisper model not found at {}",
+            whisper_model_path.to_string_lossy()
+        ));
+    }
+    if !wav_path.exists() {
+        return Err(anyhow!(
+            "Input WAV file not found at {}",
+            wav_path.to_string_lossy()
+        ));
+    }
+
+    let mut effective_bin = whisper_bin.to_path_buf();
+    let mut used_fallback = false;
+
+    match probe_whisper_binary_detailed(whisper_bin).await {
+        WhisperProbeResult::Runnable => {}
+        WhisperProbeResult::MissingSharedLibrary(diag)
+        | WhisperProbeResult::Unexecutable(diag) => {
+            if let Some(fallback) = find_fallback_whisper_binary(whisper_bin).await {
+                tracing::warn!(
+                    "Whisper binary at {} failed pre-flight probe ({diag}); falling back to {}",
+                    whisper_bin.display(),
+                    fallback.display()
+                );
+                on_progress(
+                    15.0,
+                    format!(
+                        "GPU/custom whisper-cli missing runtime libraries; falling back to {}",
+                        fallback.display()
+                    ),
+                );
+                effective_bin = fallback;
+                used_fallback = true;
+            } else {
+                return Err(anyhow!(
+                    "Whisper binary at {} cannot run due to missing shared libraries or runtime error ({diag}). Install Vulkan/CUDA runtime libraries (e.g., libvulkan1 on Linux) or switch to the CPU whisper-cli build in Setup.",
+                    whisper_bin.display()
+                ));
+            }
+        }
+        WhisperProbeResult::NonFatalProbeExit(diag) => {
+            tracing::debug!(
+                "whisper-cli --help pre-flight exited non-zero without shared-library error ({diag}); proceeding"
+            );
+        }
+    }
+
+    match execute_whisper_once(
+        &effective_bin,
+        whisper_model_path,
+        vad_model_path,
+        wav_path,
+        source_language,
+        glossary,
+        cancel_flag,
+        &mut on_progress,
+    )
+    .await
+    {
+        Ok(out) => Ok(out),
+        Err(WhisperExecError::MissingSharedLibrary(diag)) => {
+            if !used_fallback {
+                if let Some(fallback) = find_fallback_whisper_binary(&effective_bin).await {
+                    tracing::warn!(
+                        "Whisper binary at {} failed with missing shared library ({diag}); retrying with fallback {}",
+                        effective_bin.display(),
+                        fallback.display()
+                    );
+                    on_progress(
+                        15.0,
+                        format!(
+                            "GPU/custom whisper-cli failed ({diag}); falling back to {}",
+                            fallback.display()
+                        ),
+                    );
+                    return match execute_whisper_once(
+                        &fallback,
+                        whisper_model_path,
+                        vad_model_path,
+                        wav_path,
+                        source_language,
+                        glossary,
+                        cancel_flag,
+                        &mut on_progress,
+                    )
+                    .await
+                    {
+                        Ok(out) => Ok(out),
+                        Err(WhisperExecError::MissingSharedLibrary(d)) => Err(anyhow!(
+                            "Whisper fallback binary also failed due to missing shared libraries: {d}"
+                        )),
+                        Err(WhisperExecError::Other(err)) => Err(err),
+                    };
+                }
+            }
+            Err(anyhow!(
+                "Whisper binary at {} failed due to missing shared libraries ({diag}). Install Vulkan/CUDA runtime libraries (e.g., libvulkan1 on Linux) or switch to the CPU whisper-cli build in Setup.",
+                effective_bin.display()
+            ))
+        }
+        Err(WhisperExecError::Other(err)) => Err(err),
+    }
 }
 
 #[cfg(test)]
@@ -490,5 +737,119 @@ mod tests {
         glossary.insert("Beograd".to_string(), "Београд".to_string());
         let prompt = build_whisper_prompt(&glossary).unwrap();
         assert_eq!(prompt, "Glossary: Beograd, Београд, EasySRT, EasySRT Studio.");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn probes_whisper_binary_runnable_and_falls_back_on_missing_shared_libs() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_whisper_probe_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let gpu_dir = temp_dir.join("whisper-bin-ubuntu-vulkan-x64");
+        let cpu_dir = temp_dir.join("whisper-bin-ubuntu-x64");
+        fs::create_dir_all(&gpu_dir).unwrap();
+        fs::create_dir_all(&cpu_dir).unwrap();
+
+        let gpu_bin = gpu_dir.join("whisper-cli");
+        let cpu_bin = cpu_dir.join("whisper-cli");
+        let model = temp_dir.join("model.bin");
+        let wav = temp_dir.join("audio.wav");
+        fs::write(&model, b"model").unwrap();
+        fs::write(&wav, b"RIFF0000WAVE").unwrap();
+
+        // Missing-shared-library simulated GPU binary
+        {
+            let mut f = fs::File::create(&gpu_bin).unwrap();
+            f.write_all(
+                b"#!/usr/bin/env sh\necho 'error while loading shared libraries: libvulkan.so.1: cannot open shared object file: No such file or directory' >&2\nexit 127\n",
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&gpu_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        // Runnable simulated CPU fallback binary
+        {
+            let mut f = fs::File::create(&cpu_bin).unwrap();
+            f.write_all(
+                br#"#!/usr/bin/env sh
+if [ "$1" = "--help" ]; then
+  echo "usage: whisper-cli"
+  exit 0
+fi
+OUT_PREFIX=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    -of) OUT_PREFIX="$2"; shift 2 ;;
+    *) shift 1 ;;
+  esac
+done
+cat << 'EOF' > "${OUT_PREFIX}.json"
+{
+  "result": { "language": "en" },
+  "transcription": [
+    { "offsets": { "from": 0, "to": 1000 }, "text": "Fallback ok.", "tokens": [] }
+  ]
+}
+EOF
+"#,
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&cpu_bin, fs::Permissions::from_mode(0o755)).unwrap();
+
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        assert!(!probe_whisper_binary_runnable(&gpu_bin).await);
+        assert!(probe_whisper_binary_runnable(&cpu_bin).await);
+        assert!(
+            !probe_whisper_binary_runnable(&temp_dir.join("nonexistent-whisper")).await
+        );
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut progress_msgs = Vec::new();
+        let out = run_whisper_cli(
+            &gpu_bin,
+            &model,
+            None,
+            &wav,
+            "en",
+            &BTreeMap::new(),
+            &cancel,
+            |_, detail| progress_msgs.push(detail),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.words.len(), 2);
+        assert_eq!(out.words[0].text, "Fallback");
+        assert!(progress_msgs
+            .iter()
+            .any(|m| m.contains("falling back to")));
+
+        // Without any sibling fallback, diagnostic error must explain missing shared library
+        fs::remove_file(&cpu_bin).unwrap();
+        let err = run_whisper_cli(
+            &gpu_bin,
+            &model,
+            None,
+            &wav,
+            "en",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("missing shared libraries"));
+        assert!(err.contains("libvulkan.so.1"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

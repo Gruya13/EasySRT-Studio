@@ -42,7 +42,7 @@ pub fn parse_nvidia_smi_output(raw: &str) -> GpuInfo {
             continue;
         }
 
-        let Some(first_token) = mem_part.trim().split_whitespace().next() else {
+        let Some(first_token) = mem_part.split_whitespace().next() else {
             continue;
         };
 

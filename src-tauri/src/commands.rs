@@ -195,6 +195,17 @@ pub async fn run_full_pipeline(
 }
 
 #[tauri::command]
+pub async fn run_local_llm_batch(
+    app: AppHandle,
+    state: State<'_, PipelineState>,
+    projects: Vec<SubtitleProject>,
+) -> Result<Vec<SubtitleProject>, String> {
+    pipeline::run_local_llm_batch(&app, state.inner(), projects)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn cancel_job(
     state: State<'_, PipelineState>,
     job_id: String,

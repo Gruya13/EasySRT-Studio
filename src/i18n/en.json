@@ -71,6 +71,8 @@
     "resegmentNow": "Re-segment Active Project",
     "polishSerbian": "LLM Polish Serbian Transcript",
     "polishSerbianHint": "Fixes grammar, punctuation, and speech recognition artifacts",
+    "correctSourceAsr": "Correct Source ASR",
+    "correctSourceAsrHint": "Fixes speech-to-text errors in source transcript during translation",
     "translationProvider": "Translation & Polish Engine",
     "providerLocal": "Local LLM (Offline CUDA)",
     "providerDeepSeek": "DeepSeek API (Online)",

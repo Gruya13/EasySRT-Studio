@@ -45,6 +45,7 @@ pub fn run() {
             commands::polish_project,
             commands::condense_project_cps,
             commands::run_full_pipeline,
+            commands::run_local_llm_batch,
             commands::cancel_job,
             commands::convert_cues_script,
             commands::export_subtitles,

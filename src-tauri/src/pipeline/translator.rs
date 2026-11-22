@@ -81,10 +81,29 @@ fn normalize_cue_single_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedCueText {
+    pub source: Option<String>,
+    pub text: String,
+}
+
 #[derive(Debug, Deserialize)]
 struct BatchOutputItem {
     id: u32,
+    #[serde(default)]
+    source: Option<String>,
     text: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum KeyedCueValue {
+    Text(String),
+    Object {
+        #[serde(default)]
+        source: Option<String>,
+        text: String,
+    },
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,7 +114,7 @@ enum BatchResponseEnvelope {
         #[serde(alias = "cues", alias = "translations", alias = "results")]
         items: Vec<BatchOutputItem>,
     },
-    KeyedMap(BTreeMap<String, String>),
+    KeyedMap(BTreeMap<String, KeyedCueValue>),
 }
 
 fn think_tag_regex() -> &'static Regex {
@@ -152,10 +171,11 @@ pub fn clean_llm_json_response(raw: &str) -> String {
 }
 
 /// Parses the LLM JSON output and verifies that every expected cue `id` is present and non-empty.
+/// Supports both plain string values (`"1": "..."`) and dual-column objects (`"1": {"source": "...", "text": "..."}`).
 pub fn parse_and_validate_batch_response(
     raw: &str,
     expected_ids: &[u32],
-) -> Result<BTreeMap<u32, String>> {
+) -> Result<BTreeMap<u32, ParsedCueText>> {
     let cleaned = clean_llm_json_response(raw);
     let envelope: BatchResponseEnvelope = serde_json::from_str(&cleaned).with_context(|| {
         format!(
@@ -170,16 +190,33 @@ pub fn parse_and_validate_batch_response(
             for item in items {
                 let text = normalize_cue_single_line(&item.text);
                 if !text.is_empty() {
-                    map.insert(item.id, text);
+                    let source = item
+                        .source
+                        .map(|s| normalize_cue_single_line(&s))
+                        .filter(|s| !s.is_empty());
+                    map.insert(item.id, ParsedCueText { source, text });
                 }
             }
         }
         BatchResponseEnvelope::KeyedMap(kv) => {
             for (k, v) in kv {
                 if let Ok(id) = k.trim().parse::<u32>() {
-                    let text = normalize_cue_single_line(&v);
-                    if !text.is_empty() {
-                        map.insert(id, text);
+                    match v {
+                        KeyedCueValue::Text(t) => {
+                            let text = normalize_cue_single_line(&t);
+                            if !text.is_empty() {
+                                map.insert(id, ParsedCueText { source: None, text });
+                            }
+                        }
+                        KeyedCueValue::Object { source, text } => {
+                            let text = normalize_cue_single_line(&text);
+                            if !text.is_empty() {
+                                let source = source
+                                    .map(|s| normalize_cue_single_line(&s))
+                                    .filter(|s| !s.is_empty());
+                                map.insert(id, ParsedCueText { source, text });
+                            }
+                        }
                     }
                 }
             }
@@ -201,15 +238,31 @@ pub fn parse_and_validate_batch_response(
 fn build_response_format(
     endpoint: &LlmEndpointConfig,
     expected_ids: &[u32],
+    correct_source_asr: bool,
+    operation: BatchOperation,
 ) -> Option<serde_json::Value> {
     let is_local =
         endpoint.base_url.contains("127.0.0.1") || endpoint.base_url.contains("localhost");
     if is_local {
+        let dual_column = correct_source_asr && operation == BatchOperation::Translate;
         let mut props = serde_json::Map::new();
         let mut req_keys = Vec::with_capacity(expected_ids.len());
         for &id in expected_ids {
             let key = id.to_string();
-            props.insert(key.clone(), serde_json::json!({ "type": "string" }));
+            let prop_schema = if dual_column {
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "source": { "type": "string" },
+                        "text": { "type": "string" }
+                    },
+                    "required": ["source", "text"],
+                    "additionalProperties": false
+                })
+            } else {
+                serde_json::json!({ "type": "string" })
+            };
+            props.insert(key.clone(), prop_schema);
             req_keys.push(key);
         }
         Some(serde_json::json!({
@@ -235,6 +288,7 @@ fn build_system_prompt(
     source_language: &str,
     target_language: &str,
     glossary: &BTreeMap<String, String>,
+    correct_source_asr: bool,
 ) -> String {
     let mut prompt = match operation {
         BatchOperation::Translate => {
@@ -243,15 +297,28 @@ fn build_system_prompt(
             } else {
                 "Translate accurately, idiomatically, and concisely into the target language for subtitles."
             };
-            format!(
-                "You are an expert subtitle translator from '{}' to '{}'. {}\n\
-                 STRICT RULES:\n\
-                 1. Reconstruct full sentences mentally across adjacent cues (`context_before`, `translate_cues`, `context_after`) so that phrases split across cue boundaries translate into coherent, natural grammar.\n\
-                 2. Translate ONLY the items in `translate_cues`, preserving each cue's corresponding portion of the sentence and staying within each item's `max_chars` reading-speed budget whenever natural.\n\
-                 3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
-                 4. Output ONLY a valid JSON object mapping each cue ID string to its translated text: `{{\"1\": \"...\", \"2\": \"...\"}}` with no markdown fences and no commentary.",
-                source_language, target_language, target_instructions
-            )
+            if correct_source_asr {
+                format!(
+                    "You are an expert subtitle translator from '{}' to '{}' and ASR transcript proofreader. {}\n\
+                     STRICT RULES:\n\
+                     1. Reconstruct full sentences mentally across adjacent cues (`context_before`, `translate_cues`, `context_after`) so that phrases split across cue boundaries translate into coherent, natural grammar.\n\
+                     2. ALSO fix obvious speech-to-text phonetic/homophone errors in the source text (e.g., \"Aesip\" -> \"Aesop\") based on context without altering the speaker's words, and translate using the corrected source meaning.\n\
+                     3. Translate ONLY the items in `translate_cues`, preserving each cue's corresponding portion of the sentence and staying within each item's `max_chars` reading-speed budget whenever natural.\n\
+                     4. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+                     5. Output ONLY a valid JSON object mapping each cue ID string to an object `{{\"1\": {{\"source\": \"<corrected source text>\", \"text\": \"<translated text>\"}}}}` with no markdown fences and no commentary.",
+                    source_language, target_language, target_instructions
+                )
+            } else {
+                format!(
+                    "You are an expert subtitle translator from '{}' to '{}'. {}\n\
+                     STRICT RULES:\n\
+                     1. Reconstruct full sentences mentally across adjacent cues (`context_before`, `translate_cues`, `context_after`) so that phrases split across cue boundaries translate into coherent, natural grammar.\n\
+                     2. Translate ONLY the items in `translate_cues`, preserving each cue's corresponding portion of the sentence and staying within each item's `max_chars` reading-speed budget whenever natural.\n\
+                     3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+                     4. Output ONLY a valid JSON object mapping each cue ID string to its translated text: `{{\"1\": \"...\", \"2\": \"...\"}}` with no markdown fences and no commentary.",
+                    source_language, target_language, target_instructions
+                )
+            }
         }
         BatchOperation::PolishSerbian => {
             "You are an expert Serbian subtitle editor and proofreader.\n\
@@ -447,12 +514,13 @@ async fn translate_slice_with_subdivision(
     client: &reqwest::Client,
     endpoint: &LlmEndpointConfig,
     operation: BatchOperation,
+    correct_source_asr: bool,
     rules: &SegmentRules,
     system_prompt: &str,
     all_cues: &[SubtitleCue],
     target_indices: &[usize],
     cancel_flag: &Arc<AtomicBool>,
-) -> Result<BTreeMap<u32, String>> {
+) -> Result<BTreeMap<u32, ParsedCueText>> {
     let mut out = BTreeMap::new();
     if target_indices.is_empty() {
         return Ok(out);
@@ -479,7 +547,8 @@ async fn translate_slice_with_subdivision(
             slice_indices,
             ctx_after,
         )?;
-        let response_format = build_response_format(endpoint, &expected_ids);
+        let response_format =
+            build_response_format(endpoint, &expected_ids, correct_source_asr, operation);
 
         let max_attempts = if slice_indices.len() == 1 { 2 } else { 1 };
         let mut last_err = None;
@@ -552,6 +621,7 @@ where
         &project.options.source_language,
         &project.options.target_language,
         &project.options.glossary,
+        project.options.correct_source_asr,
     );
 
     let client = reqwest::Client::builder()
@@ -624,6 +694,7 @@ where
             &client,
             endpoint,
             operation,
+            project.options.correct_source_asr,
             &rules,
             &system_prompt,
             &project.cues,
@@ -634,12 +705,23 @@ where
 
         for &idx in &target_indices {
             let cue = &mut project.cues[idx];
-            if let Some(updated_text) = batch_results.get(&cue.id) {
+            if let Some(parsed) = batch_results.get(&cue.id) {
+                if operation == BatchOperation::Translate && project.options.correct_source_asr {
+                    if let Some(src) = &parsed.source {
+                        if !src.trim().is_empty() {
+                            cue.source_text = segmenter::wrap_balanced_lines(
+                                src,
+                                rules.max_chars_per_line,
+                                rules.max_lines,
+                            );
+                        }
+                    }
+                }
                 let scripted = if is_serbian_target {
-                    let ekavian = sr_script::normalize_ekavian(updated_text);
+                    let ekavian = sr_script::normalize_ekavian(&parsed.text);
                     sr_script::convert_script(&ekavian, project.options.script)
                 } else {
-                    updated_text.clone()
+                    parsed.text.clone()
                 };
                 let wrapped = segmenter::wrap_balanced_lines(
                     &scripted,
@@ -823,8 +905,8 @@ mod tests {
     fn cleans_think_tags_and_markdown_fences() {
         let raw = "<think>\nLet me translate cues 1 and 2 carefully.\n</think>\n```json\n[\n  {\"id\": 1, \"text\": \"Dobro jutro\"},\n  {\"id\": 2, \"text\": \"Dobrodošli\"}\n]\n```";
         let map = parse_and_validate_batch_response(raw, &[1, 2]).unwrap();
-        assert_eq!(map.get(&1).map(String::as_str), Some("Dobro jutro"));
-        assert_eq!(map.get(&2).map(String::as_str), Some("Dobrodošli"));
+        assert_eq!(map.get(&1).map(|v| v.text.as_str()), Some("Dobro jutro"));
+        assert_eq!(map.get(&2).map(|v| v.text.as_str()), Some("Dobrodošli"));
     }
 
     #[tokio::test]
@@ -1017,8 +1099,28 @@ mod tests {
     fn parses_keyed_json_map_with_brackets_and_builds_response_formats() {
         let raw = "<think>ok</think>```json\n{\"1\": \"Zdravo [SMEH] svima.\", \"2\": \"Kako ste?\"}\n```";
         let map = parse_and_validate_batch_response(raw, &[1, 2]).unwrap();
-        assert_eq!(map.get(&1).map(String::as_str), Some("Zdravo [SMEH] svima."));
-        assert_eq!(map.get(&2).map(String::as_str), Some("Kako ste?"));
+        assert_eq!(
+            map.get(&1).map(|v| v.text.as_str()),
+            Some("Zdravo [SMEH] svima.")
+        );
+        assert_eq!(map.get(&2).map(|v| v.text.as_str()), Some("Kako ste?"));
+
+        let dual_raw = "{\"1\": {\"source\": \"Section 37 of Aesop.\", \"text\": \"Odeljak 37 Ezopa.\"}, \"2\": \"Kako ste?\"}";
+        let dual_map = parse_and_validate_batch_response(dual_raw, &[1, 2]).unwrap();
+        assert_eq!(
+            dual_map.get(&1),
+            Some(&ParsedCueText {
+                source: Some("Section 37 of Aesop.".to_string()),
+                text: "Odeljak 37 Ezopa.".to_string(),
+            })
+        );
+        assert_eq!(
+            dual_map.get(&2),
+            Some(&ParsedCueText {
+                source: None,
+                text: "Kako ste?".to_string(),
+            })
+        );
 
         let local_ep = LlmEndpointConfig {
             base_url: "http://127.0.0.1:8080/v1".to_string(),
@@ -1026,12 +1128,32 @@ mod tests {
             api_key: None,
             batch_size: 25,
         };
-        let local_rf = build_response_format(&local_ep, &[1, 2]).unwrap();
+        let local_rf =
+            build_response_format(&local_ep, &[1, 2], false, BatchOperation::Translate).unwrap();
         assert_eq!(local_rf["type"], "json_schema");
         assert_eq!(local_rf["json_schema"]["strict"], true);
         assert_eq!(
             local_rf["json_schema"]["schema"]["required"],
             serde_json::json!(["1", "2"])
+        );
+        assert_eq!(
+            local_rf["json_schema"]["schema"]["properties"]["1"],
+            serde_json::json!({ "type": "string" })
+        );
+
+        let dual_rf =
+            build_response_format(&local_ep, &[1, 2], true, BatchOperation::Translate).unwrap();
+        assert_eq!(
+            dual_rf["json_schema"]["schema"]["properties"]["1"],
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["source", "text"],
+                "additionalProperties": false
+            })
         );
 
         let cloud_ep = LlmEndpointConfig {
@@ -1040,7 +1162,8 @@ mod tests {
             api_key: Some("k".to_string()),
             batch_size: 25,
         };
-        let cloud_rf = build_response_format(&cloud_ep, &[1, 2]).unwrap();
+        let cloud_rf =
+            build_response_format(&cloud_ep, &[1, 2], true, BatchOperation::Translate).unwrap();
         assert_eq!(cloud_rf["type"], "json_object");
     }
 
@@ -1159,5 +1282,187 @@ mod tests {
         assert!(project.cues[0].cps <= project.options.segment_rules.max_cps);
         assert_eq!(project.cues[1].translated_text, "Kratak titl.");
         assert_eq!(project.completed_translation_batches, 2);
+    }
+
+    #[tokio::test]
+    async fn translates_and_corrects_source_asr_in_single_pass() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_requests = Arc::new(tokio::sync::Mutex::new(Vec::<serde_json::Value>::new()));
+        let captured_clone = Arc::clone(&captured_requests);
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let captured_clone = Arc::clone(&captured_clone);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 32768];
+                    let mut total_read = 0usize;
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+
+                    loop {
+                        let n = socket.read(&mut buf[total_read..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total_read += n;
+                        let s = String::from_utf8_lossy(&buf[..total_read]);
+                        if header_end.is_none() {
+                            if let Some(pos) = s.find("\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                                for line in s[..pos].lines() {
+                                    if let Some(v) =
+                                        line.to_ascii_lowercase().strip_prefix("content-length:")
+                                    {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(h_end) = header_end {
+                            if total_read >= h_end + content_len {
+                                break;
+                            }
+                        }
+                    }
+
+                    let raw_req = String::from_utf8_lossy(&buf[..total_read]).to_string();
+                    let body_part = raw_req.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let req_json: serde_json::Value =
+                        serde_json::from_str(body_part).unwrap_or_default();
+                    {
+                        let mut guard = captured_clone.lock().await;
+                        guard.push(req_json.clone());
+                    }
+
+                    let llm_content = serde_json::json!({
+                        "1": {
+                            "source": "Section 37 of the Aesop for Children, and this is a classic fable.",
+                            "text": "Odeljak 37 Ezopovih basni za decu, a ovo je klasična basna."
+                        },
+                        "2": {
+                            "source": "Welcome to Belgrade!",
+                            "text": "Dobrodošli u Beograd!"
+                        }
+                    })
+                    .to_string();
+
+                    let resp_json = serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": llm_content
+                            }
+                        }]
+                    });
+                    let resp_body = serde_json::to_string(&resp_json).unwrap();
+                    let http_resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = socket.write_all(http_resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut project = SubtitleProject {
+            job_id: "dual-asr-job".to_string(),
+            audio_path: "/tmp/fable.mp3".to_string(),
+            audio_file_name: "fable.mp3".to_string(),
+            duration_ms: 8000,
+            detected_language: Some("en".to_string()),
+            options: JobOptions {
+                source_language: "en".to_string(),
+                target_language: "sr".to_string(),
+                script: SerbianScript::Latin,
+                correct_source_asr: true,
+                ..JobOptions::default()
+            },
+            words: vec![],
+            cues: vec![
+                SubtitleCue {
+                    id: 1,
+                    start_ms: 0,
+                    end_ms: 4000,
+                    source_text: "Section 37 of the Aesip for Children, and this is a classic fable."
+                        .to_string(),
+                    translated_text: String::new(),
+                    cps: 16.0,
+                    warnings: vec![],
+                },
+                SubtitleCue {
+                    id: 2,
+                    start_ms: 4000,
+                    end_ms: 6500,
+                    source_text: "Welcome to Bellgrade!".to_string(),
+                    translated_text: String::new(),
+                    cps: 8.0,
+                    warnings: vec![],
+                },
+            ],
+            phase: JobPhase::Translating,
+            completed_translation_batches: 0,
+            error_message: None,
+            updated_at: "2026-11-22T22:00:00Z".to_string(),
+        };
+
+        let endpoint = LlmEndpointConfig {
+            base_url: format!("http://127.0.0.1:{}/v1", addr.port()),
+            model: "local-llm".to_string(),
+            api_key: None,
+            batch_size: 25,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut checkpoints = 0usize;
+
+        translate_cues(
+            &mut project,
+            &endpoint,
+            &cancel,
+            |_| {
+                checkpoints += 1;
+                Ok(())
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        server_task.abort();
+
+        assert_eq!(checkpoints, 1);
+        assert_eq!(project.completed_translation_batches, 1);
+
+        // Verify local json_schema enforced {"source": string, "text": string} per cue ID
+        let reqs = captured_requests.lock().await;
+        assert_eq!(reqs.len(), 1);
+        let sys_prompt = reqs[0]["messages"][0]["content"].as_str().unwrap_or("");
+        assert!(sys_prompt.contains("Aesop"));
+        assert!(sys_prompt.contains("\"source\""));
+        assert_eq!(
+            reqs[0]["response_format"]["json_schema"]["schema"]["properties"]["1"],
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "source": { "type": "string" },
+                    "text": { "type": "string" }
+                },
+                "required": ["source", "text"],
+                "additionalProperties": false
+            })
+        );
+
+        // Verify both source_text (with balanced line wrapping) and translated_text were updated
+        assert!(project.cues[0].source_text.contains("Aesop"));
+        assert!(!project.cues[0].source_text.contains("Aesip"));
+        assert_eq!(project.cues[0].source_text.lines().count(), 2);
+        assert!(project.cues[0].translated_text.contains("Ezopovih"));
+        assert_eq!(project.cues[0].translated_text.lines().count(), 2);
+        assert_eq!(project.cues[1].source_text, "Welcome to Belgrade!");
+        assert_eq!(project.cues[1].translated_text, "Dobrodošli u Beograd!");
     }
 }

@@ -230,6 +230,7 @@ async fn main() -> Result<()> {
                 segment_rules: rules,
                 glossary: glossary.clone(),
                 polish_serbian: true,
+                correct_source_asr: false,
                 provider_override: Some(if use_deepseek {
                     TranslationProviderKind::DeepSeek
                 } else {

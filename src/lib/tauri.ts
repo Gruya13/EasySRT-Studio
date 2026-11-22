@@ -221,6 +221,15 @@ export function runFullPipeline(
   });
 }
 
+export function runLocalLlmBatch(
+  projects: SubtitleProject[],
+): Promise<SubtitleProject[]> {
+  if (!isTauriRuntime()) {
+    return browserFallback.runLocalLlmBatch(projects);
+  }
+  return invoke<SubtitleProject[]>("run_local_llm_batch", { projects });
+}
+
 export function cancelJob(jobId: string): Promise<void> {
   if (!isTauriRuntime()) {
     return browserFallback.cancelJob(jobId);
