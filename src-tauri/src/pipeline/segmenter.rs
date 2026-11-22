@@ -106,6 +106,81 @@ fn ends_with_clause_punct(word: &str) -> bool {
         || trimmed.ends_with('–')
 }
 
+fn is_dangling_function_word(word: &str) -> bool {
+    let clean = word
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    matches!(
+        clean.as_str(),
+        "the"
+            | "a"
+            | "an"
+            | "to"
+            | "of"
+            | "in"
+            | "on"
+            | "at"
+            | "by"
+            | "for"
+            | "with"
+            | "from"
+            | "into"
+            | "and"
+            | "or"
+            | "but"
+            | "has"
+            | "have"
+            | "had"
+            | "is"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "we"
+            | "i"
+            | "you"
+            | "they"
+            | "he"
+            | "she"
+            | "this"
+            | "that"
+            | "our"
+            | "my"
+            | "your"
+            | "his"
+            | "her"
+            | "their"
+            | "not"
+            | "no"
+            | "u"
+            | "na"
+            | "za"
+            | "od"
+            | "do"
+            | "sa"
+            | "s"
+            | "iz"
+            | "kroz"
+            | "o"
+            | "po"
+            | "pri"
+            | "ka"
+            | "k"
+            | "ali"
+            | "ili"
+            | "da"
+            | "je"
+            | "su"
+            | "sam"
+            | "smo"
+            | "ste"
+            | "ću"
+            | "će"
+            | "bi"
+            | "ne"
+    )
+}
+
 /// Groups `TimedWord`s into readable `SubtitleCue`s according to `rules`.
 pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleCue> {
     let rules = normalize_rules(rules);
@@ -161,10 +236,18 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
                 break;
             }
 
-            // Priority 3: Break on speech pause >= 350ms between consecutive words
+            // Priority 2/3: Break on clause punctuation with short pause, or longer speech pause
+            // without leaving dangling function words (articles/prepositions/auxiliaries) at cue end.
             if let Some(next_word) = cleaned_words.get(i + 1) {
                 let gap = next_word.start_ms.saturating_sub(cleaned_words[i].end_ms);
-                if gap >= PAUSE_SPLIT_THRESHOLD_MS {
+                if ends_with_clause_punct(&cleaned_words[i].text) && gap >= 200 {
+                    last_fit_idx = i;
+                    hit_hard_limit = false;
+                    break;
+                }
+                if !is_dangling_function_word(&cleaned_words[i].text)
+                    && (gap >= 500 || (gap >= PAUSE_SPLIT_THRESHOLD_MS && char_len >= 28))
+                {
                     last_fit_idx = i;
                     hit_hard_limit = false;
                     break;
@@ -179,7 +262,10 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
             // Priority 2: Clause punctuation (`,`, `;`, `:`, `—`)
             if let Some(clause_idx) = (start_idx..=last_fit_idx)
                 .rev()
-                .find(|&idx| ends_with_clause_punct(&cleaned_words[idx].text))
+                .find(|&idx| {
+                    ends_with_clause_punct(&cleaned_words[idx].text)
+                        && !is_dangling_function_word(&cleaned_words[idx].text)
+                })
             {
                 end_idx = clause_idx;
             } else if let Some(pause_idx) = (start_idx..last_fit_idx).rev().find(|&idx| {
@@ -187,8 +273,17 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
                     .start_ms
                     .saturating_sub(cleaned_words[idx].end_ms)
                     >= SOFT_PAUSE_THRESHOLD_MS
+                    && !is_dangling_function_word(&cleaned_words[idx].text)
             }) {
                 end_idx = pause_idx;
+            } else if is_dangling_function_word(&cleaned_words[last_fit_idx].text) {
+                if let Some(non_dangling) = (start_idx..last_fit_idx)
+                    .rev()
+                    .take(2)
+                    .find(|&idx| !is_dangling_function_word(&cleaned_words[idx].text))
+                {
+                    end_idx = non_dangling;
+                }
             }
         }
 
@@ -445,5 +540,22 @@ mod tests {
         assert!(cue.warnings.contains(&"high_cps".to_string()));
         assert!(cue.warnings.contains(&"line_too_long".to_string()));
         assert!(cue.warnings.contains(&"duration_too_short".to_string()));
+    }
+
+    #[test]
+    fn avoids_splitting_after_dangling_function_words() {
+        let words = vec![
+            word(0, 300, "Villages"),
+            word(300, 600, "were"),
+            word(600, 900, "forced"),
+            word(900, 1100, "to"),
+            // 420ms BPE timestamp jitter right after "to"
+            word(1520, 1900, "fly"),
+            word(1900, 2300, "away."),
+        ];
+        let rules = SegmentRules::default();
+        let cues = segment_words(&words, &rules);
+        assert_eq!(cues.len(), 1);
+        assert_eq!(cues[0].source_text, "Villages were forced to fly away.");
     }
 }

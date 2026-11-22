@@ -319,6 +319,10 @@ where
         }
     };
 
+    let threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(4, 16))
+        .unwrap_or(4);
+
     let mut cmd = Command::new(whisper_bin);
     configure_command_env(&mut cmd, whisper_bin);
 
@@ -328,6 +332,14 @@ where
         .arg(wav_path)
         .arg("-l")
         .arg(lang)
+        .arg("-t")
+        .arg(threads.to_string())
+        .arg("-bs")
+        .arg("1")
+        .arg("-bo")
+        .arg("1")
+        .arg("-nf")
+        .arg("-fa")
         .arg("-ojf")
         .arg("-of")
         .arg(&output_prefix);

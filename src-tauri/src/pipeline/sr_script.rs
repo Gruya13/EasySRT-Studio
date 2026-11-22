@@ -337,6 +337,270 @@ fn map_single_latin_to_cyrillic(ch: char) -> char {
     }
 }
 
+const EXACT_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
+    ("ovdje", "ovde"),
+    ("gdje", "gde"),
+    ("igdje", "igde"),
+    ("nigdje", "nigde"),
+    ("negdje", "negde"),
+    ("svugdje", "svugde"),
+    ("prije", "pre"),
+    ("poslije", "posle"),
+    ("uvijek", "uvek"),
+    ("zauvijek", "zauvek"),
+    ("oduvijek", "oduvek"),
+    ("vrijeme", "vreme"),
+    ("čovjek", "čovek"),
+    ("čovječe", "čoveče"),
+    ("čovjeka", "čoveka"),
+    ("čovjeku", "čoveku"),
+    ("čovjekom", "čovekom"),
+    ("dijete", "dete"),
+    ("djeteta", "deteta"),
+    ("djetetu", "detetu"),
+    ("djetetom", "detetom"),
+    ("djeca", "deca"),
+    ("djece", "dece"),
+    ("djeci", "deci"),
+    ("djecu", "decu"),
+    ("djecom", "decom"),
+    ("djed", "deda"),
+    ("djeda", "dede"),
+    ("djedu", "dedi"),
+    ("pradjed", "pradeda"),
+    ("pradjedova", "pradedova"),
+    ("pradjedovi", "pradedovi"),
+    ("hljeb", "hleb"),
+    ("hljeba", "hleba"),
+    ("hljebu", "hlebu"),
+    ("mlijeko", "mleko"),
+    ("mlijeka", "mleka"),
+    ("mlijeku", "mleku"),
+    ("rijeka", "reka"),
+    ("rijeke", "reke"),
+    ("rijeci", "reci"),
+    ("rijeku", "reku"),
+    ("rijekom", "rekom"),
+    ("riječ", "reč"),
+    ("riječi", "reči"),
+    ("riječima", "rečima"),
+    ("vijest", "vest"),
+    ("vijesti", "vesti"),
+    ("povijest", "istorija"),
+    ("svijet", "svet"),
+    ("svijeta", "sveta"),
+    ("svijetu", "svetu"),
+    ("svijetom", "svetom"),
+    ("svjetli", "svetli"),
+    ("svjetla", "svetla"),
+    ("svjetlo", "svetlo"),
+    ("svjetlost", "svetlost"),
+    ("cvijet", "cvet"),
+    ("cvijeta", "cveta"),
+    ("cvjetna", "cvetna"),
+    ("cvjetni", "cvetni"),
+    ("cvjetno", "cvetno"),
+    ("ljeto", "leto"),
+    ("ljeta", "leta"),
+    ("ljetu", "letu"),
+    ("vjetar", "vetar"),
+    ("vjetra", "vetra"),
+    ("vjetru", "vetru"),
+    ("mjesto", "mesto"),
+    ("mjesta", "mesta"),
+    ("mjestu", "mestu"),
+    ("mjestom", "mestom"),
+    ("mjera", "mera"),
+    ("mjere", "mere"),
+    ("mjeru", "meru"),
+    ("nedjelja", "nedelja"),
+    ("nedjelje", "nedelje"),
+    ("nedjelju", "nedelju"),
+    ("ponedjeljak", "ponedeljak"),
+    ("srijeda", "sreda"),
+    ("srijedu", "sredu"),
+    ("uspjeh", "uspeh"),
+    ("uspjeha", "uspeha"),
+    ("uspjehu", "uspehu"),
+    ("uspješno", "uspešno"),
+    ("uspješan", "uspešan"),
+    ("uspješna", "uspešna"),
+    ("osmijeh", "osmeh"),
+    ("osmijeha", "osmeha"),
+    ("smijeh", "smeh"),
+    ("smijeha", "smeha"),
+    ("grijeh", "greh"),
+    ("grijeha", "greha"),
+    ("lijep", "lep"),
+    ("lijepa", "lepa"),
+    ("lijepo", "lepo"),
+    ("lijepog", "lepog"),
+    ("lijepom", "lepom"),
+    ("ljepota", "lepota"),
+    ("bijel", "beo"),
+    ("bijela", "bela"),
+    ("bijelo", "belo"),
+    ("bijeli", "beli"),
+    ("cijeli", "ceo"),
+    ("cijela", "cela"),
+    ("cijelo", "celo"),
+    ("cijelog", "celog"),
+    ("cijelom", "celom"),
+    ("dio", "deo"),
+    ("dijela", "dela"),
+    ("dijelu", "delu"),
+    ("htjeti", "hteti"),
+    ("vidjeti", "videti"),
+    ("željeti", "želeti"),
+    ("živjeti", "živeti"),
+    ("voljeti", "voleti"),
+    ("umrijeti", "umreti"),
+    ("mrijeti", "mreti"),
+    ("grijeti", "grejati"),
+    ("grije", "greje"),
+];
+
+const STEM_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
+    ("zabilješk", "zabelešk"),
+    ("zabiljež", "zabelež"),
+    ("bilješk", "belešk"),
+    ("nijemac", "nemac"),
+    ("nijemci", "nemci"),
+    ("njemačk", "nemačk"),
+    ("zahtijev", "zahtev"),
+    ("zahtjev", "zahtev"),
+    ("primijet", "primet"),
+    ("primjeć", "primeć"),
+    ("razumijev", "razumev"),
+    ("razumjet", "razumet"),
+    ("povjerenj", "poverenj"),
+    ("vjerov", "verov"),
+    ("vjeruj", "veruj"),
+    ("pjesm", "pesm"),
+    ("djevoj", "devoj"),
+    ("osjeć", "oseć"),
+    ("osjet", "oset"),
+    ("prebjeg", "prebeg"),
+    ("pobjeg", "pobeg"),
+    ("pobjed", "pobed"),
+    ("bjež", "bež"),
+    ("svjedoč", "svedoč"),
+    ("svjedok", "svedok"),
+    ("vrijedn", "vredn"),
+    ("vrjedn", "vredn"),
+];
+
+fn is_cyrillic_alpha(ch: char) -> bool {
+    matches!(
+        ch,
+        'А'..='Я' | 'а'..='я' | 'Ђ' | 'ђ' | 'Ј' | 'ј' | 'Љ' | 'љ' | 'Њ' | 'њ' | 'Ћ' | 'ћ' | 'Џ' | 'џ'
+    )
+}
+
+fn apply_case_pattern(template_latin: &str, replacement_lower: &str) -> String {
+    let alpha_chars: Vec<char> = template_latin
+        .chars()
+        .filter(|c| c.is_alphabetic())
+        .collect();
+    if alpha_chars.len() > 1 && alpha_chars.iter().all(|c| c.is_uppercase()) {
+        return replacement_lower.to_uppercase();
+    }
+    if template_latin
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_uppercase())
+    {
+        let mut chars = replacement_lower.chars();
+        if let Some(first) = chars.next() {
+            let mut out: String = first.to_uppercase().collect();
+            out.push_str(chars.as_str());
+            return out;
+        }
+    }
+    replacement_lower.to_string()
+}
+
+fn normalize_ekavian_word(token: &str) -> String {
+    let was_cyrillic = token.chars().any(is_cyrillic_alpha);
+    let latin = if was_cyrillic {
+        to_latin(token)
+    } else {
+        token.to_string()
+    };
+    let lower = latin.to_lowercase();
+
+    let replaced_lower = if let Some(&(_, ekav)) = EXACT_IJEKAVIAN_TO_EKAVIAN
+        .iter()
+        .find(|&&(ijek, _)| ijek == lower)
+    {
+        Some(ekav.to_string())
+    } else {
+        STEM_IJEKAVIAN_TO_EKAVIAN
+            .iter()
+            .find_map(|&(ijek_stem, ekav_stem)| {
+                lower
+                    .strip_prefix(ijek_stem)
+                    .map(|suffix| format!("{ekav_stem}{suffix}"))
+            })
+    };
+
+    let Some(next_lower) = replaced_lower else {
+        return token.to_string();
+    };
+
+    let cased_latin = apply_case_pattern(&latin, &next_lower);
+    if was_cyrillic {
+        to_cyrillic(&cased_latin)
+    } else {
+        cased_latin
+    }
+}
+
+fn normalize_ekavian_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    let mut word_buf = String::new();
+
+    for ch in segment.chars() {
+        if ch.is_alphabetic() {
+            word_buf.push(ch);
+        } else {
+            if !word_buf.is_empty() {
+                out.push_str(&normalize_ekavian_word(&word_buf));
+                word_buf.clear();
+            }
+            out.push(ch);
+        }
+    }
+
+    if !word_buf.is_empty() {
+        out.push_str(&normalize_ekavian_word(&word_buf));
+    }
+
+    out
+}
+
+/// Normalizes common unambiguous Ijekavian words and stems into Serbian Ekavian
+/// while preserving casing, URLs, emails, HTML/ASS tags, and Cyrillic/Latin script.
+pub fn normalize_ekavian(text: &str) -> String {
+    let re = protected_span_regex();
+    let mut out = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for m in re.find_iter(text) {
+        if m.start() > last_end {
+            out.push_str(&normalize_ekavian_segment(&text[last_end..m.start()]));
+        }
+        out.push_str(m.as_str());
+        last_end = m.end();
+    }
+
+    if last_end < text.len() {
+        out.push_str(&normalize_ekavian_segment(&text[last_end..]));
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -400,5 +664,22 @@ mod tests {
         );
         let back_to_latin = convert_script(&cyr, SerbianScript::Latin);
         assert_eq!(back_to_latin, latin);
+    }
+
+    #[test]
+    fn normalizes_ijekavian_to_ekavian_preserving_case_and_script() {
+        let input = "Ostajte ovdje, sunce tuđeg neba, zahtjevao sam zabilješku od Nijemaca za djecu i pjesme.";
+        assert_eq!(
+            normalize_ekavian(input),
+            "Ostajte ovde, sunce tuđeg neba, zahtevao sam zabelešku od Nemaca za decu i pesme."
+        );
+
+        let cyr_input = "Овдје је лијепо вријеме за дјецу и пјесме.";
+        assert_eq!(
+            normalize_ekavian(cyr_input),
+            "Овде је лепо време за децу и песме."
+        );
+
+        assert_eq!(normalize_ekavian("OVDJE I UVIJEK"), "OVDE I UVEK");
     }
 }

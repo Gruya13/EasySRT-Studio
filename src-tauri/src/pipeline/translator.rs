@@ -41,6 +41,8 @@ struct ChatCompletionRequest {
     model: String,
     messages: Vec<ChatMessage>,
     temperature: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -60,16 +62,20 @@ struct ChatChoice {
 }
 
 #[derive(Debug, Serialize)]
-struct BatchPromptPayload<'a> {
-    context_before: Vec<PromptCueItem<'a>>,
-    translate_cues: Vec<PromptCueItem<'a>>,
-    context_after: Vec<PromptCueItem<'a>>,
+struct BatchPromptPayload {
+    context_before: Vec<PromptCueItem>,
+    translate_cues: Vec<PromptCueItem>,
+    context_after: Vec<PromptCueItem>,
 }
 
 #[derive(Debug, Serialize)]
-struct PromptCueItem<'a> {
+struct PromptCueItem {
     id: u32,
-    text: &'a str,
+    text: String,
+}
+
+fn normalize_cue_single_line(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 #[derive(Debug, Deserialize)]
@@ -86,6 +92,7 @@ enum BatchResponseEnvelope {
         #[serde(alias = "cues", alias = "translations", alias = "results")]
         items: Vec<BatchOutputItem>,
     },
+    KeyedMap(BTreeMap<String, String>),
 }
 
 fn think_tag_regex() -> &'static Regex {
@@ -94,7 +101,7 @@ fn think_tag_regex() -> &'static Regex {
 }
 
 /// Strips `<think>...</think>` blocks and markdown code fences from an LLM response,
-/// isolating the JSON payload.
+/// isolating the JSON object `{...}` or array `[...]`.
 pub fn clean_llm_json_response(raw: &str) -> String {
     let without_think = think_tag_regex().replace_all(raw, "");
     let trimmed = without_think.trim();
@@ -115,11 +122,27 @@ pub fn clean_llm_json_response(raw: &str) -> String {
         trimmed
     };
 
-    // Isolate the outermost JSON array `[...]` if present
-    if let (Some(start), Some(end)) = (unfenced.find('['), unfenced.rfind(']')) {
-        if start < end {
-            return unfenced[start..=end].to_string();
+    // Isolate the outermost JSON object `{...}` or array `[...]` based on whichever starts first
+    let obj_bounds = unfenced
+        .find('{')
+        .zip(unfenced.rfind('}'))
+        .filter(|(s, e)| s < e);
+    let arr_bounds = unfenced
+        .find('[')
+        .zip(unfenced.rfind(']'))
+        .filter(|(s, e)| s < e);
+
+    match (obj_bounds, arr_bounds) {
+        (Some((os, oe)), Some((as_, ae))) => {
+            if os < as_ {
+                return unfenced[os..=oe].to_string();
+            } else {
+                return unfenced[as_..=ae].to_string();
+            }
         }
+        (Some((os, oe)), None) => return unfenced[os..=oe].to_string(),
+        (None, Some((as_, ae))) => return unfenced[as_..=ae].to_string(),
+        (None, None) => {}
     }
 
     unfenced.to_string()
@@ -138,20 +161,25 @@ pub fn parse_and_validate_batch_response(
         )
     })?;
 
-    let items = match envelope {
-        BatchResponseEnvelope::Array(arr) => arr,
-        BatchResponseEnvelope::Wrapped { items } => items,
-    };
-
     let mut map = BTreeMap::new();
-    for item in items {
-        let text = item
-            .text
-            .split_whitespace()
-            .collect::<Vec<_>>()
-            .join(" ");
-        if !text.is_empty() {
-            map.insert(item.id, text);
+    match envelope {
+        BatchResponseEnvelope::Array(items) | BatchResponseEnvelope::Wrapped { items } => {
+            for item in items {
+                let text = normalize_cue_single_line(&item.text);
+                if !text.is_empty() {
+                    map.insert(item.id, text);
+                }
+            }
+        }
+        BatchResponseEnvelope::KeyedMap(kv) => {
+            for (k, v) in kv {
+                if let Ok(id) = k.trim().parse::<u32>() {
+                    let text = normalize_cue_single_line(&v);
+                    if !text.is_empty() {
+                        map.insert(id, text);
+                    }
+                }
+            }
         }
     }
 
@@ -167,6 +195,38 @@ pub fn parse_and_validate_batch_response(
     Ok(map)
 }
 
+fn build_response_format(
+    endpoint: &LlmEndpointConfig,
+    expected_ids: &[u32],
+) -> Option<serde_json::Value> {
+    let is_local =
+        endpoint.base_url.contains("127.0.0.1") || endpoint.base_url.contains("localhost");
+    if is_local {
+        let mut props = serde_json::Map::new();
+        let mut req_keys = Vec::with_capacity(expected_ids.len());
+        for &id in expected_ids {
+            let key = id.to_string();
+            props.insert(key.clone(), serde_json::json!({ "type": "string" }));
+            req_keys.push(key);
+        }
+        Some(serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "subtitle_map",
+                "strict": true,
+                "schema": {
+                    "type": "object",
+                    "properties": props,
+                    "required": req_keys,
+                    "additionalProperties": false
+                }
+            }
+        }))
+    } else {
+        Some(serde_json::json!({ "type": "json_object" }))
+    }
+}
+
 fn build_system_prompt(
     operation: BatchOperation,
     source_language: &str,
@@ -176,26 +236,27 @@ fn build_system_prompt(
     let mut prompt = match operation {
         BatchOperation::Translate => {
             let target_instructions = if target_language.eq_ignore_ascii_case("sr") {
-                "Translate into natural, idiomatic Serbian (strict Ekavian standard: 'mleko', 'devojka', 'vreme', 'gde', 'lepo' — never Ijekavian/Croatian forms). Keep subtitle phrasing concise for comfortable reading speed."
+                "Translate into natural, idiomatic Serbian (strict Ekavian standard: 'mleko', 'devojka', 'vreme', 'gde', 'lepo' — never Ijekavian/Croatian forms like 'mlijeko', 'vrijeme', 'tko', 'krajolik'). Use accurate Serbian grammar and cases, never invent non-existent words, and keep subtitle phrasing concise for comfortable reading speed."
             } else {
-                "Translate accurately and concisely into the target language for subtitles."
+                "Translate accurately, idiomatically, and concisely into the target language for subtitles."
             };
             format!(
                 "You are an expert subtitle translator from '{}' to '{}'. {}\n\
                  STRICT RULES:\n\
-                 1. Translate ONLY the items in `translate_cues`. Use `context_before` and `context_after` purely for context so sentences split across cue boundaries flow grammatically.\n\
-                 2. NEVER merge, split, add, or drop cues. Return the EXACT same `id`s as in `translate_cues`.\n\
-                 3. Output ONLY a valid JSON array of objects: `[{{\"id\": 1, \"text\": \"...\"}}, ...]` with no markdown fences and no commentary.",
+                 1. Reconstruct full sentences mentally across adjacent cues (`context_before`, `translate_cues`, `context_after`) so that phrases split across cue boundaries translate into coherent, natural grammar.\n\
+                 2. Translate ONLY the items in `translate_cues`, preserving each cue's corresponding portion of the sentence.\n\
+                 3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+                 4. Output ONLY a valid JSON object mapping each cue ID string to its translated text: `{{\"1\": \"...\", \"2\": \"...\"}}` with no markdown fences and no commentary.",
                 source_language, target_language, target_instructions
             )
         }
         BatchOperation::PolishSerbian => {
             "You are an expert Serbian subtitle editor and proofreader.\n\
              STRICT RULES:\n\
-             1. Polish ONLY the items in `translate_cues` (using `context_before` and `context_after` for sentence context).\n\
-             2. Fix speech-to-text recognition errors, punctuation, capitalization, and normalize any Ijekavian/Croatian forms into natural Serbian Ekavian standard without changing the speaker's meaning.\n\
-             3. NEVER merge, split, add, or drop cues. Return the EXACT same `id`s as in `translate_cues`.\n\
-             4. Output ONLY a valid JSON array of objects: `[{\"id\": 1, \"text\": \"...\"}, ...]` with no markdown fences and no commentary."
+             1. Reconstruct full sentences mentally across `context_before`, `translate_cues`, and `context_after`, and polish ONLY the items in `translate_cues`.\n\
+             2. Fix speech-to-text recognition errors, punctuation, capitalization, and normalize any Ijekavian/Croatian forms into natural Serbian Ekavian standard without changing the speaker's meaning or inventing words.\n\
+             3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+             4. Output ONLY a valid JSON object mapping each cue ID string to its polished text: `{\"1\": \"...\", \"2\": \"...\"}` with no markdown fences and no commentary."
                 .to_string()
         }
     };
@@ -212,15 +273,15 @@ fn build_system_prompt(
     prompt
 }
 
-fn build_user_prompt<'a>(
-    context_before: &'a [SubtitleCue],
-    target_cues: &'a [SubtitleCue],
-    context_after: &'a [SubtitleCue],
+fn build_user_prompt(
+    context_before: &[SubtitleCue],
+    target_cues: &[SubtitleCue],
+    context_after: &[SubtitleCue],
 ) -> Result<String> {
-    let to_item = |c: &'a SubtitleCue| -> PromptCueItem<'a> {
+    let to_item = |c: &SubtitleCue| -> PromptCueItem {
         PromptCueItem {
             id: c.id,
-            text: c.source_text.as_str(),
+            text: normalize_cue_single_line(&c.source_text),
         }
     };
 
@@ -238,6 +299,7 @@ async fn call_chat_completions(
     endpoint: &LlmEndpointConfig,
     system_prompt: &str,
     user_prompt: &str,
+    response_format: Option<serde_json::Value>,
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<String> {
     if cancel_flag.load(Ordering::SeqCst) {
@@ -267,6 +329,7 @@ async fn call_chat_completions(
             },
         ],
         temperature: 0.2,
+        response_format,
     };
 
     let mut req = client.post(&url).json(&req_body);
@@ -343,15 +406,23 @@ async fn translate_slice_with_subdivision(
         let ctx_after = &all_cues[end..(end + 3).min(all_cues.len())];
         let expected_ids: Vec<u32> = target_cues.iter().map(|c| c.id).collect();
         let user_prompt = build_user_prompt(ctx_before, target_cues, ctx_after)?;
+        let response_format = build_response_format(endpoint, &expected_ids);
 
         let max_attempts = if target_cues.len() == 1 { 2 } else { 1 };
         let mut last_err = None;
         let mut succeeded = None;
 
         for _attempt in 0..max_attempts {
-            match call_chat_completions(client, endpoint, system_prompt, &user_prompt, cancel_flag)
-                .await
-                .and_then(|raw| parse_and_validate_batch_response(&raw, &expected_ids))
+            match call_chat_completions(
+                client,
+                endpoint,
+                system_prompt,
+                &user_prompt,
+                response_format.clone(),
+                cancel_flag,
+            )
+            .await
+            .and_then(|raw| parse_and_validate_batch_response(&raw, &expected_ids))
             {
                 Ok(batch_map) => {
                     succeeded = Some(batch_map);
@@ -460,7 +531,8 @@ where
         for cue in &mut project.cues[start..end] {
             if let Some(translated) = batch_results.get(&cue.id) {
                 let scripted = if is_serbian_target {
-                    sr_script::convert_script(translated, project.options.script)
+                    let ekavian = sr_script::normalize_ekavian(translated);
+                    sr_script::convert_script(&ekavian, project.options.script)
                 } else {
                     translated.clone()
                 };
@@ -802,5 +874,36 @@ mod tests {
         .unwrap();
 
         assert_eq!(progress_calls, 2);
+    }
+
+    #[test]
+    fn parses_keyed_json_map_with_brackets_and_builds_response_formats() {
+        let raw = "<think>ok</think>```json\n{\"1\": \"Zdravo [SMEH] svima.\", \"2\": \"Kako ste?\"}\n```";
+        let map = parse_and_validate_batch_response(raw, &[1, 2]).unwrap();
+        assert_eq!(map.get(&1).map(String::as_str), Some("Zdravo [SMEH] svima."));
+        assert_eq!(map.get(&2).map(String::as_str), Some("Kako ste?"));
+
+        let local_ep = LlmEndpointConfig {
+            base_url: "http://127.0.0.1:8080/v1".to_string(),
+            model: "local-llm".to_string(),
+            api_key: None,
+            batch_size: 25,
+        };
+        let local_rf = build_response_format(&local_ep, &[1, 2]).unwrap();
+        assert_eq!(local_rf["type"], "json_schema");
+        assert_eq!(local_rf["json_schema"]["strict"], true);
+        assert_eq!(
+            local_rf["json_schema"]["schema"]["required"],
+            serde_json::json!(["1", "2"])
+        );
+
+        let cloud_ep = LlmEndpointConfig {
+            base_url: "https://api.deepseek.com/v1".to_string(),
+            model: "deepseek-chat".to_string(),
+            api_key: Some("k".to_string()),
+            batch_size: 25,
+        };
+        let cloud_rf = build_response_format(&cloud_ep, &[1, 2]).unwrap();
+        assert_eq!(cloud_rf["type"], "json_object");
     }
 }

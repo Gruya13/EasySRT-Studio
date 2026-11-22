@@ -105,6 +105,11 @@ async fn spawn_and_wait_healthy(
         .map(Stdio::from)
         .unwrap_or_else(|_| Stdio::null());
 
+    let threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(4, 16))
+        .unwrap_or(4);
+    let threads_str = threads.to_string();
+
     let mut cmd = Command::new(llama_bin);
     configure_std_command_env(&mut cmd, llama_bin);
     cmd.arg("-m")
@@ -116,10 +121,23 @@ async fn spawn_and_wait_healthy(
         .arg("-np")
         .arg("1")
         .arg("-c")
-        .arg(ctx_size.to_string());
+        .arg(ctx_size.to_string())
+        .arg("-ctk")
+        .arg("q8_0")
+        .arg("-ctv")
+        .arg("q8_0")
+        .arg("-t")
+        .arg(&threads_str)
+        .arg("-tb")
+        .arg(&threads_str);
 
     if force_cpu {
         cmd.arg("-ngl").arg("0");
+    } else {
+        cmd.arg("-fitc")
+            .arg("2048")
+            .arg("-fitt")
+            .arg("128");
     }
 
     cmd.stdin(Stdio::null())

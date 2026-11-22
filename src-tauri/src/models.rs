@@ -208,8 +208,8 @@ impl Default for TranslationConfig {
             deepseek_model: "deepseek-chat".to_string(),
             custom_base_url: String::new(),
             custom_model: String::new(),
-            batch_size: 12,
-            context_window: 4096,
+            batch_size: 25,
+            context_window: 2048,
         }
     }
 }
