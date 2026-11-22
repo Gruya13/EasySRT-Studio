@@ -115,41 +115,157 @@ fn split_text_proportionally(
     to_ms: u64,
     prob: f64,
 ) -> Vec<TimedWord> {
-    let parts: Vec<&str> = text.split_whitespace().collect();
-    if parts.is_empty() {
-        return Vec::new();
+    let mut out: Vec<TimedWord> = text
+        .split_whitespace()
+        .map(|part| TimedWord {
+            start_ms: from_ms,
+            end_ms: from_ms,
+            text: part.to_string(),
+            probability: prob,
+        })
+        .collect();
+    distribute_range_proportionally(&mut out, from_ms, to_ms);
+    out
+}
+
+fn distribute_range_proportionally(slice: &mut [TimedWord], range_start: u64, range_end: u64) {
+    if slice.is_empty() {
+        return;
     }
 
-    let total_duration = to_ms.saturating_sub(from_ms);
-    let total_chars: usize = parts.iter().map(|p| p.chars().count().max(1)).sum();
-    let mut out = Vec::with_capacity(parts.len());
+    let total_duration = range_end.saturating_sub(range_start);
+    let total_chars: usize = slice.iter().map(|w| w.text.chars().count().max(1)).sum();
+    let count = slice.len();
     let mut elapsed_chars = 0usize;
 
-    for (idx, part) in parts.iter().enumerate() {
-        let part_chars = part.chars().count().max(1);
+    for (idx, word) in slice.iter_mut().enumerate() {
+        let word_chars = word.text.chars().count().max(1);
         let word_start = if total_chars == 0 {
-            from_ms
+            range_start
         } else {
-            from_ms + ((total_duration as u128 * elapsed_chars as u128) / total_chars as u128) as u64
+            range_start
+                + ((total_duration as u128 * elapsed_chars as u128) / total_chars as u128) as u64
         };
-        elapsed_chars += part_chars;
-        let word_end = if idx + 1 == parts.len() || total_chars == 0 {
-            to_ms.max(word_start)
+        elapsed_chars += word_chars;
+        let word_end = if idx + 1 == count || total_chars == 0 {
+            range_end.max(word_start)
         } else {
-            (from_ms
+            (range_start
                 + ((total_duration as u128 * elapsed_chars as u128) / total_chars as u128) as u64)
                 .max(word_start)
         };
+        word.start_ms = word_start;
+        word.end_ms = word_end;
+    }
+}
 
-        out.push(TimedWord {
-            start_ms: word_start,
-            end_ms: word_end,
-            text: (*part).to_string(),
-            probability: prob,
-        });
+/// Anchors token-level word timestamps onto `[seg_from, seg_to]` when misaligned (e.g.
+/// silence-compressed VAD token offsets) and redistributes collapsed zero-duration tokens.
+fn align_segment_words_to_offsets(seg_words: &mut [TimedWord], seg_from: u64, seg_to: u64) {
+    if seg_words.is_empty() || seg_to <= seg_from {
+        return;
     }
 
-    out
+    let raw_min = seg_words.iter().map(|w| w.start_ms).min().unwrap_or(seg_from);
+    let raw_max = seg_words.iter().map(|w| w.end_ms).max().unwrap_or(seg_to);
+    let is_misaligned = raw_min < seg_from
+        || raw_max > seg_to
+        || raw_max + 300 < seg_to
+        || raw_min > seg_from + 300
+        || raw_max <= raw_min;
+
+    if is_misaligned {
+        if raw_max > raw_min {
+            let raw_span = raw_max - raw_min;
+            let seg_span = seg_to - seg_from;
+            for word in seg_words.iter_mut() {
+                let rel_s = word.start_ms.saturating_sub(raw_min);
+                let rel_e = word.end_ms.max(word.start_ms).saturating_sub(raw_min);
+                word.start_ms =
+                    seg_from + ((rel_s as u128 * seg_span as u128) / raw_span as u128) as u64;
+                word.end_ms =
+                    seg_from + ((rel_e as u128 * seg_span as u128) / raw_span as u128) as u64;
+            }
+        } else {
+            distribute_range_proportionally(seg_words, seg_from, seg_to);
+        }
+    }
+
+    let mut running_ms = seg_from;
+    for word in seg_words.iter_mut() {
+        word.start_ms = word.start_ms.max(running_ms).min(seg_to);
+        word.end_ms = word.end_ms.max(word.start_ms).min(seg_to);
+        running_ms = word.end_ms;
+    }
+
+    let mut i = 0;
+    while i < seg_words.len() {
+        if seg_words[i].end_ms > seg_words[i].start_ms {
+            i += 1;
+            continue;
+        }
+        let mut j = i + 1;
+        while j < seg_words.len() && seg_words[j].end_ms <= seg_words[j].start_ms {
+            j += 1;
+        }
+        let run_start = seg_words[i].start_ms;
+        let next_bound = if j < seg_words.len() {
+            seg_words[j].start_ms.max(run_start)
+        } else {
+            seg_to.max(run_start)
+        };
+        if next_bound > run_start {
+            distribute_range_proportionally(&mut seg_words[i..j], run_start, next_bound);
+            i = j;
+        } else if j < seg_words.len() && seg_words[j].end_ms > run_start {
+            let bound_end = seg_words[j].end_ms;
+            distribute_range_proportionally(&mut seg_words[i..=j], run_start, bound_end);
+            i = j + 1;
+        } else if i > 0 && seg_words[i - 1].start_ms < run_start {
+            let prev_start = seg_words[i - 1].start_ms;
+            let bound_end = next_bound.max(run_start);
+            distribute_range_proportionally(&mut seg_words[(i - 1)..j], prev_start, bound_end);
+            i = j;
+        } else {
+            i = j;
+        }
+    }
+
+    // Smooth artificial intra-segment token pauses (> 160ms) so the segmenter
+    // does not split mid-phrase on Whisper BPE timing jitter inside one VAD chunk.
+    for k in 0..seg_words.len().saturating_sub(1) {
+        let next_start = seg_words[k + 1].start_ms;
+        if next_start > seg_words[k].end_ms + 160 {
+            seg_words[k].end_ms = next_start.saturating_sub(80).max(seg_words[k].end_ms);
+        }
+    }
+}
+
+fn is_trailing_silence_hallucination(
+    seg_idx: usize,
+    seg_count: usize,
+    seg_from: u64,
+    seg_to: u64,
+    seg_text: &str,
+    seg_words: &[TimedWord],
+) -> bool {
+    if seg_count <= 1 || seg_idx + 1 != seg_count || seg_to.saturating_sub(seg_from) > 1500 {
+        return false;
+    }
+    let normalized = seg_text.trim().to_ascii_lowercase();
+    let matches_phrase = matches!(
+        normalized.as_str(),
+        "thank you." | "thank you" | "thanks for watching." | "thanks for watching!"
+    );
+    if !matches_phrase {
+        return false;
+    }
+    let avg_prob = if seg_words.is_empty() {
+        1.0
+    } else {
+        seg_words.iter().map(|w| w.probability).sum::<f64>() / seg_words.len() as f64
+    };
+    avg_prob < 0.78
 }
 
 /// Parses `whisper.cpp` `-ojf` full JSON output into `WhisperOutput` (`detected_language` + `Vec<TimedWord>`).
@@ -164,10 +280,40 @@ pub fn parse_whisper_ojf_json(json_str: &str) -> Result<WhisperOutput> {
         .filter(|l| !l.is_empty());
 
     let mut words = Vec::new();
+    let seg_count = root.transcription.len();
 
-    for seg in &root.transcription {
-        let seg_from = seg.offsets.from.max(0) as u64;
-        let seg_to = seg.offsets.to.max(seg.offsets.from).max(0) as u64;
+    for (seg_idx, seg) in root.transcription.iter().enumerate() {
+        let raw_seg_from = seg.offsets.from.max(0) as u64;
+        let raw_seg_to = seg.offsets.to.max(seg.offsets.from).max(0) as u64;
+        let prev_seg_to = seg_idx
+            .checked_sub(1)
+            .map(|idx| root.transcription[idx].offsets.to.max(0) as u64);
+        let next_seg_from = root
+            .transcription
+            .get(seg_idx + 1)
+            .map(|next| next.offsets.from.max(0) as u64);
+
+        // Preserve a readable pause gap (>= 200ms) when adjacent Silero VAD segments
+        // touch or nearly touch (e.g. seg[k].to == seg[k+1].from).
+        let seg_from = if let Some(prev_to) = prev_seg_to {
+            if prev_to + 220 >= raw_seg_from && raw_seg_to > raw_seg_from + 900 {
+                (raw_seg_from + 90).min(raw_seg_to)
+            } else {
+                raw_seg_from
+            }
+        } else {
+            raw_seg_from
+        };
+
+        let seg_to = if let Some(next_from) = next_seg_from {
+            if next_from <= raw_seg_to + 220 && raw_seg_to > seg_from + 900 {
+                raw_seg_to.saturating_sub(110).max(seg_from + 200)
+            } else {
+                raw_seg_to
+            }
+        } else {
+            raw_seg_to
+        };
 
         let mut seg_words: Vec<TimedWord> = Vec::new();
         let mut current_word: Option<(u64, u64, String, f64, usize)> = None;
@@ -256,6 +402,18 @@ pub fn parse_whisper_ojf_json(json_str: &str) -> Result<WhisperOutput> {
 
         if seg_words.is_empty() && !seg.text.trim().is_empty() {
             seg_words = split_text_proportionally(seg.text.trim(), seg_from, seg_to, 1.0);
+        }
+
+        align_segment_words_to_offsets(&mut seg_words, seg_from, seg_to);
+        if is_trailing_silence_hallucination(
+            seg_idx,
+            seg_count,
+            seg_from,
+            seg_to,
+            &seg.text,
+            &seg_words,
+        ) {
+            continue;
         }
 
         words.extend(seg_words);
@@ -444,7 +602,6 @@ where
         .arg("1")
         .arg("-bo")
         .arg("1")
-        .arg("-nf")
         .arg("-fa")
         .arg("-ojf")
         .arg("-of")
@@ -737,6 +894,116 @@ mod tests {
         glossary.insert("Beograd".to_string(), "Београд".to_string());
         let prompt = build_whisper_prompt(&glossary).unwrap();
         assert_eq!(prompt, "Glossary: Beograd, Београд, EasySRT, EasySRT Studio.");
+    }
+
+    #[test]
+    fn remaps_vad_compressed_token_offsets_to_segment_timeline() {
+        let payload = r#"{
+            "result": { "language": "en" },
+            "transcription": [
+                {
+                    "offsets": { "from": 81890, "to": 88960 },
+                    "text": " This is a decision that I make.",
+                    "tokens": [
+                        { "text": "[_BEG_]", "offsets": { "from": 53460, "to": 53460 }, "p": 0.99 },
+                        { "text": " This", "offsets": { "from": 53460, "to": 54120 }, "p": 0.96 },
+                        { "text": " is", "offsets": { "from": 54120, "to": 54600 }, "p": 0.97 },
+                        { "text": " a", "offsets": { "from": 54600, "to": 54900 }, "p": 0.98 },
+                        { "text": " decision", "offsets": { "from": 54900, "to": 56200 }, "p": 0.95 },
+                        { "text": " that", "offsets": { "from": 56200, "to": 56800 }, "p": 0.94 },
+                        { "text": " I", "offsets": { "from": 56800, "to": 57200 }, "p": 0.99 },
+                        { "text": " make", "offsets": { "from": 57200, "to": 58100 }, "p": 0.98 },
+                        { "text": ".", "offsets": { "from": 58100, "to": 58220 }, "p": 0.99 }
+                    ]
+                }
+            ]
+        }"#;
+
+        let out = parse_whisper_ojf_json(payload).unwrap();
+        assert_eq!(out.words.len(), 7);
+        assert_eq!(out.words.first().unwrap().start_ms, 81890);
+        assert_eq!(out.words.last().unwrap().end_ms, 88960);
+        for pair in out.words.windows(2) {
+            assert!(pair[0].end_ms > pair[0].start_ms);
+            assert!(pair[1].start_ms >= pair[0].end_ms);
+        }
+        assert!(out.words.last().unwrap().end_ms > out.words.last().unwrap().start_ms);
+    }
+
+    #[test]
+    fn redistributes_zero_duration_tokens_within_segment() {
+        let payload = r#"{
+            "result": { "language": "en" },
+            "transcription": [
+                {
+                    "offsets": { "from": 1000, "to": 3000 },
+                    "text": " This is a recording.",
+                    "tokens": [
+                        { "text": " This", "offsets": { "from": 1000, "to": 1000 }, "p": 0.95 },
+                        { "text": " is", "offsets": { "from": 1000, "to": 1000 }, "p": 0.95 },
+                        { "text": " a", "offsets": { "from": 1000, "to": 1000 }, "p": 0.95 },
+                        { "text": " recording", "offsets": { "from": 1000, "to": 1900 }, "p": 0.95 },
+                        { "text": ".", "offsets": { "from": 2000, "to": 3000 }, "p": 0.95 }
+                    ]
+                }
+            ]
+        }"#;
+
+        let out = parse_whisper_ojf_json(payload).unwrap();
+        assert_eq!(out.words.len(), 4);
+        assert_eq!(out.words.first().unwrap().start_ms, 1000);
+        assert!(out.words.last().unwrap().end_ms <= 3000);
+        for word in &out.words {
+            assert!(
+                word.end_ms > word.start_ms,
+                "word '{}' kept zero duration: {}..{}",
+                word.text,
+                word.start_ms,
+                word.end_ms
+            );
+        }
+        for pair in out.words.windows(2) {
+            assert!(pair[1].start_ms >= pair[0].end_ms);
+        }
+    }
+
+    #[test]
+    fn preserves_pause_gap_between_touching_vad_segments() {
+        let payload = r#"{
+            "result": { "language": "en" },
+            "transcription": [
+                {
+                    "offsets": { "from": 5410, "to": 9670 },
+                    "text": " First segment words",
+                    "tokens": [
+                        { "text": " First", "offsets": { "from": 0, "to": 1400 }, "p": 0.96 },
+                        { "text": " segment", "offsets": { "from": 1400, "to": 2800 }, "p": 0.96 },
+                        { "text": " words", "offsets": { "from": 2800, "to": 4260 }, "p": 0.96 }
+                    ]
+                },
+                {
+                    "offsets": { "from": 9670, "to": 12730 },
+                    "text": " Second segment.",
+                    "tokens": [
+                        { "text": " Second", "offsets": { "from": 4260, "to": 5700 }, "p": 0.97 },
+                        { "text": " segment", "offsets": { "from": 5700, "to": 6980 }, "p": 0.97 },
+                        { "text": ".", "offsets": { "from": 6980, "to": 7040 }, "p": 0.99 }
+                    ]
+                }
+            ]
+        }"#;
+
+        let out = parse_whisper_ojf_json(payload).unwrap();
+        assert_eq!(out.words.len(), 5);
+        assert_eq!(out.words[0].start_ms, 5410);
+        assert_eq!(out.words[2].text, "words");
+        assert_eq!(out.words[3].text, "Second");
+        let boundary_gap = out.words[3].start_ms.saturating_sub(out.words[2].end_ms);
+        assert!(
+            boundary_gap >= 200,
+            "expected >= 200ms gap between touching VAD segments, got {boundary_gap}"
+        );
+        assert_eq!(out.words[4].end_ms, 12730);
     }
 
     #[cfg(unix)]

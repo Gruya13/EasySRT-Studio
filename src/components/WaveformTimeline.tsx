@@ -86,6 +86,65 @@ function decodeBase64ToBytes(base64: string): Uint8Array {
   return bytes;
 }
 
+/** Extracts 99th-percentile normalized acoustic amplitude buckets from an AudioBuffer. */
+function extractAudioPeaks(
+  buffer: AudioBuffer,
+  bucketCount = 2400,
+): Float32Array {
+  const totalSamples = buffer.length;
+  if (totalSamples === 0 || bucketCount <= 0 || buffer.numberOfChannels === 0) {
+    return new Float32Array(0);
+  }
+
+  const channels: Float32Array[] = [];
+  for (let c = 0; c < buffer.numberOfChannels; c += 1) {
+    channels.push(buffer.getChannelData(c));
+  }
+
+  const count = Math.min(bucketCount, totalSamples);
+  const raw = new Float32Array(count);
+
+  for (let b = 0; b < count; b += 1) {
+    const start = Math.floor((b / count) * totalSamples);
+    const end = Math.max(
+      start + 1,
+      Math.floor(((b + 1) / count) * totalSamples),
+    );
+    const step = Math.max(1, Math.floor((end - start) / 64));
+
+    let peak = 0;
+    let sumSq = 0;
+    let samples = 0;
+    for (let i = start; i < end; i += step) {
+      let s = 0;
+      for (let c = 0; c < channels.length; c += 1) {
+        const v = Math.abs(channels[c][i] ?? 0);
+        if (v > s) s = v;
+      }
+      if (s > peak) peak = s;
+      sumSq += s * s;
+      samples += 1;
+    }
+
+    const rms = samples > 0 ? Math.sqrt(sumSq / samples) : 0;
+    raw[b] = 0.55 * peak + 0.45 * rms;
+  }
+
+  const sorted = Float32Array.from(raw).sort();
+  const p99Idx = Math.min(
+    sorted.length - 1,
+    Math.floor(sorted.length * 0.99),
+  );
+  const scale = sorted[p99Idx] > 0.005 ? sorted[p99Idx] : 1;
+
+  const out = new Float32Array(count);
+  for (let b = 0; b < count; b += 1) {
+    out[b] =
+      raw[b] > 0.002 ? Math.min(1, Math.max(0.02, raw[b] / scale)) : 0.02;
+  }
+  return out;
+}
+
 function buildDemoWavBuffer(
   durationMs: number,
   cues: SubtitleCue[],
@@ -166,6 +225,7 @@ export function WaveformTimeline() {
   const [playheadMs, setPlayheadMs] = useState(0);
   const [audioBlobUrl, setAudioBlobUrl] = useState<string>("");
   const [liveAudioDurationMs, setLiveAudioDurationMs] = useState(0);
+  const [waveformVersion, setWaveformVersion] = useState(0);
   const [viewportWidth, setViewportWidth] = useState(1000);
   const [trimDrag, setTrimDrag] = useState<TrimDragState | null>(null);
   const [tracks, setTracks] = useState<TrackState>({
@@ -176,6 +236,7 @@ export function WaveformTimeline() {
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
   const audioRawBytesRef = useRef<ArrayBuffer | null>(null);
+  const audioPeaksRef = useRef<Float32Array | null>(null);
   const webAudioCtxRef = useRef<AudioContext | null>(null);
   const webAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const webAudioGainRef = useRef<GainNode | null>(null);
@@ -253,8 +314,10 @@ export function WaveformTimeline() {
     stopWebAudio();
     webAudioBufferRef.current = null;
     audioRawBytesRef.current = null;
+    audioPeaksRef.current = null;
     setLiveAudioDurationMs(0);
     setAudioBlobUrl("");
+    setWaveformVersion((v) => v + 1);
 
     const path = activeProject?.audioPath?.trim() ?? "";
     if (!path || /\.(srt|vtt)$/i.test(path)) {
@@ -263,6 +326,29 @@ export function WaveformTimeline() {
 
     const isDemoProject =
       !isTauriRuntime() || activeProject?.jobId === "demo-session-01";
+
+    const decodePeaksFromBuffer = async (rawBuf: ArrayBuffer) => {
+      if (typeof AudioContext === "undefined") {
+        return;
+      }
+      try {
+        if (!webAudioCtxRef.current) {
+          webAudioCtxRef.current = new AudioContext();
+        }
+        const decoded = await webAudioCtxRef.current.decodeAudioData(
+          rawBuf.slice(0),
+        );
+        if (!active) return;
+        webAudioBufferRef.current = decoded;
+        if (decoded.duration > 0 && !activeProject?.durationMs) {
+          setLiveAudioDurationMs(Math.round(decoded.duration * 1000));
+        }
+        audioPeaksRef.current = extractAudioPeaks(decoded, 2400);
+        setWaveformVersion((v) => v + 1);
+      } catch {
+        // Ignore decode failures for unsupported codecs; fallback rendering remains active
+      }
+    };
 
     const loadPreview = async () => {
       try {
@@ -277,6 +363,7 @@ export function WaveformTimeline() {
         const blob = new Blob([rawBuf], { type: preview.mimeType });
         createdUrl = URL.createObjectURL(blob);
         setAudioBlobUrl(createdUrl);
+        void decodePeaksFromBuffer(rawBuf);
       } catch {
         if (!active) return;
         if (isDemoProject) {
@@ -288,6 +375,7 @@ export function WaveformTimeline() {
           const blob = new Blob([demoBuf], { type: "audio/wav" });
           createdUrl = URL.createObjectURL(blob);
           setAudioBlobUrl(createdUrl);
+          void decodePeaksFromBuffer(demoBuf);
         }
       }
     };
@@ -669,6 +757,36 @@ export function WaveformTimeline() {
     const barW = 2;
     const maxHalf = Math.max(4, height * 0.41);
     const words = activeProject?.words ?? [];
+    const peaks = audioPeaksRef.current;
+
+    if (peaks && peaks.length > 0) {
+      for (let x = 2; x < width - 2; x += stepX) {
+        const frac0 = x / width;
+        const frac1 = (x + stepX) / width;
+        const b0 = Math.max(0, Math.floor(frac0 * peaks.length));
+        const b1 = Math.min(
+          peaks.length,
+          Math.max(b0 + 1, Math.floor(frac1 * peaks.length)),
+        );
+
+        let amp = 0;
+        for (let b = b0; b < b1; b += 1) {
+          if (peaks[b] > amp) {
+            amp = peaks[b];
+          }
+        }
+
+        const tMs = frac0 * audioEndMs;
+        const inCue = cues.some((c) => tMs >= c.startMs && tMs <= c.endMs);
+        ctx.fillStyle = inCue
+          ? "rgba(56, 189, 248, 0.85)"
+          : "rgba(56, 189, 248, 0.42)";
+
+        const barH = Math.max(2, amp * maxHalf * 2);
+        ctx.fillRect(x, midY - barH / 2, barW, barH);
+      }
+      return;
+    }
 
     for (let x = 2; x < width - 2; x += stepX) {
       const tMs = (x / width) * audioEndMs;
@@ -705,7 +823,7 @@ export function WaveformTimeline() {
       const barH = Math.max(2, amp * maxHalf * 2);
       ctx.fillRect(x, midY - barH / 2, barW, barH);
     }
-  }, [activeProject?.words, cues, audioEndMs]);
+  }, [activeProject?.words, cues, audioEndMs, waveformVersion]);
 
   useEffect(() => {
     const id = window.requestAnimationFrame(drawWaveform);

@@ -19,6 +19,8 @@ import {
   parseBulkGlossary,
   parseSubtitleFileText,
   parseTimestampSrt,
+  resolveInitialBatchActiveJobId,
+  shouldActivateSyncedProject,
   wrapBalancedLines,
 } from "../subtitleUtils.ts";
 import type { SubtitleCue } from "../../types/models.ts";
@@ -315,5 +317,32 @@ describe("SRT & WebVTT Parsing and Formatting", () => {
     assert.equal(reparsedVtt[1].startMs, 3000);
     assert.equal(reparsedVtt[1].endMs, 5125);
     assert.equal(reparsedVtt[1].sourceText, "Drugi segment: čćžšđ ЉЊЏ.");
+  });
+});
+
+describe("Batch Queue Active Selection Locking", () => {
+  it("keeps the user's selected file active while background batch jobs start or complete", () => {
+    // Initially (null or demo), the first batch job becomes active
+    assert.equal(resolveInitialBatchActiveJobId(null, "job-1"), "job-1");
+    assert.equal(
+      resolveInitialBatchActiveJobId("demo-session-01", "job-1"),
+      "job-1",
+    );
+    assert.equal(shouldActivateSyncedProject(null, "job-1"), true);
+    assert.equal(
+      shouldActivateSyncedProject("demo-session-01", "job-1"),
+      true,
+    );
+
+    // Once the user selects job-1, background updates or starts for job-2/job-3 must NOT hijack focus
+    assert.equal(resolveInitialBatchActiveJobId("job-1", "job-2"), "job-1");
+    assert.equal(shouldActivateSyncedProject("job-1", "job-2"), false);
+    assert.equal(shouldActivateSyncedProject("job-1", "job-3"), false);
+
+    // Updates for the selected job itself (e.g., finishing translation) DO update the active editor view
+    assert.equal(shouldActivateSyncedProject("job-1", "job-1"), true);
+
+    // Explicit user actions (loading checkpoint / importing subtitle) force activation
+    assert.equal(shouldActivateSyncedProject("job-1", "job-2", true), true);
   });
 });

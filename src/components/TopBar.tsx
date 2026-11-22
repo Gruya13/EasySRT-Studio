@@ -2,6 +2,7 @@ import { getCurrentWindow } from "@tauri-apps/api/window";
 import { useEffect, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
+import { setWindowMaximized } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
 
 export function TopBar() {
@@ -28,7 +29,7 @@ export function TopBar() {
     let mounted = true;
     const syncMax = async () => {
       try {
-        const isMax = await getCurrentWindow().isMaximized();
+        const isMax = await setWindowMaximized(true);
         if (mounted) {
           setMaximized(isMax);
         }
@@ -55,9 +56,7 @@ export function TopBar() {
   const handleToggleMaximize = async () => {
     if (isTauriRuntime()) {
       try {
-        const win = getCurrentWindow();
-        await win.toggleMaximize();
-        const isMax = await win.isMaximized();
+        const isMax = await setWindowMaximized(null);
         setMaximized(isMax);
         return;
       } catch {

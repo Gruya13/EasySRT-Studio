@@ -766,3 +766,28 @@ export function formatTxtDocument(
   }
   return prefix + (lines.length > 0 ? `${lines.join("\n")}\n` : "");
 }
+
+/** Returns whether an incoming project sync should switch the active editor selection. */
+export function shouldActivateSyncedProject(
+  currentActiveJobId: string | null,
+  incomingJobId: string,
+  forceActivate = false,
+): boolean {
+  return (
+    Boolean(forceActivate) ||
+    currentActiveJobId === null ||
+    currentActiveJobId === "demo-session-01" ||
+    currentActiveJobId === incomingJobId
+  );
+}
+
+/** Resolves initial activeJobId when batch starts without overriding an already selected job. */
+export function resolveInitialBatchActiveJobId(
+  currentActiveJobId: string | null,
+  firstRunnableJobId: string | null,
+): string | null {
+  if (!currentActiveJobId || currentActiveJobId === "demo-session-01") {
+    return firstRunnableJobId;
+  }
+  return currentActiveJobId;
+}

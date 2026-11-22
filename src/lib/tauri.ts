@@ -1,5 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ApiKeyStatus,
   AppConfig,
@@ -282,6 +283,32 @@ export function readAudioPreviewBase64(
     return browserFallback.readAudioPreviewBase64(audioPath);
   }
   return invoke<AudioPreviewData>("read_audio_preview_base64", { audioPath });
+}
+
+export async function setWindowMaximized(
+  maximized?: boolean | null,
+): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return Boolean(maximized);
+  }
+  return invoke<boolean>("set_window_maximized", {
+    maximized: maximized ?? null,
+  });
+}
+
+export async function openDialogPreservingMaximize(
+  options: Parameters<typeof open>[0],
+): Promise<Awaited<ReturnType<typeof open>>> {
+  try {
+    return await open(options);
+  } finally {
+    if (isTauriRuntime()) {
+      void setWindowMaximized(true).catch(() => {});
+      setTimeout(() => {
+        void setWindowMaximized(true).catch(() => {});
+      }, 120);
+    }
+  }
 }
 
 // ---------------------------------------------------------------------------

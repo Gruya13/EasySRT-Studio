@@ -50,6 +50,7 @@ pub fn run() {
             commands::convert_cues_script,
             commands::export_subtitles,
             commands::read_audio_preview_base64,
+            commands::set_window_maximized,
         ])
         .run(tauri::generate_context!())
         .expect("error while running EasySRT Studio");

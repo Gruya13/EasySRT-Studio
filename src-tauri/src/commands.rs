@@ -303,6 +303,82 @@ pub async fn read_audio_preview_base64(audio_path: String) -> Result<AudioPrevie
     })
 }
 
+#[cfg(target_os = "linux")]
+async fn hyprland_set_maximized(pid: u32, maximized: Option<bool>) -> Option<bool> {
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
+    let out = tokio::process::Command::new("hyprctl")
+        .args(["clients", "-j"])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let clients: Vec<serde_json::Value> = serde_json::from_slice(&out.stdout).ok()?;
+    let target_client = clients
+        .iter()
+        .find(|c| c.get("pid").and_then(|v| v.as_u64()) == Some(u64::from(pid)))
+        .or_else(|| {
+            clients.iter().find(|c| {
+                let cls = c
+                    .get("class")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                let title = c
+                    .get("title")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_ascii_lowercase();
+                cls.contains("easysrt") || title.contains("easysrt")
+            })
+        })?;
+
+    let addr = target_client.get("address").and_then(|v| v.as_str())?;
+    let current = target_client
+        .get("fullscreen")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0)
+        != 0;
+    let target = maximized.unwrap_or(!current);
+    if target != current {
+        let action = if target { "set" } else { "unset" };
+        let expr = format!(
+            "hl.dsp.window.fullscreen({{ mode = \"maximized\", action = \"{action}\", window = \"address:{addr}\" }})"
+        );
+        let _ = tokio::process::Command::new("hyprctl")
+            .args(["dispatch", &expr])
+            .output()
+            .await;
+    }
+    Some(target)
+}
+
+#[tauri::command]
+pub async fn set_window_maximized(
+    window: tauri::WebviewWindow,
+    maximized: Option<bool>,
+) -> std::result::Result<bool, String> {
+    #[cfg(target_os = "linux")]
+    if let Some(target) = hyprland_set_maximized(std::process::id(), maximized).await {
+        if target {
+            let _ = window.maximize();
+        } else {
+            let _ = window.unmaximize();
+        }
+        return Ok(target);
+    }
+
+    let current = window.is_maximized().unwrap_or(false);
+    let target = maximized.unwrap_or(!current);
+    if target {
+        window.maximize().map_err(|e| e.to_string())?;
+    } else {
+        window.unmaximize().map_err(|e| e.to_string())?;
+    }
+    Ok(target)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

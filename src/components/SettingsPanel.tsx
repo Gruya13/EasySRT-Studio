@@ -1,4 +1,3 @@
-import { open } from "@tauri-apps/plugin-dialog";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import {
@@ -6,6 +5,7 @@ import {
   formatDurationShort,
   isTauriRuntime,
 } from "../lib/subtitleUtils";
+import { openDialogPreservingMaximize } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
 import type {
   CatalogItemKind,
@@ -301,7 +301,10 @@ export function SettingsPanel() {
   const handleBrowseModelsDir = async () => {
     if (isTauriRuntime()) {
       try {
-        const dir = await open({ directory: true, multiple: false });
+        const dir = await openDialogPreservingMaximize({
+          directory: true,
+          multiple: false,
+        });
         if (typeof dir === "string" && dir) {
           setModelsDirDraft(dir);
           await updateConfig({ modelsDirOverride: dir });
@@ -316,7 +319,7 @@ export function SettingsPanel() {
   const handleImportModelClick = async () => {
     if (isTauriRuntime()) {
       try {
-        const selected = await open({
+        const selected = await openDialogPreservingMaximize({
           multiple: false,
           filters: [
             {
@@ -412,7 +415,10 @@ export function SettingsPanel() {
   const handleBrowseExportDir = async () => {
     if (isTauriRuntime()) {
       try {
-        const dir = await open({ directory: true, multiple: false });
+        const dir = await openDialogPreservingMaximize({
+          directory: true,
+          multiple: false,
+        });
         if (typeof dir === "string" && dir) {
           setExportDirDraft(dir);
           await updateConfig({

@@ -1,4 +1,3 @@
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   CheckCircle2,
   FileDown,
@@ -9,6 +8,7 @@ import {
 import { useEffect, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
+import { openDialogPreservingMaximize } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
 import type { ExportFormat, ExportOptions } from "../types/models";
 
@@ -51,7 +51,7 @@ export function ExportModal() {
   const handleChooseFolder = async () => {
     if (isTauriRuntime()) {
       try {
-        const dir = await open({
+        const dir = await openDialogPreservingMaximize({
           directory: true,
           multiple: false,
         });

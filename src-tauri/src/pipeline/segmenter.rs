@@ -2,7 +2,8 @@
 
 use crate::models::{SegmentPreset, SegmentRules, SubtitleCue, TimedWord};
 
-const PAUSE_SPLIT_THRESHOLD_MS: u64 = 350;
+const INTER_SEGMENT_PAUSE_MS: u64 = 200;
+const HARD_PAUSE_MS: u64 = 500;
 const SOFT_PAUSE_THRESHOLD_MS: u64 = 150;
 
 /// Returns preset rules for `Standard` (2x42) or `Reels` (1x20), or preserves custom values.
@@ -125,9 +126,38 @@ fn is_dangling_function_word(word: &str) -> bool {
             | "with"
             | "from"
             | "into"
+            | "onto"
+            | "upon"
+            | "without"
+            | "within"
+            | "between"
+            | "through"
+            | "during"
+            | "against"
+            | "among"
+            | "around"
+            | "behind"
+            | "beyond"
+            | "towards"
+            | "toward"
             | "and"
             | "or"
             | "but"
+            | "which"
+            | "that"
+            | "who"
+            | "whom"
+            | "whose"
+            | "where"
+            | "when"
+            | "while"
+            | "because"
+            | "although"
+            | "since"
+            | "until"
+            | "unless"
+            | "before"
+            | "after"
             | "has"
             | "have"
             | "had"
@@ -143,13 +173,15 @@ fn is_dangling_function_word(word: &str) -> bool {
             | "he"
             | "she"
             | "this"
-            | "that"
+            | "these"
+            | "those"
             | "our"
             | "my"
             | "your"
             | "his"
             | "her"
             | "their"
+            | "its"
             | "not"
             | "no"
             | "u"
@@ -178,7 +210,70 @@ fn is_dangling_function_word(word: &str) -> bool {
             | "će"
             | "bi"
             | "ne"
+            | "koji"
+            | "koja"
+            | "koje"
+            | "kojeg"
+            | "kojem"
+            | "kojim"
+            | "čiji"
+            | "čija"
+            | "čije"
+            | "što"
+            | "jer"
+            | "ako"
+            | "dok"
+            | "kad"
+            | "kada"
+            | "nego"
+            | "već"
+            | "niti"
+            | "moj"
+            | "tvoj"
+            | "njegov"
+            | "njen"
+            | "naš"
+            | "vaš"
+            | "njihov"
+            | "ovaj"
+            | "ova"
+            | "ovo"
     )
+}
+
+fn slice_char_len(words: &[TimedWord]) -> usize {
+    let mut len = 0usize;
+    for (idx, w) in words.iter().enumerate() {
+        len += w.text.chars().count();
+        if idx > 0 {
+            len += 1;
+        }
+    }
+    len
+}
+
+fn distance_to_next_natural_break(words: &[TimedWord], from_idx: usize, max_chars: usize) -> usize {
+    let mut len = 0usize;
+    for idx in from_idx..words.len() {
+        let word_len = words[idx].text.chars().count();
+        len = if idx == from_idx {
+            word_len
+        } else {
+            len + 1 + word_len
+        };
+        if len > max_chars || ends_with_sentence_punct(&words[idx].text) {
+            return len;
+        }
+        if let Some(next_word) = words.get(idx + 1) {
+            let gap = next_word.start_ms.saturating_sub(words[idx].end_ms);
+            if gap >= INTER_SEGMENT_PAUSE_MS
+                || (ends_with_clause_punct(&words[idx].text) && gap >= 120)
+            {
+                return len;
+            }
+        }
+    }
+    len
 }
 
 /// Groups `TimedWord`s into readable `SubtitleCue`s according to `rules`.
@@ -236,37 +331,55 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
                 break;
             }
 
-            // Priority 2/3: Break on clause punctuation with short pause, or longer speech pause
-            // without leaving dangling function words (articles/prepositions/auxiliaries) at cue end.
+            // Priority 2/3: Break on clause punctuation or inter-segment pauses
+            // without leaving dangling function words or tiny orphan fragments.
             if let Some(next_word) = cleaned_words.get(i + 1) {
                 let gap = next_word.start_ms.saturating_sub(cleaned_words[i].end_ms);
-                if ends_with_clause_punct(&cleaned_words[i].text) && gap >= 200 {
-                    last_fit_idx = i;
-                    hit_hard_limit = false;
-                    break;
-                }
-                if !is_dangling_function_word(&cleaned_words[i].text)
-                    && (gap >= 500 || (gap >= PAUSE_SPLIT_THRESHOLD_MS && char_len >= 28))
+                let candidate_duration = cleaned_words[i].end_ms.saturating_sub(cue_start_ms);
+
+                if ends_with_clause_punct(&cleaned_words[i].text)
+                    && ((char_len >= 22 && candidate_duration >= 1100 && gap >= INTER_SEGMENT_PAUSE_MS)
+                        || gap >= 380)
                 {
                     last_fit_idx = i;
                     hit_hard_limit = false;
                     break;
                 }
+
+                if !is_dangling_function_word(&cleaned_words[i].text)
+                    && gap >= INTER_SEGMENT_PAUSE_MS
+                {
+                    let next_chunk_len =
+                        distance_to_next_natural_break(&cleaned_words, i + 1, max_total_chars);
+                    let would_overflow_next = char_len + 1 + next_chunk_len > max_total_chars;
+                    if (char_len >= 26 && candidate_duration >= 1200)
+                        || gap >= HARD_PAUSE_MS
+                        || would_overflow_next
+                    {
+                        last_fit_idx = i;
+                        hit_hard_limit = false;
+                        break;
+                    }
+                }
             }
         }
 
         // If we stopped because adding the next word would exceed max chars or max duration,
-        // look back within start_idx..=last_fit_idx for a natural clause boundary or pause.
+        // look back within start_idx..=last_fit_idx for a natural clause boundary or pause
+        // while keeping a minimum readable prefix length.
         let mut end_idx = last_fit_idx;
         if hit_hard_limit && last_fit_idx > start_idx {
-            // Priority 2: Clause punctuation (`,`, `;`, `:`, `—`)
-            if let Some(clause_idx) = (start_idx..=last_fit_idx)
-                .rev()
-                .find(|&idx| {
-                    ends_with_clause_punct(&cleaned_words[idx].text)
-                        && !is_dangling_function_word(&cleaned_words[idx].text)
-                })
-            {
+            let min_prefix_chars = if max_total_chars >= 36 {
+                (max_total_chars / 3).max(18)
+            } else {
+                (max_total_chars / 3).max(1)
+            };
+
+            if let Some(clause_idx) = (start_idx..=last_fit_idx).rev().find(|&idx| {
+                ends_with_clause_punct(&cleaned_words[idx].text)
+                    && !is_dangling_function_word(&cleaned_words[idx].text)
+                    && slice_char_len(&cleaned_words[start_idx..=idx]) >= min_prefix_chars
+            }) {
                 end_idx = clause_idx;
             } else if let Some(pause_idx) = (start_idx..last_fit_idx).rev().find(|&idx| {
                 cleaned_words[idx + 1]
@@ -274,12 +387,13 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
                     .saturating_sub(cleaned_words[idx].end_ms)
                     >= SOFT_PAUSE_THRESHOLD_MS
                     && !is_dangling_function_word(&cleaned_words[idx].text)
+                    && slice_char_len(&cleaned_words[start_idx..=idx]) >= min_prefix_chars
             }) {
                 end_idx = pause_idx;
             } else if is_dangling_function_word(&cleaned_words[last_fit_idx].text) {
                 if let Some(non_dangling) = (start_idx..last_fit_idx)
                     .rev()
-                    .take(2)
+                    .take(4)
                     .find(|&idx| !is_dangling_function_word(&cleaned_words[idx].text))
                 {
                     end_idx = non_dangling;
@@ -557,5 +671,44 @@ mod tests {
         let cues = segment_words(&words, &rules);
         assert_eq!(cues.len(), 1);
         assert_eq!(cues[0].source_text, "Villages were forced to fly away.");
+    }
+
+    #[test]
+    fn avoids_micro_orphan_prefix_on_hard_limit_lookback_and_dangling_relatives() {
+        let words = vec![
+            word(0, 400, "This"),
+            word(400, 800, "report,"),
+            word(960, 1300, "which"),
+            word(1300, 1700, "explains"),
+            word(1700, 2100, "everything"),
+            word(2100, 2600, "about"),
+            word(2600, 3000, "the"),
+            word(3000, 3500, "situation"),
+            word(3500, 4000, "clearly"),
+            word(4000, 4500, "today"),
+            word(4500, 5000, "should"),
+            word(5000, 5400, "help"),
+            word(5400, 5800, "us"),
+            word(5800, 6200, "decide"),
+            word(6200, 6600, "soon."),
+        ];
+        let rules = SegmentRules::default(); // max_total_chars = 84
+        let cues = segment_words(&words, &rules);
+        assert!(cues.len() >= 2);
+        // Must NOT split into tiny "This report," (12 chars < min_prefix_chars)
+        assert!(
+            cues[0].source_text.replace('\n', " ").chars().count() >= 28,
+            "first cue should not be an orphan fragment: {:?}",
+            cues[0].source_text
+        );
+        // Must NOT leave relative pronoun "which" dangling at end of a cue
+        for cue in &cues {
+            let last_word = cue.source_text.split_whitespace().last().unwrap_or("");
+            assert!(
+                !last_word.eq_ignore_ascii_case("which"),
+                "cue ended with dangling relative pronoun 'which': {:?}",
+                cue.source_text
+            );
+        }
     }
 }

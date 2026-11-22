@@ -1,8 +1,9 @@
 import { getCurrentWindow } from "@tauri-apps/api/window";
-import { open } from "@tauri-apps/plugin-dialog";
+import { Download, RotateCw } from "lucide-react";
 import { useEffect, useMemo, useRef, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { formatDurationShort, isTauriRuntime } from "../lib/subtitleUtils";
+import { openDialogPreservingMaximize } from "../lib/tauri";
 import { useAppStore, type BatchQueueItem } from "../stores/appStore";
 import type { JobPhase } from "../types/models";
 
@@ -74,6 +75,8 @@ export function FilesPanel() {
   const importSubtitleFromText = useAppStore((s) => s.importSubtitleFromText);
   const selectQueueItem = useAppStore((s) => s.selectQueueItem);
   const removeQueueItem = useAppStore((s) => s.removeQueueItem);
+  const reprocessQueueItem = useAppStore((s) => s.reprocessQueueItem);
+  const setExportOpen = useAppStore((s) => s.setExportOpen);
   const startBatchPipeline = useAppStore((s) => s.startBatchPipeline);
   const cancelJobById = useAppStore((s) => s.cancelJobById);
 
@@ -173,7 +176,7 @@ export function FilesPanel() {
   const handleAddFilesClick = async () => {
     if (isTauriRuntime()) {
       try {
-        const selected = await open({
+        const selected = await openDialogPreservingMaximize({
           multiple: true,
           filters: [
             {
@@ -529,20 +532,62 @@ export function FilesPanel() {
                 </div>
 
                 <div className="file-right">
-                  <span className={`file-badge ${status}`}>
-                    {renderBadgeText(item, status)}
-                  </span>
-                  <button
-                    type="button"
-                    className="file-remove-btn"
-                    title={t.queue.remove}
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      removeQueueItem(item.jobId);
-                    }}
-                  >
-                    ×
-                  </button>
+                  {status !== "done" && (
+                    <span className={`file-badge ${status}`}>
+                      {renderBadgeText(item, status)}
+                    </span>
+                  )}
+                  <div className="file-hover-actions">
+                    {item.project && item.project.cues.length > 0 && (
+                      <button
+                        type="button"
+                        className="file-action-btn export"
+                        title={
+                          lang === "en" ? "Export subtitles" : "Izvoz titla"
+                        }
+                        aria-label={
+                          lang === "en" ? "Export subtitles" : "Izvoz titla"
+                        }
+                        onClick={(e) => {
+                          e.stopPropagation();
+                          selectQueueItem(item.jobId);
+                          setExportOpen(true);
+                        }}
+                      >
+                        <Download size={11} />
+                        <span>{lang === "en" ? "Export" : "Izvoz"}</span>
+                      </button>
+                    )}
+                    <button
+                      type="button"
+                      className="file-action-btn reprocess"
+                      disabled={isRunningBatch}
+                      title={
+                        lang === "en" ? "Re-process file" : "Ponovna obrada"
+                      }
+                      aria-label={
+                        lang === "en" ? "Re-process file" : "Ponovna obrada"
+                      }
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        reprocessQueueItem(item.jobId);
+                      }}
+                    >
+                      <RotateCw size={11} />
+                      <span>{lang === "en" ? "Reprocess" : "Ponovi"}</span>
+                    </button>
+                    <button
+                      type="button"
+                      className="file-remove-btn"
+                      title={t.queue.remove}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        removeQueueItem(item.jobId);
+                      }}
+                    >
+                      ×
+                    </button>
+                  </div>
                 </div>
               </div>
             );

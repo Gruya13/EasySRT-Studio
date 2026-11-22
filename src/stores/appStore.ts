@@ -8,6 +8,8 @@ import {
   isTauriRuntime,
   parseSubtitleFileText,
   recalculateCue,
+  resolveInitialBatchActiveJobId,
+  shouldActivateSyncedProject,
 } from "../lib/subtitleUtils";
 import {
   cancelJob,
@@ -212,6 +214,7 @@ interface AppStoreState {
   importSubtitleFromPath: (path: string) => Promise<void>;
   importSubtitleFromText: (fileName: string, content: string) => void;
   removeQueueItem: (jobId: string) => void;
+  reprocessQueueItem: (jobId: string) => void;
   clearFinishedQueueItems: () => void;
   selectQueueItem: (jobId: string) => void;
 
@@ -283,7 +286,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     void action();
   };
 
-  const syncProjectIntoQueueAndState = (project: SubtitleProject) => {
+  const syncProjectIntoQueueAndState = (
+    project: SubtitleProject,
+    options?: { forceActivate?: boolean },
+  ) => {
     set((state) => {
       const existsInQueue = state.batchQueue.some(
         (item) => item.jobId === project.jobId,
@@ -319,9 +325,15 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         ...state.checkpoints.filter((c) => c.jobId !== project.jobId),
       ];
 
+      const shouldUpdateActive = shouldActivateSyncedProject(
+        state.activeJobId,
+        project.jobId,
+        options?.forceActivate,
+      );
+
       return {
-        activeProject: project,
-        activeJobId: project.jobId,
+        activeProject: shouldUpdateActive ? project : state.activeProject,
+        activeJobId: shouldUpdateActive ? project.jobId : state.activeJobId,
         batchQueue: updatedQueue,
         checkpoints: updatedCheckpoints,
       };
@@ -883,7 +895,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       try {
         const project = await importSubtitleFile(path, get().jobOptions);
         resetUndoHistory();
-        syncProjectIntoQueueAndState(project);
+        syncProjectIntoQueueAndState(project, { forceActivate: true });
         set({
           activeCueId: project.cues[0]?.id ?? null,
           banner: {
@@ -960,7 +972,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       };
 
       resetUndoHistory();
-      syncProjectIntoQueueAndState(project);
+      syncProjectIntoQueueAndState(project, { forceActivate: true });
       set({
         activeCueId: cues[0]?.id ?? null,
         banner: {
@@ -1080,7 +1092,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       try {
         const project = await loadCheckpoint(jobId);
         resetUndoHistory();
-        syncProjectIntoQueueAndState(project);
+        syncProjectIntoQueueAndState(project, { forceActivate: true });
         set({
           jobOptions: {
             ...DEFAULT_JOB_OPTIONS,
@@ -1114,6 +1126,31 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           },
         });
       }
+    },
+
+    reprocessQueueItem: (jobId) => {
+      if (get().isRunningBatch) {
+        return;
+      }
+      const target = get().batchQueue.find((q) => q.jobId === jobId);
+      if (!target) {
+        return;
+      }
+      set((state) => ({
+        batchQueue: state.batchQueue.map((item) =>
+          item.jobId === jobId
+            ? {
+                ...item,
+                phase: "queued",
+                percent: 0,
+                detail: "queued",
+                errorMessage: null,
+              }
+            : item,
+        ),
+        activeJobId: resolveInitialBatchActiveJobId(state.activeJobId, jobId),
+      }));
+      get().startBatchPipeline("full");
     },
 
     closeOnlineConfirm: () => {
@@ -1192,7 +1229,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             return;
           }
 
-          set({ isRunningBatch: true });
+          set((s) => ({
+            isRunningBatch: true,
+            activeJobId: resolveInitialBatchActiveJobId(
+              s.activeJobId,
+              runnable[0]?.jobId ?? null,
+            ),
+          }));
 
           const effectiveProvider =
             get().jobOptions.providerOverride ??
@@ -1280,7 +1323,6 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             for (const item of runnable) {
               const currentOptions = { ...get().jobOptions };
               set((s) => ({
-                activeJobId: item.jobId,
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
                     ? {
@@ -1358,7 +1400,6 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             for (const item of runnable) {
               const currentOptions = { ...get().jobOptions };
               set((s) => ({
-                activeJobId: item.jobId,
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
                     ? {
@@ -1452,7 +1493,6 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             for (const item of runnable) {
               const currentOptions = { ...get().jobOptions };
               set((s) => ({
-                activeJobId: item.jobId,
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
                     ? {
