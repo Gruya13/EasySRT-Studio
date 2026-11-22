@@ -3,6 +3,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ApiKeyStatus,
   AppConfig,
+  AudioPreviewData,
   CatalogItemKind,
   CatalogManifest,
   CustomModelEntry,
@@ -272,6 +273,15 @@ export function exportSubtitles(
     return browserFallback.exportSubtitles(project, options);
   }
   return invoke<ExportResult>("export_subtitles", { project, options });
+}
+
+export function readAudioPreviewBase64(
+  audioPath: string,
+): Promise<AudioPreviewData> {
+  if (!isTauriRuntime()) {
+    return browserFallback.readAudioPreviewBase64(audioPath);
+  }
+  return invoke<AudioPreviewData>("read_audio_preview_base64", { audioPath });
 }
 
 // ---------------------------------------------------------------------------

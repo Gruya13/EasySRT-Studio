@@ -209,3 +209,8 @@ export interface ApiKeyStatus {
   hasCustomApiKey: boolean;
   storageBackend: string;
 }
+
+export interface AudioPreviewData {
+  mimeType: string;
+  base64Data: string;
+}

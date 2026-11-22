@@ -381,6 +381,13 @@ pub struct ApiKeyStatus {
     pub storage_backend: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AudioPreviewData {
+    pub mime_type: String,
+    pub base64_data: String,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

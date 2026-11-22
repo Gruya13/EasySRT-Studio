@@ -2,6 +2,7 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ApiKeyStatus,
   AppConfig,
+  AudioPreviewData,
   CatalogItem,
   CatalogItemKind,
   CatalogManifest,
@@ -950,6 +951,72 @@ export const browserFallback = {
       writtenFiles.push(`${baseDir}/${stem}.source.srt`);
     }
     return { writtenFiles };
+  },
+
+  async readAudioPreviewBase64(_audioPath: string): Promise<AudioPreviewData> {
+    const sampleRate = 16000;
+    const durationSec = 24;
+    const numSamples = sampleRate * durationSec;
+    const dataSize = numSamples * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+
+    const writeAscii = (offset: number, text: string) => {
+      for (let i = 0; i < text.length; i += 1) {
+        view.setUint8(offset + i, text.charCodeAt(i));
+      }
+    };
+
+    writeAscii(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(8, "WAVE");
+    writeAscii(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeAscii(36, "data");
+    view.setUint32(40, dataSize, true);
+
+    const speechSpans: Array<[number, number, number]> = [
+      [0.4, 3.9, 210],
+      [4.2, 8.1, 240],
+      [8.4, 10.5, 220],
+      [10.9, 14.9, 195],
+      [15.3, 19.4, 230],
+      [19.8, 23.5, 205],
+    ];
+    for (let i = 0; i < numSamples; i += 1) {
+      const t = i / sampleRate;
+      const span = speechSpans.find(([s, e]) => t >= s && t <= e);
+      let sample = 0;
+      if (span) {
+        const [s, e, baseHz] = span;
+        const fade = Math.sin(
+          Math.min(1, Math.min((t - s) * 8, (e - t) * 8)) * (Math.PI / 2),
+        );
+        const mod = 0.65 + 0.35 * Math.sin(2 * Math.PI * 3.2 * t);
+        const tone =
+          0.6 * Math.sin(2 * Math.PI * baseHz * t) +
+          0.3 * Math.sin(2 * Math.PI * baseHz * 1.5 * t);
+        sample = Math.round(tone * fade * mod * 0.14 * 32767);
+      }
+      view.setInt16(44 + i * 2, sample, true);
+    }
+
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    const chunk = 0x8000;
+    for (let i = 0; i < bytes.length; i += chunk) {
+      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
+    }
+    return {
+      mimeType: "audio/wav",
+      base64Data: btoa(binary),
+    };
   },
 
   async onDownloadProgress(

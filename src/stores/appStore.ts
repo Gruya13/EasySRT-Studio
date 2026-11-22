@@ -492,10 +492,20 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             : (seededProject.cues[0]?.id ?? null);
         }
 
-        if (
+        if (nextBatchQueue.length === 0 && checkpoints.length > 0) {
+          nextBatchQueue = checkpoints.map((cp) => ({
+            jobId: cp.jobId,
+            audioPath: cp.audioPath,
+            audioFileName: cp.audioFileName,
+            phase: cp.phase,
+            percent: cp.phase === "completed" ? 100 : 50,
+            detail: cp.phase,
+            project: cp,
+            errorMessage: cp.errorMessage,
+          }));
+        } else if (
           nextBatchQueue.length === 0 &&
-          nextActiveProject !== null &&
-          (!isTauriRuntime() || checkpoints.length === 0)
+          nextActiveProject !== null
         ) {
           nextBatchQueue = [
             {
@@ -1041,14 +1051,28 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!isSameJob) {
         resetUndoHistory();
       }
+      const placeholderProject: SubtitleProject | null = item.project
+        ? item.project
+        : {
+            jobId: item.jobId,
+            audioPath: item.audioPath,
+            audioFileName: item.audioFileName,
+            durationMs: 0,
+            detectedLanguage: null,
+            options: { ...get().jobOptions },
+            words: [],
+            cues: [],
+            phase: item.phase,
+            completedTranslationBatches: 0,
+            errorMessage: item.errorMessage,
+            updatedAt: new Date().toISOString(),
+          };
       set({
         activeJobId: jobId,
-        activeProject: item.project ?? get().activeProject,
+        activeProject: placeholderProject ?? get().activeProject,
         activeCueId: isSameJob
           ? get().activeCueId
-          : item.project
-            ? (item.project.cues[0]?.id ?? null)
-            : get().activeCueId,
+          : (placeholderProject.cues[0]?.id ?? null),
       });
     },
 

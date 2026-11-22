@@ -15,7 +15,7 @@ import type {
   TranslationProviderKind,
 } from "../types/models";
 
-type SettingsTabId = "obrada" | "titlovi" | "modeli" | "cloud" | "izvoz" | "opste";
+type SettingsTabId = "obrada" | "titlovi" | "modeli" | "izvoz" | "opste";
 
 interface NumericFieldInputProps {
   id: string;
@@ -167,6 +167,19 @@ export function SettingsPanel() {
 
   const effectiveProvider: TranslationProviderKind =
     jobOptions.providerOverride ?? config.translation.provider;
+
+  const [lastOnlineProvider, setLastOnlineProvider] = useState<
+    "deepSeek" | "customOpenAi"
+  >(effectiveProvider === "customOpenAi" ? "customOpenAi" : "deepSeek");
+
+  useEffect(() => {
+    if (
+      effectiveProvider === "deepSeek" ||
+      effectiveProvider === "customOpenAi"
+    ) {
+      setLastOnlineProvider(effectiveProvider);
+    }
+  }, [effectiveProvider]);
 
   useEffect(() => {
     setModelsDirDraft(config.modelsDirOverride ?? "");
@@ -442,7 +455,6 @@ export function SettingsPanel() {
     { id: "obrada", label: lang === "en" ? "Processing" : "Obrada" },
     { id: "titlovi", label: lang === "en" ? "Subtitles" : "Titlovi" },
     { id: "modeli", label: lang === "en" ? "Models" : "Modeli" },
-    { id: "cloud", label: "Cloud API" },
     { id: "izvoz", label: lang === "en" ? "Export" : "Izvoz" },
     { id: "opste", label: lang === "en" ? "General" : "Opšte" },
   ];
@@ -478,14 +490,21 @@ export function SettingsPanel() {
           })}
         </div>
 
-        <span
+        <button
           id="settings-mode-pill"
+          type="button"
           className={`settings-mode-pill${isOnline ? " online" : ""}`}
-          title={t.workspace.translationProvider}
+          style={{ cursor: "pointer" }}
+          title={
+            lang === "en"
+              ? "Switch Offline / Online mode in Models"
+              : "Promeni Offline / Online režim u Modelima"
+          }
+          onClick={() => setActiveTab("modeli")}
         >
           <span className="mode-dot" />
           <span id="settings-mode-text">{modePillText}</span>
-        </span>
+        </button>
       </header>
 
       <div className="settings-body">
@@ -815,368 +834,400 @@ export function SettingsPanel() {
           </div>
         )}
 
-        {/* TAB 3: MODELI */}
+        {/* TAB 3: MODELI (Offline lokalni modeli / Online Cloud API) */}
         {activeTab === "modeli" && (
           <div id="pane-modeli" className="s-pane">
-            <div
-              className={`s-gpu-banner${
-                setupStatus?.readyForOffline ? "" : " warn"
-              }`}
-            >
-              <div className="s-gpu-left" title={gpuBannerLabel}>
-                <span className="s-gpu-dot" aria-hidden="true" />
-                <span>{gpuBannerLabel}</span>
-              </div>
-
-              <div className="s-action-btns">
-                <span
-                  className={
-                    setupStatus?.readyForOffline
-                      ? "s-pill-green"
-                      : "s-pill-amber"
-                  }
-                >
-                  {setupStatus?.readyForOffline
-                    ? lang === "en"
-                      ? "Ready"
-                      : "Spremno"
-                    : lang === "en"
-                      ? "Setup needed"
-                      : "Potrebni modeli"}
-                </span>
-                <button
-                  type="button"
-                  className="s-mini-btn compact info"
-                  onClick={() => setSetupOpen(true)}
-                >
-                  {lang === "en" ? "Manager" : "Instalacija"}
-                </button>
-              </div>
-            </div>
-
-            <div className="s-grid-2">
-              <div className="s-field">
-                <label className="s-label" htmlFor="s-whisper-model">
-                  Whisper ASR model
-                </label>
-                <select
-                  id="s-whisper-model"
-                  className="s-select"
-                  value={config.activeWhisperModelId ?? ""}
-                  onChange={(e) =>
-                    void updateConfig({
-                      activeWhisperModelId: e.target.value || null,
-                    })
-                  }
-                >
-                  <option value="">{t.settings.autoSelectRecommended}</option>
-                  {catalogWhisperModels.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name} ({formatBytes(m.sizeBytes)})
-                    </option>
-                  ))}
-                  {customWhisperModels.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      [Custom] {m.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-
-              <div className="s-field">
-                <label className="s-label" htmlFor="s-llm-model">
-                  {lang === "en" ? "Local LLM Model" : "Lokalni LLM model"}
-                </label>
-                <select
-                  id="s-llm-model"
-                  className="s-select"
-                  value={config.activeLlmModelId ?? ""}
-                  onChange={(e) =>
-                    void updateConfig({
-                      activeLlmModelId: e.target.value || null,
-                    })
-                  }
-                >
-                  <option value="">{t.settings.autoSelectRecommended}</option>
-                  {catalogLlmModels.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      {m.name} ({formatBytes(m.sizeBytes)})
-                    </option>
-                  ))}
-                  {customLlmModels.map((m) => (
-                    <option key={m.id} value={m.id}>
-                      [Custom] {m.name}
-                    </option>
-                  ))}
-                </select>
-              </div>
-            </div>
-
-            <div className="s-field">
-              <label className="s-label" htmlFor="s-models-dir">
-                {lang === "en" ? "Models Folder" : "Folder za modele"}
-              </label>
-              <div className="s-input-group">
-                <input
-                  id="s-models-dir"
-                  className="s-input mono-inp"
-                  type="text"
-                  value={modelsDirDraft}
-                  placeholder={setupStatus?.storage.modelsDir ?? "./models"}
-                  onChange={(e) => setModelsDirDraft(e.target.value)}
-                  onBlur={() =>
-                    void updateConfig({
-                      modelsDirOverride: modelsDirDraft.trim() || null,
-                    })
-                  }
-                  onKeyDown={(e) => {
-                    if (e.key === "Enter") {
-                      e.currentTarget.blur();
-                    }
-                  }}
-                />
-                <button
-                  id="s-btn-browse-models"
-                  className="s-mini-btn"
-                  type="button"
-                  onClick={() => void handleBrowseModelsDir()}
-                >
-                  {t.settings.browseFolder}
-                </button>
-                <button
-                  id="s-btn-import-model"
-                  className="s-mini-btn info"
-                  type="button"
-                  onClick={() => void handleImportModelClick()}
-                >
-                  + {lang === "en" ? "Import" : "Uvezi"} .bin / .gguf
-                </button>
-                <input
-                  ref={modelImportInputRef}
-                  type="file"
-                  accept=".bin,.gguf"
-                  onChange={handleBrowserModelImport}
-                  hidden
-                />
-              </div>
-            </div>
-          </div>
-        )}
-
-        {/* TAB 4: CLOUD API */}
-        {activeTab === "cloud" && (
-          <div id="pane-cloud" className="s-pane">
             <div className="s-field">
               <span className="s-label">
-                {lang === "en" ? "Translation Engine" : "Pogon za prevod"}
+                {lang === "en" ? "Active Mode" : "Aktivni režim (Mode)"}
               </span>
               <div
-                className="s-seg three"
+                className="s-seg"
                 role="group"
-                aria-label={t.workspace.translationProvider}
+                aria-label={
+                  lang === "en" ? "Active Mode" : "Aktivni režim (Mode)"
+                }
               >
                 <button
                   type="button"
-                  className={`s-seg-btn js-provider-btn${
-                    effectiveProvider === "localLlama" ? " active-accent" : ""
-                  }`}
-                  data-provider="localLlama"
+                  data-testid="mode-offline-btn"
+                  className={`s-seg-btn${!isOnline ? " active-accent" : ""}`}
                   onClick={() => void setEffectiveProvider("localLlama")}
                 >
                   {lang === "en"
-                    ? "Local LLM (Offline)"
-                    : "Lokalni LLM (Offline)"}
+                    ? "Offline (Local Models)"
+                    : "Offline (Lokalni modeli)"}
                 </button>
                 <button
                   type="button"
-                  className={`s-seg-btn js-provider-btn${
-                    effectiveProvider === "deepSeek" ? " active-info" : ""
-                  }`}
-                  data-provider="deepSeek"
-                  onClick={() => void setEffectiveProvider("deepSeek")}
+                  data-testid="mode-online-btn"
+                  className={`s-seg-btn${isOnline ? " active-info" : ""}`}
+                  onClick={() => void setEffectiveProvider(lastOnlineProvider)}
                 >
-                  DeepSeek API
-                </button>
-                <button
-                  type="button"
-                  className={`s-seg-btn js-provider-btn${
-                    effectiveProvider === "customOpenAi" ? " active-info" : ""
-                  }`}
-                  data-provider="customOpenAi"
-                  onClick={() => void setEffectiveProvider("customOpenAi")}
-                >
-                  Custom OpenAI
+                  {lang === "en"
+                    ? "Online (Cloud API)"
+                    : "Online (Cloud API)"}
                 </button>
               </div>
             </div>
 
-            <div className="s-grid-2">
-              <div className="s-field">
+            {!isOnline ? (
+              <>
                 <div
-                  style={{
-                    display: "flex",
-                    alignItems: "center",
-                    justifyContent: "space-between",
-                    gap: "6px",
-                  }}
+                  className={`s-gpu-banner${
+                    setupStatus?.readyForOffline ? "" : " warn"
+                  }`}
                 >
-                  <label className="s-label" htmlFor="s-api-key">
-                    {t.settings.apiKeyLabel}
-                  </label>
-                  <span
-                    id="api-key-badge"
-                    className={
-                      hasCurrentApiKey ? "s-pill-green" : "s-pill-muted"
-                    }
-                    style={{ padding: "0 6px", fontSize: "9.5px" }}
-                  >
-                    {hasCurrentApiKey
-                      ? lang === "en"
-                        ? "Saved"
-                        : "Sačuvan"
-                      : lang === "en"
-                        ? "Not set"
-                        : "Nije podešen"}
-                  </span>
-                </div>
-                <div className="s-input-group">
-                  <input
-                    id="s-api-key"
-                    className="s-input mono-inp"
-                    type="password"
-                    value={apiKeyInput}
-                    onChange={(e) => setApiKeyInput(e.target.value)}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.preventDefault();
-                        void handleSaveApiKey();
-                      }
-                    }}
-                    placeholder="sk-..."
-                  />
-                  <button
-                    id="s-btn-save-key"
-                    className="s-mini-btn accent"
-                    type="button"
-                    disabled={!apiKeyInput.trim()}
-                    onClick={() => void handleSaveApiKey()}
-                  >
-                    {lang === "en" ? "Save" : "Sačuvaj"}
-                  </button>
-                  {hasCurrentApiKey && (
-                    <button
-                      type="button"
-                      className="s-mini-btn danger"
-                      title={t.settings.clearKey}
-                      onClick={() =>
-                        void runClearApiKey(
-                          effectiveProvider === "customOpenAi"
-                            ? "customOpenAi"
-                            : "deepSeek",
-                        )
+                  <div className="s-gpu-left" title={gpuBannerLabel}>
+                    <span className="s-gpu-dot" aria-hidden="true" />
+                    <span>{gpuBannerLabel}</span>
+                  </div>
+
+                  <div className="s-action-btns">
+                    <span
+                      className={
+                        setupStatus?.readyForOffline
+                          ? "s-pill-green"
+                          : "s-pill-amber"
                       }
                     >
-                      ×
+                      {setupStatus?.readyForOffline
+                        ? lang === "en"
+                          ? "Ready"
+                          : "Spremno"
+                        : lang === "en"
+                          ? "Setup needed"
+                          : "Potrebni modeli"}
+                    </span>
+                    <button
+                      type="button"
+                      className="s-mini-btn compact info"
+                      onClick={() => setSetupOpen(true)}
+                    >
+                      {lang === "en" ? "Manager" : "Instalacija"}
                     </button>
-                  )}
+                  </div>
                 </div>
-              </div>
 
-              <div className="s-field">
-                <label className="s-label" htmlFor="s-cloud-endpoint">
-                  {effectiveProvider === "customOpenAi"
-                    ? "Endpoint / Model"
-                    : "Model / Endpoint"}
-                </label>
-                <div className="s-input-group">
-                  <input
-                    id="s-cloud-endpoint"
-                    className="s-input mono-inp"
-                    type="text"
-                    disabled={effectiveProvider === "localLlama"}
-                    value={cloudEndpointDraft}
-                    onChange={(e) => setCloudEndpointDraft(e.target.value)}
-                    onBlur={commitCloudEndpoint}
-                    onKeyDown={(e) => {
-                      if (e.key === "Enter") {
-                        e.currentTarget.blur();
+                <div className="s-grid-2">
+                  <div className="s-field">
+                    <label className="s-label" htmlFor="s-whisper-model">
+                      Whisper ASR model
+                    </label>
+                    <select
+                      id="s-whisper-model"
+                      className="s-select"
+                      value={config.activeWhisperModelId ?? ""}
+                      onChange={(e) =>
+                        void updateConfig({
+                          activeWhisperModelId: e.target.value || null,
+                        })
                       }
-                    }}
-                    placeholder={
-                      effectiveProvider === "localLlama"
-                        ? "local llama-server"
-                        : effectiveProvider === "deepSeek"
-                          ? "deepseek-chat"
-                          : "https://api.openai.com/v1"
-                    }
-                  />
-                  {effectiveProvider === "customOpenAi" && (
+                    >
+                      <option value="">
+                        {t.settings.autoSelectRecommended}
+                      </option>
+                      {catalogWhisperModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} ({formatBytes(m.sizeBytes)})
+                        </option>
+                      ))}
+                      {customWhisperModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          [Custom] {m.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+
+                  <div className="s-field">
+                    <label className="s-label" htmlFor="s-llm-model">
+                      {lang === "en" ? "Local LLM Model" : "Lokalni LLM model"}
+                    </label>
+                    <select
+                      id="s-llm-model"
+                      className="s-select"
+                      value={config.activeLlmModelId ?? ""}
+                      onChange={(e) =>
+                        void updateConfig({
+                          activeLlmModelId: e.target.value || null,
+                        })
+                      }
+                    >
+                      <option value="">
+                        {t.settings.autoSelectRecommended}
+                      </option>
+                      {catalogLlmModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          {m.name} ({formatBytes(m.sizeBytes)})
+                        </option>
+                      ))}
+                      {customLlmModels.map((m) => (
+                        <option key={m.id} value={m.id}>
+                          [Custom] {m.name}
+                        </option>
+                      ))}
+                    </select>
+                  </div>
+                </div>
+
+                <div className="s-field">
+                  <label className="s-label" htmlFor="s-models-dir">
+                    {lang === "en" ? "Models Folder" : "Folder za modele"}
+                  </label>
+                  <div className="s-input-group">
                     <input
-                      aria-label={t.settings.customModelLabel}
+                      id="s-models-dir"
                       className="s-input mono-inp"
                       type="text"
-                      style={{ maxWidth: "110px" }}
-                      value={customModelDraft}
-                      onChange={(e) => setCustomModelDraft(e.target.value)}
-                      onBlur={commitCustomModel}
+                      value={modelsDirDraft}
+                      placeholder={setupStatus?.storage.modelsDir ?? "./models"}
+                      onChange={(e) => setModelsDirDraft(e.target.value)}
+                      onBlur={() =>
+                        void updateConfig({
+                          modelsDirOverride: modelsDirDraft.trim() || null,
+                        })
+                      }
                       onKeyDown={(e) => {
                         if (e.key === "Enter") {
                           e.currentTarget.blur();
                         }
                       }}
-                      placeholder="gpt-4o-mini"
                     />
-                  )}
+                    <button
+                      id="s-btn-browse-models"
+                      className="s-mini-btn"
+                      type="button"
+                      onClick={() => void handleBrowseModelsDir()}
+                    >
+                      {t.settings.browseFolder}
+                    </button>
+                    <button
+                      id="s-btn-import-model"
+                      className="s-mini-btn info"
+                      type="button"
+                      onClick={() => void handleImportModelClick()}
+                    >
+                      + {lang === "en" ? "Import" : "Uvezi"} .bin / .gguf
+                    </button>
+                    <input
+                      ref={modelImportInputRef}
+                      type="file"
+                      accept=".bin,.gguf"
+                      onChange={handleBrowserModelImport}
+                      hidden
+                    />
+                  </div>
                 </div>
-              </div>
-            </div>
+              </>
+            ) : (
+              <>
+                <div className="s-field">
+                  <span className="s-label">
+                    {lang === "en" ? "Cloud Provider" : "Cloud provajder"}
+                  </span>
+                  <div
+                    className="s-seg"
+                    role="group"
+                    aria-label={t.workspace.translationProvider}
+                  >
+                    <button
+                      type="button"
+                      className={`s-seg-btn js-provider-btn${
+                        effectiveProvider === "deepSeek" ? " active-info" : ""
+                      }`}
+                      data-provider="deepSeek"
+                      onClick={() => {
+                        setLastOnlineProvider("deepSeek");
+                        void setEffectiveProvider("deepSeek");
+                      }}
+                    >
+                      DeepSeek API
+                    </button>
+                    <button
+                      type="button"
+                      className={`s-seg-btn js-provider-btn${
+                        effectiveProvider === "customOpenAi"
+                          ? " active-info"
+                          : ""
+                      }`}
+                      data-provider="customOpenAi"
+                      onClick={() => {
+                        setLastOnlineProvider("customOpenAi");
+                        void setEffectiveProvider("customOpenAi");
+                      }}
+                    >
+                      Custom OpenAI
+                    </button>
+                  </div>
+                </div>
 
-            <div className="s-grid-2">
-              <div className="s-field">
-                <label className="s-label" htmlFor="s-batch-size">
-                  {lang === "en"
-                    ? "Cues per batch (batchSize)"
-                    : "Titlova po paketu (batchSize)"}
-                </label>
-                <NumericFieldInput
-                  id="s-batch-size"
-                  min={5}
-                  max={60}
-                  value={config.translation.batchSize}
-                  onCommit={(batchSize) =>
-                    void updateConfig({
-                      translation: {
-                        ...config.translation,
-                        batchSize,
-                      },
-                    })
-                  }
-                />
-              </div>
+                <div className="s-grid-2">
+                  <div className="s-field">
+                    <div
+                      style={{
+                        display: "flex",
+                        alignItems: "center",
+                        justifyContent: "space-between",
+                        gap: "6px",
+                      }}
+                    >
+                      <label className="s-label" htmlFor="s-api-key">
+                        {t.settings.apiKeyLabel}
+                      </label>
+                      <span
+                        id="api-key-badge"
+                        className={
+                          hasCurrentApiKey ? "s-pill-green" : "s-pill-muted"
+                        }
+                        style={{ padding: "0 6px", fontSize: "9.5px" }}
+                      >
+                        {hasCurrentApiKey
+                          ? lang === "en"
+                            ? "Saved"
+                            : "Sačuvan"
+                          : lang === "en"
+                            ? "Not set"
+                            : "Nije podešen"}
+                      </span>
+                    </div>
+                    <div className="s-input-group">
+                      <input
+                        id="s-api-key"
+                        className="s-input mono-inp"
+                        type="password"
+                        value={apiKeyInput}
+                        onChange={(e) => setApiKeyInput(e.target.value)}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.preventDefault();
+                            void handleSaveApiKey();
+                          }
+                        }}
+                        placeholder="sk-..."
+                      />
+                      <button
+                        id="s-btn-save-key"
+                        className="s-mini-btn accent"
+                        type="button"
+                        disabled={!apiKeyInput.trim()}
+                        onClick={() => void handleSaveApiKey()}
+                      >
+                        {lang === "en" ? "Save" : "Sačuvaj"}
+                      </button>
+                      {hasCurrentApiKey && (
+                        <button
+                          type="button"
+                          className="s-mini-btn danger"
+                          title={t.settings.clearKey}
+                          onClick={() =>
+                            void runClearApiKey(
+                              effectiveProvider === "customOpenAi"
+                                ? "customOpenAi"
+                                : "deepSeek",
+                            )
+                          }
+                        >
+                          ×
+                        </button>
+                      )}
+                    </div>
+                  </div>
 
-              <div className="s-field">
-                <label className="s-label" htmlFor="s-ctx-win">
-                  {lang === "en"
-                    ? "Context window (contextWindow)"
-                    : "Kontekstni prozor (contextWindow)"}
-                </label>
-                <NumericFieldInput
-                  id="s-ctx-win"
-                  min={2048}
-                  max={32768}
-                  step={1024}
-                  value={config.translation.contextWindow}
-                  onCommit={(contextWindow) =>
-                    void updateConfig({
-                      translation: {
-                        ...config.translation,
-                        contextWindow,
-                      },
-                    })
-                  }
-                />
-              </div>
-            </div>
+                  <div className="s-field">
+                    <label className="s-label" htmlFor="s-cloud-endpoint">
+                      {effectiveProvider === "customOpenAi"
+                        ? "Endpoint / Model"
+                        : "Model / Endpoint"}
+                    </label>
+                    <div className="s-input-group">
+                      <input
+                        id="s-cloud-endpoint"
+                        className="s-input mono-inp"
+                        type="text"
+                        value={cloudEndpointDraft}
+                        onChange={(e) => setCloudEndpointDraft(e.target.value)}
+                        onBlur={commitCloudEndpoint}
+                        onKeyDown={(e) => {
+                          if (e.key === "Enter") {
+                            e.currentTarget.blur();
+                          }
+                        }}
+                        placeholder={
+                          effectiveProvider === "deepSeek"
+                            ? "deepseek-chat"
+                            : "https://api.openai.com/v1"
+                        }
+                      />
+                      {effectiveProvider === "customOpenAi" && (
+                        <input
+                          aria-label={t.settings.customModelLabel}
+                          className="s-input mono-inp"
+                          type="text"
+                          style={{ maxWidth: "110px" }}
+                          value={customModelDraft}
+                          onChange={(e) => setCustomModelDraft(e.target.value)}
+                          onBlur={commitCustomModel}
+                          onKeyDown={(e) => {
+                            if (e.key === "Enter") {
+                              e.currentTarget.blur();
+                            }
+                          }}
+                          placeholder="gpt-4o-mini"
+                        />
+                      )}
+                    </div>
+                  </div>
+                </div>
+
+                <div className="s-grid-2">
+                  <div className="s-field">
+                    <label className="s-label" htmlFor="s-batch-size">
+                      {lang === "en"
+                        ? "Cues per batch (batchSize)"
+                        : "Titlova po paketu (batchSize)"}
+                    </label>
+                    <NumericFieldInput
+                      id="s-batch-size"
+                      min={5}
+                      max={60}
+                      value={config.translation.batchSize}
+                      onCommit={(batchSize) =>
+                        void updateConfig({
+                          translation: {
+                            ...config.translation,
+                            batchSize,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+
+                  <div className="s-field">
+                    <label className="s-label" htmlFor="s-ctx-win">
+                      {lang === "en"
+                        ? "Context window (contextWindow)"
+                        : "Kontekstni prozor (contextWindow)"}
+                    </label>
+                    <NumericFieldInput
+                      id="s-ctx-win"
+                      min={2048}
+                      max={32768}
+                      step={1024}
+                      value={config.translation.contextWindow}
+                      onCommit={(contextWindow) =>
+                        void updateConfig({
+                          translation: {
+                            ...config.translation,
+                            contextWindow,
+                          },
+                        })
+                      }
+                    />
+                  </div>
+                </div>
+              </>
+            )}
           </div>
         )}
 

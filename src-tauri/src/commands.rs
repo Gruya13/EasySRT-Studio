@@ -1,12 +1,13 @@
 //! Tauri IPC command surface matching `src/lib/tauri.ts`.
 
 use crate::models::{
-    ApiKeyStatus, AppConfig, CatalogItemKind, CatalogManifest, CustomModelEntry, ExportOptions,
-    ExportResult, InstalledComponentStatus, JobOptions, SegmentRules, SerbianScript, SetupStatus,
-    SubtitleCue, SubtitleProject, TranslationProviderKind,
+    ApiKeyStatus, AppConfig, AudioPreviewData, CatalogItemKind, CatalogManifest, CustomModelEntry,
+    ExportOptions, ExportResult, InstalledComponentStatus, JobOptions, SegmentRules,
+    SerbianScript, SetupStatus, SubtitleCue, SubtitleProject, TranslationProviderKind,
 };
 use crate::pipeline::{self, PipelineState};
 use crate::{setup_manager, storage};
+use std::path::Path;
 use tauri::{AppHandle, State};
 
 fn map_err(err: anyhow::Error) -> String {
@@ -233,4 +234,93 @@ pub async fn export_subtitles(
     options: ExportOptions,
 ) -> Result<ExportResult, String> {
     pipeline::export_subtitles(&app, project, options).map_err(map_err)
+}
+
+fn detect_audio_mime(path: &Path) -> &'static str {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    match ext.as_str() {
+        "mp3" => "audio/mpeg",
+        "wav" => "audio/wav",
+        "ogg" | "opus" => "audio/ogg",
+        "flac" => "audio/flac",
+        "m4a" | "aac" | "mp4" => "audio/mp4",
+        "webm" => "audio/webm",
+        _ => "audio/mpeg",
+    }
+}
+
+fn encode_base64(bytes: &[u8]) -> String {
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+
+        out.push(TABLE[(b0 >> 2) as usize] as char);
+        out.push(TABLE[(((b0 & 0x03) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(TABLE[(((b1 & 0x0f) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(TABLE[(b2 & 0x3f) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
+}
+
+#[tauri::command]
+pub async fn read_audio_preview_base64(audio_path: String) -> Result<AudioPreviewData, String> {
+    let path = Path::new(&audio_path);
+    if !path.is_file() {
+        return Err(format!("Audio file not found: {audio_path}"));
+    }
+    let meta = tokio::fs::metadata(path)
+        .await
+        .map_err(|e| format!("Failed to inspect audio file: {e}"))?;
+    const MAX_PREVIEW_BYTES: u64 = 128 * 1024 * 1024;
+    if meta.len() > MAX_PREVIEW_BYTES {
+        return Err(format!(
+            "Audio file exceeds {} MB preview limit ({} bytes)",
+            MAX_PREVIEW_BYTES / (1024 * 1024),
+            meta.len()
+        ));
+    }
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|e| format!("Failed to read audio file: {e}"))?;
+    Ok(AudioPreviewData {
+        mime_type: detect_audio_mime(path).to_string(),
+        base64_data: encode_base64(&bytes),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn encodes_rfc4648_base64_and_detects_mime_types() {
+        assert_eq!(encode_base64(b""), "");
+        assert_eq!(encode_base64(b"f"), "Zg==");
+        assert_eq!(encode_base64(b"fo"), "Zm8=");
+        assert_eq!(encode_base64(b"foo"), "Zm9v");
+        assert_eq!(encode_base64(b"foobar"), "Zm9vYmFy");
+        assert_eq!(encode_base64(&[0xff, 0x00, 0xab]), "/wCr");
+
+        assert_eq!(detect_audio_mime(Path::new("/tmp/test.MP3")), "audio/mpeg");
+        assert_eq!(detect_audio_mime(Path::new("/tmp/test.wav")), "audio/wav");
+        assert_eq!(detect_audio_mime(Path::new("/tmp/test.opus")), "audio/ogg");
+        assert_eq!(detect_audio_mime(Path::new("/tmp/test.flac")), "audio/flac");
+        assert_eq!(detect_audio_mime(Path::new("/tmp/test.m4a")), "audio/mp4");
+        assert_eq!(detect_audio_mime(Path::new("/tmp/test.webm")), "audio/webm");
+    }
 }

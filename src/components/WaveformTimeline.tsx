@@ -1,8 +1,8 @@
-import { convertFileSrc } from "@tauri-apps/api/core";
 import { Merge, Plus, Redo2, Scissors, Trash2, Undo2 } from "lucide-react";
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
+import { readAudioPreviewBase64 } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
 import type { SubtitleCue } from "../types/models";
 
@@ -59,6 +59,87 @@ function formatRulerSec(ms: number): string {
   return `${String(m).padStart(2, "0")}:${String(s).padStart(2, "0")}`;
 }
 
+function findCueForTime(
+  cueList: SubtitleCue[],
+  ms: number,
+  allowNearestPreceding: boolean,
+): SubtitleCue | null {
+  if (cueList.length === 0) return null;
+  const exact = cueList.find((c) => ms >= c.startMs && ms <= c.endMs);
+  if (exact) return exact;
+  if (!allowNearestPreceding) return null;
+  let best: SubtitleCue | null = null;
+  for (const cue of cueList) {
+    if (cue.startMs <= ms && (!best || cue.startMs >= best.startMs)) {
+      best = cue;
+    }
+  }
+  return best ?? cueList[0];
+}
+
+function decodeBase64ToBytes(base64: string): Uint8Array {
+  const binary = atob(base64);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) {
+    bytes[i] = binary.charCodeAt(i);
+  }
+  return bytes;
+}
+
+function buildDemoWavBuffer(
+  durationMs: number,
+  cues: SubtitleCue[],
+): ArrayBuffer {
+  const sampleRate = 16000;
+  const clampedMs = Math.max(2000, Math.min(durationMs, 120000));
+  const numSamples = Math.floor((clampedMs / 1000) * sampleRate);
+  const dataSize = numSamples * 2;
+  const buffer = new ArrayBuffer(44 + dataSize);
+  const view = new DataView(buffer);
+
+  const writeAscii = (offset: number, text: string) => {
+    for (let i = 0; i < text.length; i += 1) {
+      view.setUint8(offset + i, text.charCodeAt(i));
+    }
+  };
+
+  writeAscii(0, "RIFF");
+  view.setUint32(4, 36 + dataSize, true);
+  writeAscii(8, "WAVE");
+  writeAscii(12, "fmt ");
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeAscii(36, "data");
+  view.setUint32(40, dataSize, true);
+
+  for (let i = 0; i < numSamples; i += 1) {
+    const tSec = i / sampleRate;
+    const tMs = tSec * 1000;
+    const active = cues.find((c) => tMs >= c.startMs && tMs <= c.endMs);
+    let sample = 0;
+    if (active) {
+      const spanSec = Math.max(0.1, (active.endMs - active.startMs) / 1000);
+      const posSec = tSec - active.startMs / 1000;
+      const env = Math.sin(
+        Math.min(1, Math.min(posSec * 8, (spanSec - posSec) * 8)) *
+          (Math.PI / 2),
+      );
+      const baseHz = 185 + ((active.id * 29) % 75);
+      const wave =
+        0.55 * Math.sin(2 * Math.PI * baseHz * tSec) +
+        0.3 * Math.sin(2 * Math.PI * baseHz * 1.498 * tSec);
+      sample = Math.round(wave * env * 0.14 * 32767);
+    }
+    view.setInt16(44 + i * 2, sample, true);
+  }
+  return buffer;
+}
+
 export function WaveformTimeline() {
   const config = useAppStore((s) => s.config);
   const activeProject = useAppStore((s) => s.activeProject);
@@ -83,7 +164,8 @@ export function WaveformTimeline() {
   const [zoomPct, setZoomPct] = useState(100);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playheadMs, setPlayheadMs] = useState(0);
-  const [audioLoaded, setAudioLoaded] = useState(false);
+  const [audioBlobUrl, setAudioBlobUrl] = useState<string>("");
+  const [liveAudioDurationMs, setLiveAudioDurationMs] = useState(0);
   const [viewportWidth, setViewportWidth] = useState(1000);
   const [trimDrag, setTrimDrag] = useState<TrimDragState | null>(null);
   const [tracks, setTracks] = useState<TrackState>({
@@ -93,6 +175,14 @@ export function WaveformTimeline() {
   });
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
+  const audioRawBytesRef = useRef<ArrayBuffer | null>(null);
+  const webAudioCtxRef = useRef<AudioContext | null>(null);
+  const webAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
+  const webAudioGainRef = useRef<GainNode | null>(null);
+  const webAudioBufferRef = useRef<AudioBuffer | null>(null);
+  const webAudioStartCtxTimeRef = useRef(0);
+  const webAudioStartOffsetSecRef = useRef(0);
+
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
   const rulerRef = useRef<HTMLDivElement | null>(null);
@@ -106,13 +196,26 @@ export function WaveformTimeline() {
   const lastRafTickRef = useRef<number>(0);
 
   const cues = activeProject?.cues ?? [];
+  const cuesRef = useRef(cues);
+  cuesRef.current = cues;
+  const activeCueIdRef = useRef(activeCueId);
+  activeCueIdRef.current = activeCueId;
+  const tracksRef = useRef(tracks);
+  tracksRef.current = tracks;
+
   const maxCueEndMs = useMemo(
     () => cues.reduce((max, c) => Math.max(max, c.endMs), 0),
     [cues],
   );
   const audioEndMs = useMemo(
-    () => Math.max(activeProject?.durationMs ?? 0, maxCueEndMs, 1000),
-    [activeProject?.durationMs, maxCueEndMs],
+    () =>
+      Math.max(
+        activeProject?.durationMs ?? 0,
+        liveAudioDurationMs,
+        maxCueEndMs,
+        1000,
+      ),
+    [activeProject?.durationMs, liveAudioDurationMs, maxCueEndMs],
   );
   const totalMs = useMemo(
     () => Math.max(Math.round(audioEndMs * 1.04), maxCueEndMs + 500, 1000),
@@ -130,53 +233,146 @@ export function WaveformTimeline() {
     return cues[0];
   }, [cues, activeCueId]);
 
-  const audioSrc = useMemo(() => {
-    const path = activeProject?.audioPath;
-    if (!path || /\.(srt|vtt)$/i.test(path.trim())) {
-      return "";
-    }
-    if (isTauriRuntime()) {
+  const stopWebAudio = useCallback(() => {
+    if (webAudioSourceRef.current) {
       try {
-        return convertFileSrc(path);
+        webAudioSourceRef.current.stop();
+        webAudioSourceRef.current.disconnect();
       } catch {
-        return "";
+        // Ignore already stopped source
       }
+      webAudioSourceRef.current = null;
     }
-    return "";
-  }, [activeProject?.audioPath]);
+  }, []);
 
-  // Reset audioLoaded when source changes
+  // Load real audio bytes into a blob: ObjectURL (works natively in Linux WebKitGTK & Windows WebView2)
   useEffect(() => {
-    setAudioLoaded(false);
-  }, [audioSrc]);
+    let active = true;
+    let createdUrl = "";
 
-  // Sync mute state onto <audio>
+    stopWebAudio();
+    webAudioBufferRef.current = null;
+    audioRawBytesRef.current = null;
+    setLiveAudioDurationMs(0);
+    setAudioBlobUrl("");
+
+    const path = activeProject?.audioPath?.trim() ?? "";
+    if (!path || /\.(srt|vtt)$/i.test(path)) {
+      return;
+    }
+
+    const isDemoProject =
+      !isTauriRuntime() || activeProject?.jobId === "demo-session-01";
+
+    const loadPreview = async () => {
+      try {
+        const preview = await readAudioPreviewBase64(path);
+        if (!active) return;
+        const bytes = decodeBase64ToBytes(preview.base64Data);
+        const rawBuf = bytes.buffer.slice(
+          bytes.byteOffset,
+          bytes.byteOffset + bytes.byteLength,
+        ) as ArrayBuffer;
+        audioRawBytesRef.current = rawBuf;
+        const blob = new Blob([rawBuf], { type: preview.mimeType });
+        createdUrl = URL.createObjectURL(blob);
+        setAudioBlobUrl(createdUrl);
+      } catch {
+        if (!active) return;
+        if (isDemoProject) {
+          const demoBuf = buildDemoWavBuffer(
+            audioEndMsRef.current,
+            cuesRef.current,
+          );
+          audioRawBytesRef.current = demoBuf;
+          const blob = new Blob([demoBuf], { type: "audio/wav" });
+          createdUrl = URL.createObjectURL(blob);
+          setAudioBlobUrl(createdUrl);
+        }
+      }
+    };
+
+    void loadPreview();
+
+    return () => {
+      active = false;
+      stopWebAudio();
+      if (createdUrl) {
+        URL.revokeObjectURL(createdUrl);
+      }
+    };
+  }, [activeProject?.jobId, activeProject?.audioPath, stopWebAudio]);
+
+  // Sync mute state onto <audio> and Web Audio gain
   useEffect(() => {
     if (audioRef.current) {
       audioRef.current.muted = tracks.mp3.muted;
     }
+    if (webAudioGainRef.current && webAudioCtxRef.current) {
+      webAudioGainRef.current.gain.setValueAtTime(
+        tracks.mp3.muted ? 0 : 1,
+        webAudioCtxRef.current.currentTime,
+      );
+    }
   }, [tracks.mp3.muted]);
 
   const seekPlayhead = useCallback(
-    (ms: number) => {
+    (ms: number, syncCue = true) => {
       const clamped = Math.max(0, Math.min(audioEndMsRef.current, ms));
       playheadRef.current = clamped;
       setPlayheadMs(clamped);
-      if (audioLoaded && audioRef.current) {
+
+      if (syncCue && cuesRef.current.length > 0) {
+        const matched = findCueForTime(cuesRef.current, clamped, true);
+        if (matched && matched.id !== activeCueIdRef.current) {
+          setActiveCueId(matched.id);
+        }
+      }
+
+      if (audioRef.current && audioBlobUrl) {
         try {
-          audioRef.current.currentTime = clamped / 1000;
+          if (
+            !Number.isFinite(audioRef.current.duration) ||
+            audioRef.current.duration > 0
+          ) {
+            audioRef.current.currentTime = clamped / 1000;
+          }
         } catch {
           // Ignore seek errors before metadata
         }
       }
+
+      // If Web Audio fallback is actively playing, restart buffer from new offset
+      if (webAudioSourceRef.current && webAudioBufferRef.current) {
+        const startOffsetSec = Math.max(
+          0,
+          Math.min(
+            webAudioBufferRef.current.duration - 0.01,
+            clamped / 1000,
+          ),
+        );
+        stopWebAudio();
+        const ctx = webAudioCtxRef.current;
+        const gain = webAudioGainRef.current;
+        if (ctx && gain) {
+          const src = ctx.createBufferSource();
+          src.buffer = webAudioBufferRef.current;
+          src.connect(gain);
+          webAudioStartCtxTimeRef.current = ctx.currentTime;
+          webAudioStartOffsetSecRef.current = startOffsetSec;
+          src.start(0, startOffsetSec);
+          webAudioSourceRef.current = src;
+        }
+      }
     },
-    [audioLoaded],
+    [audioBlobUrl, setActiveCueId, stopWebAudio],
   );
 
   // When switching projects, stop playback and position playhead on active/first cue start
   useEffect(() => {
     setIsPlaying(false);
     segmentEndMsRef.current = null;
+    stopWebAudio();
     if (audioRef.current) {
       audioRef.current.pause();
     }
@@ -196,17 +392,18 @@ export function WaveformTimeline() {
   useEffect(() => {
     if (!playbackRequest) return;
     segmentEndMsRef.current = playbackRequest.endMs;
-    seekPlayhead(playbackRequest.startMs);
+    seekPlayhead(playbackRequest.startMs, true);
     setIsPlaying(true);
   }, [playbackRequest, seekPlayhead]);
 
-  // Playback loop (real audio sync + requestAnimationFrame fallback)
+  // Playback loop (<audio> blob primary + Web Audio API fallback + rAF clock)
   useEffect(() => {
     if (!isPlaying) {
       if (rafIdRef.current !== null) {
         window.cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;
       }
+      stopWebAudio();
       if (audioRef.current && !audioRef.current.paused) {
         audioRef.current.pause();
       }
@@ -214,7 +411,22 @@ export function WaveformTimeline() {
     }
 
     let cancelled = false;
-    let usingLiveAudio = false;
+    let clockSource: "audio" | "webaudio" | "raf" = "raf";
+
+    const syncEditorToPlayhead = (ms: number) => {
+      const matched = findCueForTime(cuesRef.current, ms, false);
+      if (!matched || matched.id === activeCueIdRef.current) {
+        return;
+      }
+      const activeElId = document.activeElement?.id;
+      if (
+        activeElId === "textarea-original" ||
+        activeElId === "textarea-prevod"
+      ) {
+        return;
+      }
+      setActiveCueId(matched.id);
+    };
 
     const startClock = () => {
       lastRafTickRef.current = performance.now();
@@ -223,8 +435,14 @@ export function WaveformTimeline() {
         if (cancelled) return;
 
         let nextMs: number;
-        if (usingLiveAudio && audioRef.current) {
+        if (clockSource === "audio" && audioRef.current) {
           nextMs = audioRef.current.currentTime * 1000;
+        } else if (clockSource === "webaudio" && webAudioCtxRef.current) {
+          nextMs =
+            (webAudioStartOffsetSecRef.current +
+              (webAudioCtxRef.current.currentTime -
+                webAudioStartCtxTimeRef.current)) *
+            1000;
         } else {
           const dt = Math.max(0, now - lastRafTickRef.current);
           lastRafTickRef.current = now;
@@ -232,12 +450,16 @@ export function WaveformTimeline() {
         }
 
         const segEnd = segmentEndMsRef.current;
-        const limit = segEnd !== null ? Math.min(segEnd, audioEndMsRef.current) : audioEndMsRef.current;
+        const limit =
+          segEnd !== null
+            ? Math.min(segEnd, audioEndMsRef.current)
+            : audioEndMsRef.current;
 
         if (nextMs >= limit) {
           playheadRef.current = limit;
           setPlayheadMs(limit);
           segmentEndMsRef.current = null;
+          stopWebAudio();
           if (audioRef.current && !audioRef.current.paused) {
             audioRef.current.pause();
           }
@@ -247,54 +469,135 @@ export function WaveformTimeline() {
 
         playheadRef.current = nextMs;
         setPlayheadMs(nextMs);
+        syncEditorToPlayhead(nextMs);
         rafIdRef.current = window.requestAnimationFrame(tick);
       };
 
       rafIdRef.current = window.requestAnimationFrame(tick);
     };
 
-    const audioEl = audioRef.current;
-    if (audioLoaded && audioEl) {
+    const startWebAudioFallback = async (): Promise<boolean> => {
+      const rawBuf = audioRawBytesRef.current;
+      if (!rawBuf || typeof AudioContext === "undefined") {
+        return false;
+      }
       try {
-        if (Math.abs(audioEl.currentTime * 1000 - playheadRef.current) > 80) {
-          audioEl.currentTime = playheadRef.current / 1000;
+        if (!webAudioCtxRef.current) {
+          webAudioCtxRef.current = new AudioContext();
         }
-        audioEl.muted = tracks.mp3.muted;
+        const ctx = webAudioCtxRef.current;
+        if (ctx.state === "suspended") {
+          await ctx.resume();
+        }
+        if (!webAudioGainRef.current) {
+          const gain = ctx.createGain();
+          gain.connect(ctx.destination);
+          webAudioGainRef.current = gain;
+        }
+        webAudioGainRef.current.gain.setValueAtTime(
+          tracksRef.current.mp3.muted ? 0 : 1,
+          ctx.currentTime,
+        );
+        if (!webAudioBufferRef.current) {
+          webAudioBufferRef.current = await ctx.decodeAudioData(
+            rawBuf.slice(0),
+          );
+          if (!activeProject?.durationMs && webAudioBufferRef.current.duration) {
+            setLiveAudioDurationMs(
+              Math.round(webAudioBufferRef.current.duration * 1000),
+            );
+          }
+        }
+        if (cancelled || !webAudioBufferRef.current) return false;
+        stopWebAudio();
+        const offsetSec = Math.max(
+          0,
+          Math.min(
+            Math.max(0, webAudioBufferRef.current.duration - 0.02),
+            playheadRef.current / 1000,
+          ),
+        );
+        const src = ctx.createBufferSource();
+        src.buffer = webAudioBufferRef.current;
+        src.connect(webAudioGainRef.current);
+        webAudioStartCtxTimeRef.current = ctx.currentTime;
+        webAudioStartOffsetSecRef.current = offsetSec;
+        src.start(0, offsetSec);
+        webAudioSourceRef.current = src;
+        return true;
+      } catch {
+        return false;
+      }
+    };
+
+    const audioEl = audioRef.current;
+    if (audioBlobUrl && audioEl && !audioEl.error) {
+      try {
+        if (
+          Number.isFinite(audioEl.duration) &&
+          audioEl.duration > 0 &&
+          Math.abs(audioEl.currentTime * 1000 - playheadRef.current) > 80
+        ) {
+          audioEl.currentTime = Math.min(
+            audioEl.duration,
+            playheadRef.current / 1000,
+          );
+        }
+        audioEl.muted = tracksRef.current.mp3.muted;
         const playPromise = audioEl.play();
         if (playPromise && typeof playPromise.then === "function") {
-          usingLiveAudio = true;
           playPromise
             .then(() => {
               if (!cancelled) {
+                clockSource = "audio";
                 startClock();
               }
             })
-            .catch(() => {
-              usingLiveAudio = false;
+            .catch(async () => {
+              const ok = await startWebAudioFallback();
               if (!cancelled) {
+                clockSource = ok ? "webaudio" : "raf";
                 startClock();
               }
             });
         } else {
-          usingLiveAudio = true;
+          clockSource = "audio";
           startClock();
         }
       } catch {
-        usingLiveAudio = false;
-        startClock();
+        void startWebAudioFallback().then((ok) => {
+          if (!cancelled) {
+            clockSource = ok ? "webaudio" : "raf";
+            startClock();
+          }
+        });
       }
+    } else if (audioRawBytesRef.current) {
+      void startWebAudioFallback().then((ok) => {
+        if (!cancelled) {
+          clockSource = ok ? "webaudio" : "raf";
+          startClock();
+        }
+      });
     } else {
       startClock();
     }
 
     return () => {
       cancelled = true;
+      stopWebAudio();
       if (rafIdRef.current !== null) {
         window.cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;
       }
     };
-  }, [isPlaying, audioLoaded, tracks.mp3.muted]);
+  }, [
+    isPlaying,
+    audioBlobUrl,
+    activeProject?.durationMs,
+    setActiveCueId,
+    stopWebAudio,
+  ]);
 
   const togglePlayTimeline = useCallback(() => {
     if (isPlaying) {
@@ -304,15 +607,22 @@ export function WaveformTimeline() {
     }
     segmentEndMsRef.current = null;
     if (playheadRef.current >= audioEndMsRef.current) {
-      seekPlayhead(0);
+      seekPlayhead(0, true);
+    }
+    // Kick user-gesture audio unlock synchronously inside click/Space handler
+    if (webAudioCtxRef.current?.state === "suspended") {
+      void webAudioCtxRef.current.resume().catch(() => {});
+    }
+    if (audioRef.current && audioBlobUrl && !audioRef.current.error) {
+      audioRef.current.muted = tracksRef.current.mp3.muted;
     }
     setIsPlaying(true);
-  }, [isPlaying, seekPlayhead]);
+  }, [isPlaying, audioBlobUrl, seekPlayhead]);
 
   const stopTimeline = useCallback(() => {
     segmentEndMsRef.current = null;
     setIsPlaying(false);
-    seekPlayhead(0);
+    seekPlayhead(0, true);
   }, [seekPlayhead]);
 
   // Measure viewport width for adaptive ruler ticks & HiDPI waveform
@@ -522,7 +832,7 @@ export function WaveformTimeline() {
       Math.min(1, (clientX - rect.left) / Math.max(1, rect.width)),
     );
     segmentEndMsRef.current = null;
-    seekPlayhead(ratio * totalMs);
+    seekPlayhead(ratio * totalMs, true);
   };
 
   // Clip trim drag handlers
@@ -612,11 +922,15 @@ export function WaveformTimeline() {
           }`}
           style={{ left: `${leftPct}%`, width: `${widthPct}%` }}
           title={`#${cue.id} (${formatRulerSec(startMs)}–${formatRulerSec(endMs)}): ${rawText}`}
-          onClick={() => setActiveCueId(cue.id)}
-          onDoubleClick={() => {
+          onClick={(e) => {
+            e.stopPropagation();
+            setActiveCueId(cue.id);
+          }}
+          onDoubleClick={(e) => {
+            e.stopPropagation();
             setActiveCueId(cue.id);
             segmentEndMsRef.current = null;
-            seekPlayhead(startMs);
+            seekPlayhead(startMs, false);
           }}
         >
           <div
@@ -679,11 +993,22 @@ export function WaveformTimeline() {
     <section id="timeline-panel" aria-label="Timeline">
       <audio
         ref={audioRef}
-        src={audioSrc || undefined}
-        preload="metadata"
-        onLoadedMetadata={() => setAudioLoaded(true)}
-        onCanPlay={() => setAudioLoaded(true)}
-        onError={() => setAudioLoaded(false)}
+        src={audioBlobUrl || undefined}
+        preload="auto"
+        onLoadedMetadata={(e) => {
+          const el = e.currentTarget;
+          if (Number.isFinite(el.duration) && el.duration > 0) {
+            if (!activeProject?.durationMs) {
+              setLiveAudioDurationMs(Math.round(el.duration * 1000));
+            }
+            if (Math.abs(el.currentTime * 1000 - playheadRef.current) > 80) {
+              el.currentTime = Math.min(
+                el.duration,
+                playheadRef.current / 1000,
+              );
+            }
+          }
+        }}
         onEnded={() => {
           segmentEndMsRef.current = null;
           setIsPlaying(false);
@@ -1184,6 +1509,28 @@ export function WaveformTimeline() {
               className={`tl-lane${tracks.mp3.muted ? " muted" : ""}${
                 tracks.mp3.locked ? " locked" : ""
               }`}
+              onPointerDown={(e) => {
+                scrubbingRef.current = true;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                scrubFromClientX(e.clientX);
+              }}
+              onPointerMove={(e) => {
+                if (scrubbingRef.current) {
+                  scrubFromClientX(e.clientX);
+                }
+              }}
+              onPointerUp={(e) => {
+                scrubbingRef.current = false;
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              }}
+              onPointerCancel={(e) => {
+                scrubbingRef.current = false;
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              }}
             >
               <div
                 ref={mp3ClipRef}
@@ -1203,6 +1550,29 @@ export function WaveformTimeline() {
               className={`tl-lane${tracks.original.hidden ? " muted" : ""}${
                 tracks.original.locked ? " locked" : ""
               }`}
+              onPointerDown={(e) => {
+                if (e.target !== e.currentTarget) return;
+                scrubbingRef.current = true;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                scrubFromClientX(e.clientX);
+              }}
+              onPointerMove={(e) => {
+                if (scrubbingRef.current) {
+                  scrubFromClientX(e.clientX);
+                }
+              }}
+              onPointerUp={(e) => {
+                scrubbingRef.current = false;
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              }}
+              onPointerCancel={(e) => {
+                scrubbingRef.current = false;
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              }}
             >
               {renderClips("original")}
             </div>
@@ -1213,6 +1583,29 @@ export function WaveformTimeline() {
               className={`tl-lane${tracks.prevod.hidden ? " muted" : ""}${
                 tracks.prevod.locked ? " locked" : ""
               }`}
+              onPointerDown={(e) => {
+                if (e.target !== e.currentTarget) return;
+                scrubbingRef.current = true;
+                e.currentTarget.setPointerCapture(e.pointerId);
+                scrubFromClientX(e.clientX);
+              }}
+              onPointerMove={(e) => {
+                if (scrubbingRef.current) {
+                  scrubFromClientX(e.clientX);
+                }
+              }}
+              onPointerUp={(e) => {
+                scrubbingRef.current = false;
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              }}
+              onPointerCancel={(e) => {
+                scrubbingRef.current = false;
+                if (e.currentTarget.hasPointerCapture(e.pointerId)) {
+                  e.currentTarget.releasePointerCapture(e.pointerId);
+                }
+              }}
             >
               {renderClips("prevod")}
             </div>
