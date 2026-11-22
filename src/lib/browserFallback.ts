@@ -22,6 +22,7 @@ import type {
 import {
   convertSerbianScriptText,
   getPresetSegmentRules,
+  parseSubtitleFileText,
   recalculateCue,
 } from "./subtitleUtils";
 
@@ -703,6 +704,47 @@ export const browserFallback = {
 
   async cancelJob(_jobId: string): Promise<void> {
     return;
+  },
+
+  async importSubtitleFile(
+    subtitlePath: string,
+    options: JobOptions,
+  ): Promise<SubtitleProject> {
+    const fileName =
+      subtitlePath.split(/[\\/]/).pop() || "Imported_Subtitles.srt";
+    const demo = createDemoProject(subtitlePath, options, `import-${Date.now()}`);
+    const parsedCues = parseSubtitleFileText(
+      `1\n00:00:00,500 --> 00:00:03,800\n${demo.cues[0]?.sourceText ?? "Imported subtitle segment."}\n\n2\n00:00:04,200 --> 00:00:08,100\n${demo.cues[1]?.sourceText ?? "Ready for translation or Serbian script conversion."}\n`,
+      options.segmentRules,
+    ).map((c) =>
+      options.sourceLanguage === "sr"
+        ? recalculateCue(
+            {
+              ...c,
+              sourceText: convertSerbianScriptText(
+                c.sourceText,
+                options.script,
+              ),
+            },
+            options.segmentRules,
+          )
+        : c,
+    );
+    const durationMs = parsedCues.reduce((max, c) => Math.max(max, c.endMs), 0);
+    const project: SubtitleProject = {
+      ...demo,
+      audioPath: subtitlePath,
+      audioFileName: fileName,
+      durationMs,
+      cues: parsedCues,
+      phase: "completed",
+      updatedAt: new Date().toISOString(),
+    };
+    mockCheckpoints = [
+      project,
+      ...mockCheckpoints.filter((c) => c.jobId !== project.jobId),
+    ];
+    return project;
   },
 
   async convertCuesScript(

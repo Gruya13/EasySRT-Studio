@@ -38,6 +38,7 @@ pub fn run() {
             commands::list_checkpoints,
             commands::load_checkpoint,
             commands::delete_checkpoint,
+            commands::import_subtitle_file,
             commands::transcribe_audio,
             commands::resegment_project,
             commands::translate_project,

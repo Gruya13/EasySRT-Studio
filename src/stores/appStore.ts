@@ -2,7 +2,9 @@ import { create } from "zustand";
 import { normalizeUiLanguage, type UiLanguage } from "../i18n";
 import {
   calculateCueMetrics,
+  convertSerbianScriptText,
   getPresetSegmentRules,
+  parseSubtitleFileText,
   recalculateCue,
 } from "../lib/subtitleUtils";
 import {
@@ -17,6 +19,7 @@ import {
   getConfig,
   getSetupStatus,
   importCustomModel,
+  importSubtitleFile,
   installComponent,
   installRecommendedBundle,
   listCheckpoints,
@@ -80,6 +83,19 @@ export interface BannerNotification {
   message: string;
 }
 
+export type ReplaceTargetColumn = "both" | "source" | "translated";
+
+export interface ReplaceInCuesOptions {
+  searchText: string;
+  replaceText: string;
+  targetColumn: ReplaceTargetColumn;
+  caseSensitive: boolean;
+  mode: "next" | "all";
+  startFromCueId?: number | null;
+}
+
+const MAX_UNDO_HISTORY = 50;
+
 const DEFAULT_SEGMENT_RULES: SegmentRules = getPresetSegmentRules("standard");
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -139,6 +155,11 @@ interface AppStoreState {
   activeCueId: number | null;
   playbackRequest: PlaybackRequest | null;
 
+  undoStack: SubtitleCue[][];
+  redoStack: SubtitleCue[][];
+  canUndo: boolean;
+  canRedo: boolean;
+
   isSetupOpen: boolean;
   isSettingsOpen: boolean;
   isExportOpen: boolean;
@@ -183,6 +204,8 @@ interface AppStoreState {
   convertActiveProjectScript: (targetScript: SerbianScript) => Promise<void>;
 
   enqueueAudioFiles: (paths: string[]) => void;
+  importSubtitleFromPath: (path: string) => Promise<void>;
+  importSubtitleFromText: (fileName: string, content: string) => void;
   removeQueueItem: (jobId: string) => void;
   clearFinishedQueueItems: () => void;
   selectQueueItem: (jobId: string) => void;
@@ -213,6 +236,9 @@ interface AppStoreState {
   mergeCueWithNext: (cueId: number) => void;
   deleteCueById: (cueId: number) => void;
   addCueAtEnd: () => void;
+  replaceInCues: (options: ReplaceInCuesOptions) => number;
+  undoCueEdit: () => void;
+  redoCueEdit: () => void;
 
   playCueSegment: (cue: SubtitleCue) => void;
   setActiveCueId: (cueId: number | null) => void;
@@ -296,6 +322,33 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     });
   };
 
+  const cloneCuesSnapshot = (cues: SubtitleCue[]): SubtitleCue[] =>
+    cues.map((c) => ({ ...c, warnings: [...c.warnings] }));
+
+  const pushUndoSnapshot = (currentCues: SubtitleCue[]) => {
+    set((state) => {
+      const nextUndo = [
+        ...state.undoStack.slice(-(MAX_UNDO_HISTORY - 1)),
+        cloneCuesSnapshot(currentCues),
+      ];
+      return {
+        undoStack: nextUndo,
+        redoStack: [],
+        canUndo: nextUndo.length > 0,
+        canRedo: false,
+      };
+    });
+  };
+
+  const resetUndoHistory = () => {
+    set({
+      undoStack: [],
+      redoStack: [],
+      canUndo: false,
+      canRedo: false,
+    });
+  };
+
   return {
     initialized: false,
     setupStatus: null,
@@ -320,6 +373,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     activeCueId: null,
     playbackRequest: null,
+
+    undoStack: [],
+    redoStack: [],
+    canUndo: false,
+    canRedo: false,
 
     isSetupOpen: false,
     isSettingsOpen: false,
@@ -675,6 +733,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!activeProject) {
         return;
       }
+      pushUndoSnapshot(activeProject.cues);
       try {
         const updated = await resegmentProject(
           activeProject,
@@ -725,6 +784,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!activeProject || activeProject.cues.length === 0) {
         return;
       }
+      pushUndoSnapshot(activeProject.cues);
       try {
         const convertedCues = await convertCuesScript(
           activeProject.cues,
@@ -751,6 +811,100 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           },
         });
       }
+    },
+
+    importSubtitleFromPath: async (path) => {
+      try {
+        const project = await importSubtitleFile(path, get().jobOptions);
+        resetUndoHistory();
+        syncProjectIntoQueueAndState(project);
+        set({
+          activeCueId: project.cues[0]?.id ?? null,
+          banner: {
+            type: "success",
+            message:
+              get().config.uiLanguage === "en"
+                ? `Imported subtitle file: ${project.audioFileName} (${project.cues.length} cues)`
+                : `Uvezen fajl titla: ${project.audioFileName} (${project.cues.length} titlova)`,
+          },
+        });
+      } catch (err) {
+        set({
+          banner: {
+            type: "error",
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      }
+    },
+
+    importSubtitleFromText: (fileName, content) => {
+      const { jobOptions, config } = get();
+      const parsed = parseSubtitleFileText(content, jobOptions.segmentRules);
+      if (parsed.length === 0) {
+        set({
+          banner: {
+            type: "error",
+            message:
+              config.uiLanguage === "en"
+                ? "Subtitle file is empty or has no valid timestamp cues."
+                : "Fajl titla je prazan ili ne sadrži ispravne vremenske kodove.",
+          },
+        });
+        return;
+      }
+
+      const cues = parsed.map((c) =>
+        jobOptions.sourceLanguage === "sr"
+          ? recalculateCue(
+              {
+                ...c,
+                sourceText: convertSerbianScriptText(
+                  c.sourceText,
+                  jobOptions.script,
+                ),
+              },
+              jobOptions.segmentRules,
+            )
+          : c,
+      );
+
+      const durationMs = cues.reduce((max, c) => Math.max(max, c.endMs), 0);
+      const cleanName = fileName.split(/[\\/]/).pop() || fileName;
+      const jobId = `import-${Date.now()}-${Math.random()
+        .toString(36)
+        .slice(2, 7)}`;
+
+      const project: SubtitleProject = {
+        jobId,
+        audioPath: fileName,
+        audioFileName: cleanName,
+        durationMs,
+        detectedLanguage:
+          jobOptions.sourceLanguage === "auto"
+            ? null
+            : jobOptions.sourceLanguage,
+        options: { ...jobOptions },
+        words: [],
+        cues,
+        phase: "completed",
+        completedTranslationBatches: 0,
+        errorMessage: null,
+        updatedAt: new Date().toISOString(),
+      };
+
+      resetUndoHistory();
+      syncProjectIntoQueueAndState(project);
+      set({
+        activeCueId: cues[0]?.id ?? null,
+        banner: {
+          type: "success",
+          message:
+            config.uiLanguage === "en"
+              ? `Imported subtitle file: ${cleanName} (${cues.length} cues)`
+              : `Uvezen fajl titla: ${cleanName} (${cues.length} titlova)`,
+        },
+      });
     },
 
     enqueueAudioFiles: (paths) => {
@@ -827,6 +981,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!item) {
         return;
       }
+      resetUndoHistory();
       set({
         activeJobId: jobId,
         activeProject: item.project ?? get().activeProject,
@@ -837,6 +992,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     loadCheckpointIntoEditor: async (jobId) => {
       try {
         const project = await loadCheckpoint(jobId);
+        resetUndoHistory();
         syncProjectIntoQueueAndState(project);
         set({
           jobOptions: { ...project.options },
@@ -1079,6 +1235,22 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!activeProject) {
         return;
       }
+      const existing = activeProject.cues.find((c) => c.id === cueId);
+      if (!existing) {
+        return;
+      }
+      const hasChange =
+        (patch.startMs !== undefined && patch.startMs !== existing.startMs) ||
+        (patch.endMs !== undefined && patch.endMs !== existing.endMs) ||
+        (patch.sourceText !== undefined &&
+          patch.sourceText !== existing.sourceText) ||
+        (patch.translatedText !== undefined &&
+          patch.translatedText !== existing.translatedText);
+      if (!hasChange) {
+        return;
+      }
+
+      pushUndoSnapshot(activeProject.cues);
       const rules = jobOptions.segmentRules;
       const updatedCues = activeProject.cues.map((cue) => {
         if (cue.id !== cueId) {
@@ -1131,6 +1303,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (idx === -1) {
         return;
       }
+      pushUndoSnapshot(activeProject.cues);
       const cue = activeProject.cues[idx];
       const midMs = Math.round((cue.startMs + cue.endMs) / 2);
 
@@ -1201,6 +1374,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (idx === -1 || idx + 1 >= activeProject.cues.length) {
         return;
       }
+      pushUndoSnapshot(activeProject.cues);
       const current = activeProject.cues[idx];
       const next = activeProject.cues[idx + 1];
 
@@ -1242,6 +1416,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!activeProject) {
         return;
       }
+      if (!activeProject.cues.some((c) => c.id === cueId)) {
+        return;
+      }
+      pushUndoSnapshot(activeProject.cues);
       const nextCues = activeProject.cues
         .filter((c) => c.id !== cueId)
         .map((item, i) => ({ ...item, id: i + 1 }));
@@ -1258,6 +1436,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (!activeProject) {
         return;
       }
+      pushUndoSnapshot(activeProject.cues);
       const lastCue = activeProject.cues[activeProject.cues.length - 1];
       const startMs = lastCue ? lastCue.endMs + 200 : 0;
       const endMs = startMs + 2500;
@@ -1277,6 +1456,196 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       syncProjectIntoQueueAndState({
         ...activeProject,
         cues: [...activeProject.cues, newCue],
+        updatedAt: new Date().toISOString(),
+      });
+    },
+
+    replaceInCues: (options) => {
+      const { activeProject, jobOptions } = get();
+      const {
+        searchText,
+        replaceText,
+        targetColumn,
+        caseSensitive,
+        mode,
+        startFromCueId,
+      } = options;
+
+      if (!activeProject || !searchText) {
+        return 0;
+      }
+
+      const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+      const checkSource =
+        targetColumn === "both" || targetColumn === "source";
+      const checkTranslated =
+        targetColumn === "both" || targetColumn === "translated";
+
+      if (mode === "all") {
+        const globalRegex = new RegExp(escaped, caseSensitive ? "g" : "gi");
+        let totalReplaced = 0;
+
+        const nextCues = activeProject.cues.map((cue) => {
+          let nextSource = cue.sourceText;
+          let nextTranslated = cue.translatedText;
+          let cueChanged = false;
+
+          if (checkSource && nextSource) {
+            const matches = nextSource.match(globalRegex);
+            if (matches && matches.length > 0) {
+              totalReplaced += matches.length;
+              nextSource = nextSource.replace(globalRegex, () => replaceText);
+              cueChanged = true;
+            }
+          }
+
+          if (checkTranslated && nextTranslated) {
+            const matches = nextTranslated.match(globalRegex);
+            if (matches && matches.length > 0) {
+              totalReplaced += matches.length;
+              nextTranslated = nextTranslated.replace(
+                globalRegex,
+                () => replaceText,
+              );
+              cueChanged = true;
+            }
+          }
+
+          if (!cueChanged) {
+            return cue;
+          }
+
+          return recalculateCue(
+            {
+              ...cue,
+              sourceText: nextSource,
+              translatedText: nextTranslated,
+            },
+            jobOptions.segmentRules,
+          );
+        });
+
+        if (totalReplaced > 0) {
+          pushUndoSnapshot(activeProject.cues);
+          syncProjectIntoQueueAndState({
+            ...activeProject,
+            cues: nextCues,
+            updatedAt: new Date().toISOString(),
+          });
+        }
+
+        return totalReplaced;
+      }
+
+      // mode === "next"
+      const singleRegex = new RegExp(escaped, caseSensitive ? "" : "i");
+      const cues = activeProject.cues;
+      if (cues.length === 0) {
+        return 0;
+      }
+
+      const startIdx =
+        startFromCueId != null
+          ? Math.max(
+              0,
+              cues.findIndex((c) => c.id === startFromCueId),
+            )
+          : 0;
+
+      for (let offset = 0; offset < cues.length; offset++) {
+        const idx = (startIdx + offset) % cues.length;
+        const cue = cues[idx];
+
+        const sourceMatches =
+          checkSource && Boolean(cue.sourceText) && singleRegex.test(cue.sourceText);
+        const translatedMatches =
+          checkTranslated &&
+          Boolean(cue.translatedText) &&
+          singleRegex.test(cue.translatedText);
+
+        if (!sourceMatches && !translatedMatches) {
+          continue;
+        }
+
+        pushUndoSnapshot(cues);
+        const updatedCue = recalculateCue(
+          {
+            ...cue,
+            sourceText: sourceMatches
+              ? cue.sourceText.replace(singleRegex, () => replaceText)
+              : cue.sourceText,
+            translatedText:
+              !sourceMatches && translatedMatches
+                ? cue.translatedText.replace(singleRegex, () => replaceText)
+                : cue.translatedText,
+          },
+          jobOptions.segmentRules,
+        );
+
+        const nextCues = cues.map((item, i) =>
+          i === idx ? updatedCue : item,
+        );
+
+        set({ activeCueId: cue.id });
+        syncProjectIntoQueueAndState({
+          ...activeProject,
+          cues: nextCues,
+          updatedAt: new Date().toISOString(),
+        });
+        return 1;
+      }
+
+      return 0;
+    },
+
+    undoCueEdit: () => {
+      const { activeProject, undoStack, redoStack } = get();
+      if (!activeProject || undoStack.length === 0) {
+        return;
+      }
+      const previousCues = undoStack[undoStack.length - 1];
+      const nextUndo = undoStack.slice(0, -1);
+      const nextRedo = [
+        ...redoStack.slice(-(MAX_UNDO_HISTORY - 1)),
+        cloneCuesSnapshot(activeProject.cues),
+      ];
+
+      set({
+        undoStack: nextUndo,
+        redoStack: nextRedo,
+        canUndo: nextUndo.length > 0,
+        canRedo: nextRedo.length > 0,
+      });
+
+      syncProjectIntoQueueAndState({
+        ...activeProject,
+        cues: previousCues,
+        updatedAt: new Date().toISOString(),
+      });
+    },
+
+    redoCueEdit: () => {
+      const { activeProject, undoStack, redoStack } = get();
+      if (!activeProject || redoStack.length === 0) {
+        return;
+      }
+      const restoredCues = redoStack[redoStack.length - 1];
+      const nextRedo = redoStack.slice(0, -1);
+      const nextUndo = [
+        ...undoStack.slice(-(MAX_UNDO_HISTORY - 1)),
+        cloneCuesSnapshot(activeProject.cues),
+      ];
+
+      set({
+        undoStack: nextUndo,
+        redoStack: nextRedo,
+        canUndo: nextUndo.length > 0,
+        canRedo: nextRedo.length > 0,
+      });
+
+      syncProjectIntoQueueAndState({
+        ...activeProject,
+        cues: restoredCues,
         updatedAt: new Date().toISOString(),
       });
     },

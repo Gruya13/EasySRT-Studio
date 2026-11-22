@@ -3,6 +3,7 @@ import {
   BookOpen,
   ChevronDown,
   ChevronUp,
+  FileText,
   FolderOpen,
   Languages,
   Loader2,
@@ -27,6 +28,24 @@ import type {
 import { BatchQueuePanel } from "./BatchQueuePanel";
 
 const AUDIO_EXTENSIONS = ["mp3", "wav", "m4a", "flac", "ogg", "aac", "opus"];
+const SUBTITLE_EXTENSIONS = ["srt", "vtt"];
+
+function isSubtitleFileName(nameOrPath: string): boolean {
+  return /\.(srt|vtt)$/i.test(nameOrPath.trim());
+}
+
+function readBrowserFileText(file: File): Promise<string> {
+  if (typeof file.text === "function") {
+    return file.text();
+  }
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => resolve(String(reader.result ?? ""));
+    reader.onerror = () =>
+      reject(reader.error ?? new Error("Failed to read file"));
+    reader.readAsText(file, "utf-8");
+  });
+}
 
 export function JobWorkspace() {
   const config = useAppStore((s) => s.config);
@@ -46,6 +65,8 @@ export function JobWorkspace() {
     (s) => s.convertActiveProjectScript,
   );
   const enqueueAudioFiles = useAppStore((s) => s.enqueueAudioFiles);
+  const importSubtitleFromPath = useAppStore((s) => s.importSubtitleFromPath);
+  const importSubtitleFromText = useAppStore((s) => s.importSubtitleFromText);
   const startBatchPipeline = useAppStore((s) => s.startBatchPipeline);
   const translateActiveProject = useAppStore((s) => s.translateActiveProject);
   const polishActiveProject = useAppStore((s) => s.polishActiveProject);
@@ -59,6 +80,7 @@ export function JobWorkspace() {
   const [newTranslation, setNewTranslation] = useState("");
   const [bulkGlossaryText, setBulkGlossaryText] = useState("");
   const fallbackInputRef = useRef<HTMLInputElement | null>(null);
+  const fallbackSubtitleInputRef = useRef<HTMLInputElement | null>(null);
 
   const lang = normalizeUiLanguage(config.uiLanguage);
   const t = getDictionary(lang);
@@ -98,6 +120,30 @@ export function JobWorkspace() {
     fallbackInputRef.current?.click();
   };
 
+  const handleBrowseSubtitleFile = async () => {
+    if (isTauriRuntime()) {
+      try {
+        const selected = await open({
+          multiple: false,
+          filters: [
+            {
+              name: "Subtitles (.srt, .vtt)",
+              extensions: SUBTITLE_EXTENSIONS,
+            },
+          ],
+        });
+        const path = Array.isArray(selected) ? selected[0] : selected;
+        if (typeof path === "string" && path) {
+          await importSubtitleFromPath(path);
+        }
+        return;
+      } catch {
+        // Fallback to HTML input if dialog fails
+      }
+    }
+    fallbackSubtitleInputRef.current?.click();
+  };
+
   const handleFallbackFileInput = (
     e: React.ChangeEvent<HTMLInputElement>,
   ) => {
@@ -105,8 +151,32 @@ export function JobWorkspace() {
     if (!files || files.length === 0) {
       return;
     }
-    const paths = Array.from(files).map((f) => f.name);
-    enqueueAudioFiles(paths);
+    const audioPaths: string[] = [];
+    for (const file of Array.from(files)) {
+      if (isSubtitleFileName(file.name)) {
+        void readBrowserFileText(file).then((text) => {
+          importSubtitleFromText(file.name, text);
+        });
+      } else {
+        audioPaths.push(file.name);
+      }
+    }
+    if (audioPaths.length > 0) {
+      enqueueAudioFiles(audioPaths);
+    }
+    e.target.value = "";
+  };
+
+  const handleFallbackSubtitleInput = (
+    e: React.ChangeEvent<HTMLInputElement>,
+  ) => {
+    const file = e.target.files?.[0];
+    if (!file) {
+      return;
+    }
+    void readBrowserFileText(file).then((text) => {
+      importSubtitleFromText(file.name, text);
+    });
     e.target.value = "";
   };
 
@@ -117,13 +187,31 @@ export function JobWorkspace() {
     if (files.length === 0) {
       return;
     }
-    const paths = files
-      .map(
-        (file) =>
-          (file as File & { path?: string }).path || file.name,
-      )
-      .filter(Boolean);
-    enqueueAudioFiles(paths);
+
+    const audioPaths: string[] = [];
+    for (const file of files) {
+      const nativePath = (file as File & { path?: string }).path;
+      const targetName = nativePath || file.name;
+      if (!targetName) {
+        continue;
+      }
+
+      if (isSubtitleFileName(targetName)) {
+        if (isTauriRuntime() && nativePath) {
+          void importSubtitleFromPath(nativePath);
+        } else {
+          void readBrowserFileText(file).then((text) => {
+            importSubtitleFromText(file.name, text);
+          });
+        }
+      } else {
+        audioPaths.push(targetName);
+      }
+    }
+
+    if (audioPaths.length > 0) {
+      enqueueAudioFiles(audioPaths);
+    }
   };
 
   const handleScriptClick = (script: SerbianScript) => {
@@ -179,13 +267,20 @@ export function JobWorkspace() {
 
   return (
     <section className="space-y-4">
-      {/* Hidden browser fallback file input */}
+      {/* Hidden browser fallback file inputs */}
       <input
         ref={fallbackInputRef}
         type="file"
         multiple
-        accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,audio/*"
+        accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.srt,.vtt,audio/*"
         onChange={handleFallbackFileInput}
+        className="hidden"
+      />
+      <input
+        ref={fallbackSubtitleInputRef}
+        type="file"
+        accept=".srt,.vtt"
+        onChange={handleFallbackSubtitleInput}
         className="hidden"
       />
 
@@ -226,6 +321,18 @@ export function JobWorkspace() {
             >
               <FolderOpen className="h-3.5 w-3.5" />
               <span>{t.workspace.selectFilesBtn}</span>
+            </button>
+
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                void handleBrowseSubtitleFile();
+              }}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-emerald-500/40 bg-emerald-500/15 px-3.5 py-1.5 text-xs font-semibold text-emerald-200 transition hover:bg-emerald-500/25"
+            >
+              <FileText className="h-3.5 w-3.5" />
+              <span>{t.workspace.importSubtitleBtn}</span>
             </button>
 
             {!isTauriRuntime() && !activeProject && (

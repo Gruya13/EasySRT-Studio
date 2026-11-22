@@ -25,10 +25,14 @@ export function formatTimestampSrt(ms: number): string {
   )}:${String(seconds).padStart(2, "0")},${String(millis).padStart(3, "0")}`;
 }
 
+export function formatTimestampVtt(ms: number): string {
+  return formatTimestampSrt(ms).replace(",", ".");
+}
+
 export function parseTimestampSrt(value: string): number | null {
   const cleaned = value.trim().replace(".", ",");
   const match =
-    /^(?:(\d{1,2}):)?(\d{1,2}):(\d{1,2})(?:,(\d{1,3}))?$/.exec(cleaned);
+    /^(?:(\d{1,3}):)?(\d{1,2}):(\d{1,2})(?:,(\d{1,3}))?$/.exec(cleaned);
   if (!match) {
     return null;
   }
@@ -110,18 +114,47 @@ export function getPresetSegmentRules(
   };
 }
 
-export function calculateCueMetrics(
-  cue: Pick<SubtitleCue, "startMs" | "endMs" | "sourceText" | "translatedText">,
-  rules: SegmentRules,
-): { cps: number; warnings: string[] } {
-  const activeText = (cue.translatedText.trim() || cue.sourceText.trim()).replace(
-    /\r\n/g,
-    "\n",
-  );
-  const durationMs = Math.max(1, cue.endMs - cue.startMs);
+/**
+ * Calculates Characters Per Second (CPS) rounded to 1 decimal place.
+ * Supports both `calculateCps(text, durationMs)` and `calculateCps(text, startMs, endMs)`.
+ */
+export function calculateCps(
+  text: string,
+  startOrDurationMs: number,
+  endMs?: number,
+): number {
+  const cleaned = text.replace(/\r\n/g, "\n").trim().replace(/\n/g, "");
+  const charCount = [...cleaned].length;
+  if (charCount === 0) {
+    return 0;
+  }
+  const durationMs =
+    typeof endMs === "number"
+      ? Math.max(1, endMs - startOrDurationMs)
+      : Math.max(1, startOrDurationMs);
   const durationSec = durationMs / 1000;
+  return Number((charCount / durationSec).toFixed(1));
+}
+
+/**
+ * Computes warning identifiers (`high_cps`, `critical_cps`, `line_too_long`,
+ * `too_many_lines`, `short_duration`, `long_duration`) for a cue under `rules`.
+ */
+export function computeCueWarnings(
+  cue: Pick<SubtitleCue, "startMs" | "endMs" | "sourceText" | "translatedText"> & {
+    cps?: number;
+  },
+  rules: SegmentRules,
+): string[] {
+  const activeText = (
+    cue.translatedText.trim() || cue.sourceText.trim()
+  ).replace(/\r\n/g, "\n");
+  const durationMs = Math.max(1, cue.endMs - cue.startMs);
   const charCount = [...activeText.replace(/\n/g, "")].length;
-  const cps = Number((charCount / durationSec).toFixed(1));
+  const cps =
+    typeof cue.cps === "number" && cue.cps > 0
+      ? cue.cps
+      : calculateCps(activeText, cue.startMs, cue.endMs);
 
   const lines = activeText.length > 0 ? activeText.split("\n") : [];
   const warnings: string[] = [];
@@ -146,6 +179,18 @@ export function calculateCueMetrics(
     warnings.push("long_duration");
   }
 
+  return warnings;
+}
+
+export function calculateCueMetrics(
+  cue: Pick<SubtitleCue, "startMs" | "endMs" | "sourceText" | "translatedText">,
+  rules: SegmentRules,
+): { cps: number; warnings: string[] } {
+  const activeText = (
+    cue.translatedText.trim() || cue.sourceText.trim()
+  ).replace(/\r\n/g, "\n");
+  const cps = calculateCps(activeText, cue.startMs, cue.endMs);
+  const warnings = computeCueWarnings({ ...cue, cps }, rules);
   return { cps, warnings };
 }
 
@@ -161,17 +206,82 @@ export function recalculateCue(
   };
 }
 
-const LATIN_DIGRAPHS: Array<[string, string]> = [
-  ["DŽ", "Џ"],
-  ["Dž", "Џ"],
-  ["dž", "џ"],
-  ["LJ", "Љ"],
-  ["Lj", "Љ"],
-  ["lj", "љ"],
-  ["NJ", "Њ"],
-  ["Nj", "Њ"],
-  ["nj", "њ"],
+/**
+ * Balances text into at most `maxLines` lines (preferring 1 line if it fits within
+ * `maxCharsPerLine`, or splitting into 2 balanced lines near the visual midpoint).
+ */
+export function wrapBalancedLines(
+  text: string,
+  maxCharsPerLine = 42,
+  maxLines = 2,
+): string {
+  const words = text
+    .trim()
+    .split(/\s+/)
+    .filter(Boolean);
+  if (words.length === 0) {
+    return "";
+  }
+
+  const singleLine = words.join(" ");
+  const maxChars = Math.max(1, maxCharsPerLine);
+
+  if (maxLines <= 1 || [...singleLine].length <= maxChars || words.length === 1) {
+    return singleLine;
+  }
+
+  let bestSplit = 1;
+  let bestScore = Number.POSITIVE_INFINITY;
+
+  for (let k = 1; k < words.length; k++) {
+    const line1 = words.slice(0, k).join(" ");
+    const line2 = words.slice(k).join(" ");
+    const len1 = [...line1].length;
+    const len2 = [...line2].length;
+
+    const overflow1 = Math.max(0, len1 - maxChars);
+    const overflow2 = Math.max(0, len2 - maxChars);
+    const overflowPenalty = (overflow1 + overflow2) * 1000;
+
+    const diff = Math.abs(len1 - len2);
+    const prevWord = words[k - 1].replace(/["'”’)\]]+$/, "");
+    const punctBonus = /[,;:—–.!?…]$/.test(prevWord) ? 6 : 0;
+
+    const score = overflowPenalty + diff - punctBonus;
+    if (score < bestScore) {
+      bestScore = score;
+      bestSplit = k;
+    }
+  }
+
+  const line1 = words.slice(0, bestSplit).join(" ");
+  const line2 = words.slice(bestSplit).join(" ");
+  return `${line1}\n${line2}`;
+}
+
+// ---------------------------------------------------------------------------
+// Deterministic Serbian Cyrillic <-> Latin Script Conversion
+// ---------------------------------------------------------------------------
+
+const DIGRAPH_EXCEPTION_PREFIXES = [
+  "injekc",
+  "injekt",
+  "konjug",
+  "konjunk",
+  "adjekt",
+  "nadživ",
+  "nadziv",
+  "odživ",
+  "odziv",
+  "podžanr",
+  "podžup",
+  "predživot",
+  "predzivot",
+  "tanjug",
 ];
+
+const PROTECTED_SPAN_REGEX =
+  /(?:https?:\/\/[^\s<>]+|www\.[^\s<>]+|[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}|<[^>]+>|\{\\[^}]+\}|\[[^\]]+\])/gi;
 
 const LATIN_TO_CYRILLIC_SINGLE: Record<string, string> = {
   A: "А",
@@ -230,7 +340,7 @@ const LATIN_TO_CYRILLIC_SINGLE: Record<string, string> = {
   š: "ш",
 };
 
-const CYRILLIC_TO_LATIN: Record<string, string> = {
+const CYRILLIC_TO_LATIN_SINGLE: Record<string, string> = {
   А: "A",
   Б: "B",
   В: "V",
@@ -244,10 +354,8 @@ const CYRILLIC_TO_LATIN: Record<string, string> = {
   Ј: "J",
   К: "K",
   Л: "L",
-  Љ: "Lj",
   М: "M",
   Н: "N",
-  Њ: "Nj",
   О: "O",
   П: "P",
   Р: "R",
@@ -259,7 +367,6 @@ const CYRILLIC_TO_LATIN: Record<string, string> = {
   Х: "H",
   Ц: "C",
   Ч: "Č",
-  Џ: "Dž",
   Ш: "Š",
   а: "a",
   б: "b",
@@ -268,7 +375,7 @@ const CYRILLIC_TO_LATIN: Record<string, string> = {
   д: "d",
   ђ: "đ",
   е: "e",
-  ж: "ž",
+  ж: "ж" === "ж" ? "ž" : "ž",
   з: "z",
   и: "i",
   ј: "j",
@@ -293,24 +400,137 @@ const CYRILLIC_TO_LATIN: Record<string, string> = {
   ш: "š",
 };
 
+function isAlphabeticChar(ch: string | undefined): boolean {
+  return Boolean(ch && /\p{L}/u.test(ch));
+}
+
+function isUppercaseChar(ch: string | undefined): boolean {
+  return Boolean(
+    ch && isAlphabeticChar(ch) && ch === ch.toUpperCase() && ch !== ch.toLowerCase(),
+  );
+}
+
+/**
+ * Converts Serbian Cyrillic text to Serbian Latin with smart digraph casing
+ * (`ЉУБАВ` -> `LJUBAV`, `Љубав` -> `Ljubav`, `љубав` -> `ljubav`).
+ */
+export function cyrillicToLatin(text: string): string {
+  const chars = [...text];
+  let out = "";
+
+  for (let idx = 0; idx < chars.length; idx++) {
+    const ch = chars[idx];
+    const isAllCapsContext = () => {
+      const next = chars[idx + 1];
+      const prev = idx > 0 ? chars[idx - 1] : undefined;
+      const nextUpper = isUppercaseChar(next);
+      const nextAlpha = isAlphabeticChar(next);
+      const prevUpper = isUppercaseChar(prev);
+      return nextUpper || (!nextAlpha && prevUpper);
+    };
+
+    if (ch === "Љ") {
+      out += isAllCapsContext() ? "LJ" : "Lj";
+    } else if (ch === "Њ") {
+      out += isAllCapsContext() ? "NJ" : "Nj";
+    } else if (ch === "Џ") {
+      out += isAllCapsContext() ? "DŽ" : "Dž";
+    } else {
+      out += CYRILLIC_TO_LATIN_SINGLE[ch] ?? ch;
+    }
+  }
+
+  return out;
+}
+
+function isDigraphExceptionWord(wordLower: string): boolean {
+  return DIGRAPH_EXCEPTION_PREFIXES.some((prefix) =>
+    wordLower.startsWith(prefix),
+  );
+}
+
+function convertWordToCyrillic(word: string): string {
+  const lower = word.toLowerCase();
+  const skipDigraphMerge = isDigraphExceptionWord(lower);
+  const chars = [...word];
+  let out = "";
+  let i = 0;
+
+  while (i < chars.length) {
+    const ch = chars[i];
+    const next = chars[i + 1];
+
+    if (next !== undefined) {
+      // Lj / LJ / lj is never a morphological prefix split in exception words
+      if ((ch === "L" || ch === "l") && (next === "J" || next === "j")) {
+        out += isUppercaseChar(ch) ? "Љ" : "љ";
+        i += 2;
+        continue;
+      }
+
+      if (!skipDigraphMerge) {
+        if ((ch === "N" || ch === "n") && (next === "J" || next === "j")) {
+          out += isUppercaseChar(ch) ? "Њ" : "њ";
+          i += 2;
+          continue;
+        }
+        if ((ch === "D" || ch === "d") && (next === "Ž" || next === "ž")) {
+          out += isUppercaseChar(ch) ? "Џ" : "џ";
+          i += 2;
+          continue;
+        }
+      }
+    }
+
+    out += LATIN_TO_CYRILLIC_SINGLE[ch] ?? ch;
+    i += 1;
+  }
+
+  return out;
+}
+
+function convertPlainSegmentToCyrillic(segment: string): string {
+  return segment.replace(/\p{L}+/gu, (word) => convertWordToCyrillic(word));
+}
+
+/**
+ * Converts Serbian Latin text to Serbian Cyrillic, preserving protected spans
+ * (URLs, emails, HTML/ASS tags, `[...]` markers) and respecting prefix-boundary
+ * exceptions (`injekcija` -> `инјекција`, `konjugacija` -> `конјугација`, `nadživeti` -> `надживети`).
+ */
+export function latinToCyrillic(text: string): string {
+  let out = "";
+  let lastEnd = 0;
+  const regex = new RegExp(PROTECTED_SPAN_REGEX.source, "gi");
+  let match: RegExpExecArray | null;
+
+  while ((match = regex.exec(text)) !== null) {
+    if (match.index > lastEnd) {
+      out += convertPlainSegmentToCyrillic(text.slice(lastEnd, match.index));
+    }
+    out += match[0];
+    lastEnd = match.index + match[0].length;
+  }
+
+  if (lastEnd < text.length) {
+    out += convertPlainSegmentToCyrillic(text.slice(lastEnd));
+  }
+
+  return out;
+}
+
 export function convertSerbianScriptText(
   text: string,
   targetScript: SerbianScript,
 ): string {
-  if (targetScript === "cyrillic") {
-    let out = text;
-    for (const [lat, cyr] of LATIN_DIGRAPHS) {
-      out = out.split(lat).join(cyr);
-    }
-    return [...out]
-      .map((ch) => LATIN_TO_CYRILLIC_SINGLE[ch] ?? ch)
-      .join("");
-  }
-
-  return [...text]
-    .map((ch) => CYRILLIC_TO_LATIN[ch] ?? ch)
-    .join("");
+  return targetScript === "cyrillic"
+    ? latinToCyrillic(text)
+    : cyrillicToLatin(text);
 }
+
+// ---------------------------------------------------------------------------
+// Glossary Parsing
+// ---------------------------------------------------------------------------
 
 export function parseBulkGlossary(raw: string): Record<string, string> {
   const result: Record<string, string> = {};
@@ -339,4 +559,210 @@ export function parseBulkGlossary(raw: string): Record<string, string> {
     }
   }
   return result;
+}
+
+// ---------------------------------------------------------------------------
+// .SRT / .VTT Subtitle File Parser & Exporters
+// ---------------------------------------------------------------------------
+
+function parseArrowTimestampLine(
+  line: string,
+): { startMs: number; endMs: number } | null {
+  const arrowIdx = line.indexOf("-->");
+  if (arrowIdx === -1) {
+    return null;
+  }
+  const rawLeft = line.slice(0, arrowIdx).trim();
+  const rawRightTokens = line
+    .slice(arrowIdx + 3)
+    .trim()
+    .split(/\s+/);
+  const rawRight = rawRightTokens[0] ?? "";
+  if (!rawLeft || !rawRight) {
+    return null;
+  }
+
+  const startMs = parseTimestampSrt(rawLeft);
+  const endMs = parseTimestampSrt(rawRight);
+  if (startMs === null || endMs === null) {
+    return null;
+  }
+
+  return {
+    startMs,
+    endMs: Math.max(startMs, endMs),
+  };
+}
+
+/**
+ * Pure parser for `.srt` and `.vtt` subtitle file contents.
+ * Handles UTF-8 BOM, CRLF/LF line endings, comma and dot millisecond separators,
+ * VTT headers/metadata/cue settings, and multi-line cue text.
+ */
+export function parseSubtitleFileText(
+  content: string,
+  rules: SegmentRules = getPresetSegmentRules("standard"),
+): SubtitleCue[] {
+  const normalized = content
+    .replace(/^\uFEFF/, "")
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim();
+
+  if (!normalized) {
+    return [];
+  }
+
+  const blocks = normalized.split(/\n\s*\n/);
+  const cues: SubtitleCue[] = [];
+
+  for (const rawBlock of blocks) {
+    const lines = rawBlock
+      .split("\n")
+      .map((l) => l.trimEnd());
+
+    // Skip empty blocks, WebVTT header/metadata blocks, or NOTE/STYLE/REGION blocks without timestamps
+    const firstNonEmpty = lines.find((l) => l.trim().length > 0)?.trim() ?? "";
+    if (!firstNonEmpty) {
+      continue;
+    }
+
+    let arrowLineIdx = -1;
+    let parsedTimes: { startMs: number; endMs: number } | null = null;
+
+    for (let i = 0; i < lines.length; i++) {
+      const candidate = parseArrowTimestampLine(lines[i]);
+      if (candidate !== null) {
+        arrowLineIdx = i;
+        parsedTimes = candidate;
+        break;
+      }
+    }
+
+    if (arrowLineIdx === -1 || parsedTimes === null) {
+      continue;
+    }
+
+    if (
+      firstNonEmpty.startsWith("NOTE") &&
+      arrowLineIdx > 0 &&
+      ! /^\d+$/.test(firstNonEmpty)
+    ) {
+      continue;
+    }
+
+    const textLines = lines
+      .slice(arrowLineIdx + 1)
+      .map((l) => l.trim())
+      .filter((l, idx, arr) => l.length > 0 || (idx > 0 && idx < arr.length - 1));
+    const cueText = textLines.join("\n").trim();
+    if (!cueText) {
+      continue;
+    }
+
+    const baseCue = {
+      id: cues.length + 1,
+      startMs: parsedTimes.startMs,
+      endMs: parsedTimes.endMs,
+      sourceText: cueText,
+      translatedText: "",
+    };
+    const { cps, warnings } = calculateCueMetrics(baseCue, rules);
+    cues.push({
+      ...baseCue,
+      cps,
+      warnings,
+    });
+  }
+
+  return cues;
+}
+
+export interface FormatDocumentOptions {
+  useSource?: boolean;
+  utf8Bom?: boolean;
+}
+
+function resolveFormatOptions(
+  optionsOrUseSource?: FormatDocumentOptions | boolean,
+  utf8BomArg?: boolean,
+): { useSource: boolean; utf8Bom: boolean } {
+  if (typeof optionsOrUseSource === "boolean") {
+    return {
+      useSource: optionsOrUseSource,
+      utf8Bom: Boolean(utf8BomArg),
+    };
+  }
+  return {
+    useSource: Boolean(optionsOrUseSource?.useSource),
+    utf8Bom: Boolean(optionsOrUseSource?.utf8Bom ?? utf8BomArg),
+  };
+}
+
+function selectCueExportText(cue: SubtitleCue, useSource: boolean): string {
+  if (useSource || !cue.translatedText.trim()) {
+    return cue.sourceText.trim();
+  }
+  return cue.translatedText.trim();
+}
+
+export function formatSrtDocument(
+  cues: SubtitleCue[],
+  optionsOrUseSource?: FormatDocumentOptions | boolean,
+  utf8BomArg?: boolean,
+): string {
+  const { useSource, utf8Bom } = resolveFormatOptions(
+    optionsOrUseSource,
+    utf8BomArg,
+  );
+  const prefix = utf8Bom ? "\uFEFF" : "";
+  const blocks = cues.map((cue, idx) => {
+    const seq = idx + 1;
+    const start = formatTimestampSrt(cue.startMs);
+    const end = formatTimestampSrt(Math.max(cue.startMs, cue.endMs));
+    const text = selectCueExportText(cue, useSource);
+    return `${seq}\n${start} --> ${end}\n${text}\n`;
+  });
+  return prefix + blocks.join("\n");
+}
+
+export function formatVttDocument(
+  cues: SubtitleCue[],
+  optionsOrUseSource?: FormatDocumentOptions | boolean,
+  utf8BomArg?: boolean,
+): string {
+  const { useSource, utf8Bom } = resolveFormatOptions(
+    optionsOrUseSource,
+    utf8BomArg,
+  );
+  const prefix = (utf8Bom ? "\uFEFF" : "") + "WEBVTT\n\n";
+  const blocks = cues.map((cue, idx) => {
+    const seq = idx + 1;
+    const start = formatTimestampVtt(cue.startMs);
+    const end = formatTimestampVtt(Math.max(cue.startMs, cue.endMs));
+    const text = selectCueExportText(cue, useSource);
+    return `${seq}\n${start} --> ${end}\n${text}\n`;
+  });
+  return prefix + blocks.join("\n");
+}
+
+export function formatTxtDocument(
+  cues: SubtitleCue[],
+  optionsOrUseSource?: FormatDocumentOptions | boolean,
+  utf8BomArg?: boolean,
+): string {
+  const { useSource, utf8Bom } = resolveFormatOptions(
+    optionsOrUseSource,
+    utf8BomArg,
+  );
+  const prefix = utf8Bom ? "\uFEFF" : "";
+  const lines: string[] = [];
+  for (const cue of cues) {
+    const raw = selectCueExportText(cue, useSource);
+    const singleLine = raw.split(/\s+/).filter(Boolean).join(" ");
+    if (singleLine) {
+      lines.push(singleLine);
+    }
+  }
+  return prefix + (lines.length > 0 ? `${lines.join("\n")}\n` : "");
 }

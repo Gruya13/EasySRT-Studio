@@ -119,6 +119,15 @@ pub async fn delete_checkpoint(app: AppHandle, job_id: String) -> Result<(), Str
 // ---------------------------------------------------------------------------
 
 #[tauri::command]
+pub async fn import_subtitle_file(
+    app: AppHandle,
+    subtitle_path: String,
+    options: JobOptions,
+) -> Result<SubtitleProject, String> {
+    pipeline::import_subtitle_file(&app, subtitle_path, options).map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn transcribe_audio(
     app: AppHandle,
     state: State<'_, PipelineState>,

@@ -48,13 +48,19 @@ jobs:
             libwebkit2gtk-4.1-dev \
             libappindicator3-dev \
             librsvg2-dev \
-            patchelf
+            patchelf \
+            ffmpeg
 
       - name: Install frontend dependencies
         run: npm ci
 
       - name: Typecheck frontend
         run: npm run typecheck
+
+      - name: Run tests
+        run: |
+          npm test
+          cargo test --manifest-path src-tauri/Cargo.toml
 
       - name: Build and publish Tauri bundles
         id: tauri-build
@@ -67,7 +73,7 @@ jobs:
           tagName: v__VERSION__
           releaseName: "EasySRT Studio v__VERSION__"
           releaseBody: "See the assets below to download EasySRT Studio (Windows NSIS installer, Windows Portable ZIP, or Linux AppImage)."
-          releaseDraft: true
+          releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
           args: ${{ matrix.args }}

@@ -219,6 +219,19 @@ export function cancelJob(jobId: string): Promise<void> {
   return invoke<void>("cancel_job", { jobId });
 }
 
+export function importSubtitleFile(
+  subtitlePath: string,
+  options: JobOptions,
+): Promise<SubtitleProject> {
+  if (!isTauriRuntime()) {
+    return browserFallback.importSubtitleFile(subtitlePath, options);
+  }
+  return invoke<SubtitleProject>("import_subtitle_file", {
+    subtitlePath,
+    options,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Script Conversion & Export Commands
 // ---------------------------------------------------------------------------
