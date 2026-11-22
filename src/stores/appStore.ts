@@ -10,6 +10,7 @@ import {
 import {
   cancelJob,
   clearApiKey,
+  condenseProjectCps,
   convertCuesScript,
   deleteCheckpoint,
   deleteModel,
@@ -219,6 +220,7 @@ interface AppStoreState {
   startBatchPipeline: (mode: "full" | "transcribeOnly") => void;
   translateActiveProject: () => void;
   polishActiveProject: () => void;
+  condenseActiveProjectCps: () => void;
   cancelJobById: (jobId: string) => Promise<void>;
 
   updateCue: (
@@ -1093,63 +1095,205 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               item.phase === "completed",
           );
 
-          for (const item of runnable) {
-            const currentOptions = { ...get().jobOptions };
-            set((s) => ({
-              activeJobId: item.jobId,
-              batchQueue: s.batchQueue.map((q) =>
-                q.jobId === item.jobId
-                  ? {
-                      ...q,
-                      phase: "convertingAudio",
-                      percent: 5,
-                      errorMessage: null,
-                    }
-                  : q,
-              ),
-            }));
+          const effectiveProvider =
+            get().jobOptions.providerOverride ??
+            get().config.translation.provider;
+          const canPipelineCloud =
+            mode === "full" &&
+            runnable.length > 1 &&
+            (effectiveProvider === "deepSeek" ||
+              effectiveProvider === "customOpenAi");
 
-            try {
-              const project =
-                mode === "full"
-                  ? await runFullPipeline(
-                      item.audioPath,
-                      currentOptions,
-                      item.jobId,
-                    )
-                  : await transcribeAudio(
-                      item.audioPath,
-                      currentOptions,
-                      item.jobId,
-                    );
-              syncProjectIntoQueueAndState(project);
-            } catch (err) {
-              const msg = err instanceof Error ? err.message : String(err);
-              const recovered = await loadCheckpoint(item.jobId).catch(
-                () => null,
-              );
-              if (recovered && recovered.cues.length > 0) {
-                syncProjectIntoQueueAndState({
-                  ...recovered,
-                  phase: "failed",
-                  errorMessage: msg,
-                });
-              }
+          if (canPipelineCloud) {
+            // Pipeline GPU Whisper transcription (sequential on GPU) with
+            // async cloud LLM translation/polishing across queued files.
+            const pendingCloudTasks: Promise<void>[] = [];
+
+            for (const item of runnable) {
+              const currentOptions = { ...get().jobOptions };
               set((s) => ({
+                activeJobId: item.jobId,
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
                     ? {
                         ...q,
-                        phase: "failed",
-                        errorMessage: msg,
+                        phase: "convertingAudio",
+                        percent: 5,
+                        errorMessage: null,
                       }
                     : q,
                 ),
-                banner: {
-                  type: "error",
-                  message: `${item.audioFileName}: ${msg}`,
-                },
               }));
+
+              try {
+                const transcribed = await transcribeAudio(
+                  item.audioPath,
+                  currentOptions,
+                  item.jobId,
+                );
+                syncProjectIntoQueueAndState(transcribed);
+
+                const srcLang = (
+                  transcribed.detectedLanguage ??
+                  currentOptions.sourceLanguage
+                ).toLowerCase();
+                const dstLang = currentOptions.targetLanguage.toLowerCase();
+                const needsTranslate =
+                  dstLang !== "none" && srcLang !== dstLang;
+                const needsPolish =
+                  !needsTranslate &&
+                  (srcLang === "sr" || srcLang === "hr" || srcLang === "bs") &&
+                  currentOptions.polishSerbian;
+
+                if (needsTranslate || needsPolish) {
+                  const stagePhase = needsTranslate
+                    ? "translating"
+                    : "polishing";
+                  set((s) => ({
+                    batchQueue: s.batchQueue.map((q) =>
+                      q.jobId === item.jobId
+                        ? {
+                            ...q,
+                            phase: stagePhase,
+                            percent: 55,
+                          }
+                        : q,
+                    ),
+                  }));
+
+                  const projectForLlm: SubtitleProject = {
+                    ...transcribed,
+                    phase: stagePhase,
+                  };
+
+                  const cloudTask = (async () => {
+                    try {
+                      const finished = needsTranslate
+                        ? await translateProject(projectForLlm)
+                        : await polishProject(projectForLlm);
+                      syncProjectIntoQueueAndState(finished);
+                    } catch (err) {
+                      const msg =
+                        err instanceof Error ? err.message : String(err);
+                      const recovered = await loadCheckpoint(item.jobId).catch(
+                        () => null,
+                      );
+                      if (recovered && recovered.cues.length > 0) {
+                        syncProjectIntoQueueAndState({
+                          ...recovered,
+                          phase: "failed",
+                          errorMessage: msg,
+                        });
+                      }
+                      set((s) => ({
+                        batchQueue: s.batchQueue.map((q) =>
+                          q.jobId === item.jobId
+                            ? {
+                                ...q,
+                                phase: "failed",
+                                errorMessage: msg,
+                              }
+                            : q,
+                        ),
+                        banner: {
+                          type: "error",
+                          message: `${item.audioFileName}: ${msg}`,
+                        },
+                      }));
+                    }
+                  })();
+                  pendingCloudTasks.push(cloudTask);
+                }
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                const recovered = await loadCheckpoint(item.jobId).catch(
+                  () => null,
+                );
+                if (recovered && recovered.cues.length > 0) {
+                  syncProjectIntoQueueAndState({
+                    ...recovered,
+                    phase: "failed",
+                    errorMessage: msg,
+                  });
+                }
+                set((s) => ({
+                  batchQueue: s.batchQueue.map((q) =>
+                    q.jobId === item.jobId
+                      ? {
+                          ...q,
+                          phase: "failed",
+                          errorMessage: msg,
+                        }
+                      : q,
+                  ),
+                  banner: {
+                    type: "error",
+                    message: `${item.audioFileName}: ${msg}`,
+                  },
+                }));
+              }
+            }
+
+            await Promise.all(pendingCloudTasks);
+          } else {
+            for (const item of runnable) {
+              const currentOptions = { ...get().jobOptions };
+              set((s) => ({
+                activeJobId: item.jobId,
+                batchQueue: s.batchQueue.map((q) =>
+                  q.jobId === item.jobId
+                    ? {
+                        ...q,
+                        phase: "convertingAudio",
+                        percent: 5,
+                        errorMessage: null,
+                      }
+                    : q,
+                ),
+              }));
+
+              try {
+                const project =
+                  mode === "full"
+                    ? await runFullPipeline(
+                        item.audioPath,
+                        currentOptions,
+                        item.jobId,
+                      )
+                    : await transcribeAudio(
+                        item.audioPath,
+                        currentOptions,
+                        item.jobId,
+                      );
+                syncProjectIntoQueueAndState(project);
+              } catch (err) {
+                const msg = err instanceof Error ? err.message : String(err);
+                const recovered = await loadCheckpoint(item.jobId).catch(
+                  () => null,
+                );
+                if (recovered && recovered.cues.length > 0) {
+                  syncProjectIntoQueueAndState({
+                    ...recovered,
+                    phase: "failed",
+                    errorMessage: msg,
+                  });
+                }
+                set((s) => ({
+                  batchQueue: s.batchQueue.map((q) =>
+                    q.jobId === item.jobId
+                      ? {
+                          ...q,
+                          phase: "failed",
+                          errorMessage: msg,
+                        }
+                      : q,
+                  ),
+                  banner: {
+                    type: "error",
+                    message: `${item.audioFileName}: ${msg}`,
+                  },
+                }));
+              }
             }
           }
 
@@ -1232,6 +1376,69 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               message: msg,
             },
           });
+        }
+      });
+    },
+
+    condenseActiveProjectCps: () => {
+      const { activeProject, jobOptions, isRunningBatch } = get();
+      if (!activeProject || activeProject.cues.length === 0 || isRunningBatch) {
+        return;
+      }
+      withOnlineGuard(true, "Auto-Fit CPS", async () => {
+        pushUndoSnapshot(activeProject.cues);
+        const projectWithUpdatedOptions: SubtitleProject = {
+          ...activeProject,
+          options: {
+            ...activeProject.options,
+            ...jobOptions,
+          },
+          phase: "polishing",
+        };
+        set({ isRunningBatch: true });
+        syncProjectIntoQueueAndState(projectWithUpdatedOptions);
+        try {
+          const condensed = await condenseProjectCps(projectWithUpdatedOptions);
+          syncProjectIntoQueueAndState(condensed);
+          const checkpoints = await listCheckpoints().catch(
+            () => get().checkpoints,
+          );
+          set({
+            checkpoints,
+            banner: {
+              type: "success",
+              message:
+                get().config.uiLanguage === "en"
+                  ? "High-CPS cues automatically condensed."
+                  : "Predugi titlovi su automatski sažeti (Auto-Fit CPS).",
+            },
+          });
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          const recovered = await loadCheckpoint(activeProject.jobId).catch(
+            () => null,
+          );
+          if (recovered && recovered.cues.length > 0) {
+            syncProjectIntoQueueAndState({
+              ...recovered,
+              phase: "failed",
+              errorMessage: msg,
+            });
+          } else {
+            syncProjectIntoQueueAndState({
+              ...projectWithUpdatedOptions,
+              phase: "failed",
+              errorMessage: msg,
+            });
+          }
+          set({
+            banner: {
+              type: "error",
+              message: msg,
+            },
+          });
+        } finally {
+          set({ isRunningBatch: false });
         }
       });
     },

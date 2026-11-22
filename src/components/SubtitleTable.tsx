@@ -8,6 +8,7 @@ import {
   Replace,
   Scissors,
   Search,
+  Sparkles,
   Subtitles,
   Trash2,
   Undo2,
@@ -87,6 +88,7 @@ export function SubtitleTable() {
   const config = useAppStore((s) => s.config);
   const activeProject = useAppStore((s) => s.activeProject);
   const jobOptions = useAppStore((s) => s.jobOptions);
+  const isRunningBatch = useAppStore((s) => s.isRunningBatch);
   const activeCueId = useAppStore((s) => s.activeCueId);
   const canUndo = useAppStore((s) => s.canUndo);
   const canRedo = useAppStore((s) => s.canRedo);
@@ -99,6 +101,9 @@ export function SubtitleTable() {
   const replaceInCues = useAppStore((s) => s.replaceInCues);
   const undoCueEdit = useAppStore((s) => s.undoCueEdit);
   const redoCueEdit = useAppStore((s) => s.redoCueEdit);
+  const condenseActiveProjectCps = useAppStore(
+    (s) => s.condenseActiveProjectCps,
+  );
   const playCueSegment = useAppStore((s) => s.playCueSegment);
   const setActiveCueId = useAppStore((s) => s.setActiveCueId);
 
@@ -451,6 +456,20 @@ export function SubtitleTable() {
               </span>
             </button>
           </div>
+
+          {warningCount > 0 && (
+            <button
+              type="button"
+              data-testid="btn-condense-cps"
+              disabled={isRunningBatch}
+              onClick={condenseActiveProjectCps}
+              title={t.table.condenseCpsTitle}
+              className="inline-flex items-center gap-1.5 rounded-xl border border-amber-500/40 bg-amber-500/15 px-2.5 py-1.5 text-xs font-semibold text-amber-200 transition hover:bg-amber-500/25 disabled:cursor-not-allowed disabled:opacity-40"
+            >
+              <Sparkles className="h-3.5 w-3.5 text-amber-300" />
+              <span>{t.table.condenseCpsBtn}</span>
+            </button>
+          )}
 
           {/* Search Box (Ctrl+F) + Search & Replace Toggle (Ctrl+H) */}
           <div className="flex items-center gap-1.5">

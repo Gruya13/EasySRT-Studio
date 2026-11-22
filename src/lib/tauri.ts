@@ -197,6 +197,15 @@ export function polishProject(
   return invoke<SubtitleProject>("polish_project", { project });
 }
 
+export function condenseProjectCps(
+  project: SubtitleProject,
+): Promise<SubtitleProject> {
+  if (!isTauriRuntime()) {
+    return browserFallback.condenseProjectCps(project);
+  }
+  return invoke<SubtitleProject>("condense_project_cps", { project });
+}
+
 export function runFullPipeline(
   audioPath: string,
   options: JobOptions,

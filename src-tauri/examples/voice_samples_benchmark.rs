@@ -84,6 +84,9 @@ async fn main() -> Result<()> {
     let use_deepseek = args.iter().any(|a| a == "--provider=deepseek")
         || args.windows(2).any(|w| w == ["--provider", "deepseek"])
         || std::env::var("BENCH_PROVIDER").is_ok_and(|v| v.eq_ignore_ascii_case("deepseek"));
+    let pipelined = args.iter().any(|a| a == "--pipelined")
+        || std::env::var("BENCH_PIPELINED")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
 
     let storage_paths = StoragePaths {
         mode: StorageMode::Installed,
@@ -138,13 +141,21 @@ async fn main() -> Result<()> {
     }
 
     println!(
-        "Running EasySRT Studio benchmark (provider={}) on {} files from {}\n",
+        "Running EasySRT Studio benchmark (provider={}, pipelined={}) on {} files from {}\n",
         if use_deepseek { "deepseek" } else { "localLlama" },
+        pipelined && use_deepseek,
         mp3_files.len(),
         samples_dir.display()
     );
 
+    if pipelined && !use_deepseek {
+        println!("Note: pipelined execution is only enabled with cloud providers to avoid 4 GB VRAM contention.\n");
+    }
+
+    let wall_t0 = Instant::now();
     let mut results = Vec::new();
+    let mut pending_cloud_tasks: Vec<tokio::task::JoinHandle<Result<FileBenchmarkResult>>> =
+        Vec::new();
     let cancel_flag = Arc::new(AtomicBool::new(false));
     let glossary = BTreeMap::new();
 
@@ -242,6 +253,7 @@ async fn main() -> Result<()> {
         let op_label = match operation {
             translator::BatchOperation::Translate => "translate",
             translator::BatchOperation::PolishSerbian => "polish_sr",
+            translator::BatchOperation::CondenseCps => "condense_cps",
         }
         .to_string();
 
@@ -277,132 +289,166 @@ async fn main() -> Result<()> {
             (start_ms, ep)
         };
 
-        let infer_t0 = Instant::now();
         let checkpoint_path = checkpoints_dir.join(format!("{job_id}.easysrt.json"));
-        let cp_clone = checkpoint_path.clone();
-        translator::run_batch_operation(
-            &mut project,
-            operation,
-            &endpoint,
-            &cancel_flag,
-            move |proj| {
-                let data = serde_json::to_string_pretty(proj)?;
-                fs::write(&cp_clone, data)?;
-                Ok(())
-            },
-            |_pct, _detail| {},
-        )
-        .await?;
-        let llm_infer_ms = infer_t0.elapsed().as_millis();
-        if let Some(mut guard) = llama_guard.take() {
-            guard.stop();
-        }
-        let llama_total_ms = llama_t0.elapsed().as_millis();
+        let cancel_clone = Arc::clone(&cancel_flag);
+        let duration_ms = converted.duration_ms;
 
-        project.phase = JobPhase::Completed;
-        project.updated_at = chrono::Utc::now().to_rfc3339();
-        fs::write(&checkpoint_path, serde_json::to_string_pretty(&project)?)?;
+        let finalize_fut = async move {
+            let infer_t0 = Instant::now();
+            let cp_clone = checkpoint_path.clone();
+            translator::run_batch_operation(
+                &mut project,
+                operation,
+                &endpoint,
+                &cancel_clone,
+                move |proj| {
+                    let data = serde_json::to_string_pretty(proj)?;
+                    fs::write(&cp_clone, data)?;
+                    Ok(())
+                },
+                |_pct, _detail| {},
+            )
+            .await?;
+            let llm_infer_ms = infer_t0.elapsed().as_millis();
+            if let Some(mut guard) = llama_guard.take() {
+                guard.stop();
+            }
+            let llama_total_ms = llama_t0.elapsed().as_millis();
 
-        // 5. Export SRT files beside audio
-        let exp_t0 = Instant::now();
-        let export_res = exporter::export_project_files(
-            &project,
-            &ExportOptions {
-                output_dir: None,
-                save_beside_audio: true,
-                include_source_srt: true,
-                formats: vec![ExportFormat::Srt],
-                utf8_bom: false,
-            },
-        )?;
-        let export_ms = exp_t0.elapsed().as_millis();
-        let total_ms = total_t0.elapsed().as_millis();
+            project.phase = JobPhase::Completed;
+            project.updated_at = chrono::Utc::now().to_rfc3339();
+            fs::write(&checkpoint_path, serde_json::to_string_pretty(&project)?)?;
 
-        let rtf = if converted.duration_ms > 0 {
-            total_ms as f64 / converted.duration_ms as f64
-        } else {
-            0.0
-        };
-        let warning_cues = project
-            .cues
-            .iter()
-            .filter(|c| !c.warnings.is_empty())
-            .count();
+            // 5. Export SRT files beside audio
+            let exp_t0 = Instant::now();
+            let export_res = exporter::export_project_files(
+                &project,
+                &ExportOptions {
+                    output_dir: None,
+                    save_beside_audio: true,
+                    include_source_srt: true,
+                    formats: vec![ExportFormat::Srt],
+                    utf8_bom: false,
+                },
+            )?;
+            let export_ms = exp_t0.elapsed().as_millis();
+            let total_ms = total_t0.elapsed().as_millis();
 
-        let sample_indices: Vec<usize> = match project.cues.len() {
-            0 => vec![],
-            1 => vec![0],
-            2 => vec![0, 1],
-            n => vec![0, 1, n - 1],
-        };
-        let sample_cues = sample_indices
-            .into_iter()
-            .map(|idx| {
-                let c = &project.cues[idx];
-                SampleCueSummary {
-                    id: c.id,
-                    start_ms: c.start_ms,
-                    end_ms: c.end_ms,
-                    source_text: c.source_text.clone(),
-                    translated_text: c.translated_text.clone(),
-                    cps: c.cps,
-                    warnings: c.warnings.clone(),
-                }
+            let rtf = if duration_ms > 0 {
+                total_ms as f64 / duration_ms as f64
+            } else {
+                0.0
+            };
+            let warning_cues = project
+                .cues
+                .iter()
+                .filter(|c| !c.warnings.is_empty())
+                .count();
+
+            let sample_indices: Vec<usize> = match project.cues.len() {
+                0 => vec![],
+                1 => vec![0],
+                2 => vec![0, 1],
+                n => vec![0, 1, n - 1],
+            };
+            let sample_cues = sample_indices
+                .into_iter()
+                .map(|idx| {
+                    let c = &project.cues[idx];
+                    SampleCueSummary {
+                        id: c.id,
+                        start_ms: c.start_ms,
+                        end_ms: c.end_ms,
+                        source_text: c.source_text.clone(),
+                        translated_text: c.translated_text.clone(),
+                        cps: c.cps,
+                        warnings: c.warnings.clone(),
+                    }
+                })
+                .collect();
+
+            let warm_ms = whisper_ms + llm_infer_ms;
+            println!(
+                "[{file_name}] dur={:.1}s lang={detected_lang} op={op_label} cues={} (warn={warning_cues}) | ffmpeg={}ms whisper={}ms seg={}ms llama_start={}ms llm_infer={}ms warm={:.2}s cold_total={:.2}s (RTF={:.2}x)",
+                duration_ms as f64 / 1000.0,
+                project.cues.len(),
+                ffmpeg_ms,
+                whisper_ms,
+                segment_ms,
+                llama_start_ms,
+                llm_infer_ms,
+                warm_ms as f64 / 1000.0,
+                total_ms as f64 / 1000.0,
+                rtf
+            );
+
+            Ok::<FileBenchmarkResult, anyhow::Error>(FileBenchmarkResult {
+                file_name,
+                audio_duration_ms: duration_ms,
+                detected_language: whisper_out.detected_language,
+                operation: op_label,
+                cue_count: project.cues.len(),
+                warning_cues,
+                ffmpeg_ms,
+                whisper_ms,
+                segment_ms,
+                llama_start_ms,
+                llm_infer_ms,
+                llama_total_ms,
+                export_ms,
+                total_ms,
+                rtf,
+                sample_cues,
+                written_files: export_res.written_files,
             })
-            .collect();
+        };
 
-        let warm_ms = whisper_ms + llm_infer_ms;
-        println!(
-            "[{file_name}] dur={:.1}s lang={detected_lang} op={op_label} cues={} (warn={warning_cues}) | ffmpeg={}ms whisper={}ms seg={}ms llama_start={}ms llm_infer={}ms warm={:.2}s cold_total={:.2}s (RTF={:.2}x)",
-            converted.duration_ms as f64 / 1000.0,
-            project.cues.len(),
-            ffmpeg_ms,
-            whisper_ms,
-            segment_ms,
-            llama_start_ms,
-            llm_infer_ms,
-            warm_ms as f64 / 1000.0,
-            total_ms as f64 / 1000.0,
-            rtf
-        );
-
-        results.push(FileBenchmarkResult {
-            file_name,
-            audio_duration_ms: converted.duration_ms,
-            detected_language: whisper_out.detected_language,
-            operation: op_label,
-            cue_count: project.cues.len(),
-            warning_cues,
-            ffmpeg_ms,
-            whisper_ms,
-            segment_ms,
-            llama_start_ms,
-            llm_infer_ms,
-            llama_total_ms,
-            export_ms,
-            total_ms,
-            rtf,
-            sample_cues,
-            written_files: export_res.written_files,
-        });
+        if use_deepseek && pipelined {
+            pending_cloud_tasks.push(tokio::spawn(finalize_fut));
+        } else {
+            results.push(finalize_fut.await?);
+        }
     }
 
-    let report_path = if use_deepseek {
-        Path::new("/tmp/voice_samples_deepseek_report.json")
-    } else {
-        Path::new("/tmp/voice_samples_benchmark_report.json")
-    };
-    fs::write(report_path, serde_json::to_string_pretty(&results)?)?;
-    println!("\nSaved full JSON benchmark report to {}", report_path.display());
+    for handle in pending_cloud_tasks {
+        let res = handle.await.context("Pipelined benchmark task panicked")??;
+        results.push(res);
+    }
 
+    let wall_elapsed_ms = wall_t0.elapsed().as_millis();
     let sum_audio_ms: u64 = results.iter().map(|r| r.audio_duration_ms).sum();
+    let wall_rtf = wall_elapsed_ms as f64 / sum_audio_ms.max(1) as f64;
+
+    if use_deepseek && pipelined {
+        let report_path = Path::new("/tmp/voice_samples_deepseek_pipelined_report.json");
+        let payload = serde_json::json!({
+            "provider": "deepseek",
+            "pipelined": true,
+            "fileCount": results.len(),
+            "audioTotalMs": sum_audio_ms,
+            "wallTotalMs": wall_elapsed_ms,
+            "wallRtf": wall_rtf,
+            "files": results,
+        });
+        fs::write(report_path, serde_json::to_string_pretty(&payload)?)?;
+        println!("\nSaved full JSON benchmark report to {}", report_path.display());
+    } else {
+        let report_path = if use_deepseek {
+            Path::new("/tmp/voice_samples_deepseek_report.json")
+        } else {
+            Path::new("/tmp/voice_samples_benchmark_report.json")
+        };
+        fs::write(report_path, serde_json::to_string_pretty(&results)?)?;
+        println!("\nSaved full JSON benchmark report to {}", report_path.display());
+    }
+
     let sum_total_ms: u128 = results.iter().map(|r| r.total_ms).sum();
     let sum_whisper_ms: u128 = results.iter().map(|r| r.whisper_ms).sum();
     let sum_llm_infer_ms: u128 = results.iter().map(|r| r.llm_infer_ms).sum();
     let sum_llama_ms: u128 = results.iter().map(|r| r.llama_total_ms).sum();
     let sum_warm_ms = sum_whisper_ms + sum_llm_infer_ms;
     println!(
-        "TOTAL across {} files: audio={:.1}s | whisper={:.1}s | llm_infer={:.1}s | llama_total={:.1}s | warm_infer={:.1}s (warm RTF={:.2}x) | cold_total={:.1}s (overall RTF={:.2}x)",
+        "TOTAL across {} files: audio={:.1}s | whisper={:.1}s | llm_infer={:.1}s | llama_total={:.1}s | warm_infer={:.1}s (warm RTF={:.2}x) | sum_files={:.1}s | wall_total={:.2}s (wall RTF={:.2}x)",
         results.len(),
         sum_audio_ms as f64 / 1000.0,
         sum_whisper_ms as f64 / 1000.0,
@@ -411,7 +457,8 @@ async fn main() -> Result<()> {
         sum_warm_ms as f64 / 1000.0,
         sum_warm_ms as f64 / sum_audio_ms.max(1) as f64,
         sum_total_ms as f64 / 1000.0,
-        sum_total_ms as f64 / sum_audio_ms.max(1) as f64
+        wall_elapsed_ms as f64 / 1000.0,
+        wall_rtf
     );
 
     Ok(())

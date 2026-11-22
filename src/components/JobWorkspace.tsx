@@ -359,6 +359,93 @@ export function JobWorkspace() {
 
       {/* Job Options Bar */}
       <div className="rounded-2xl border border-slate-800/90 bg-slate-900/70 p-4 shadow-md">
+        {/* 3 Smart Workflow Presets */}
+        <div className="mb-4 border-b border-slate-800/80 pb-3.5">
+          <div className="mb-2 text-[11px] font-semibold uppercase tracking-wider text-slate-400">
+            {t.workspace.workflowPresetLabel}
+          </div>
+          <div className="grid gap-2 md:grid-cols-3">
+            <button
+              type="button"
+              data-testid="preset-hybrid-turbo"
+              onClick={() => {
+                setJobOptions({
+                  targetLanguage:
+                    jobOptions.targetLanguage === "none"
+                      ? "sr"
+                      : jobOptions.targetLanguage,
+                  polishSerbian: true,
+                });
+                void setEffectiveProvider("deepSeek");
+              }}
+              className={`rounded-xl border px-3 py-2 text-left transition ${
+                jobOptions.targetLanguage !== "none" &&
+                effectiveProvider === "deepSeek"
+                  ? "border-cyan-400/60 bg-cyan-500/15 text-cyan-100 shadow-sm"
+                  : "border-slate-800 bg-slate-950/70 text-slate-300 hover:border-slate-700 hover:text-slate-100"
+              }`}
+            >
+              <div className="text-xs font-semibold">
+                {t.workspace.presetHybridTurbo}
+              </div>
+              <div className="mt-0.5 text-[10px] leading-snug text-slate-400">
+                {t.workspace.presetHybridTurboHint}
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-testid="preset-offline-local"
+              onClick={() => {
+                setJobOptions({
+                  targetLanguage:
+                    jobOptions.targetLanguage === "none"
+                      ? "sr"
+                      : jobOptions.targetLanguage,
+                  polishSerbian: true,
+                });
+                void setEffectiveProvider("localLlama");
+              }}
+              className={`rounded-xl border px-3 py-2 text-left transition ${
+                jobOptions.targetLanguage !== "none" &&
+                effectiveProvider === "localLlama"
+                  ? "border-emerald-400/60 bg-emerald-500/15 text-emerald-100 shadow-sm"
+                  : "border-slate-800 bg-slate-950/70 text-slate-300 hover:border-slate-700 hover:text-slate-100"
+              }`}
+            >
+              <div className="text-xs font-semibold">
+                {t.workspace.presetOfflineLocal}
+              </div>
+              <div className="mt-0.5 text-[10px] leading-snug text-slate-400">
+                {t.workspace.presetOfflineLocalHint}
+              </div>
+            </button>
+
+            <button
+              type="button"
+              data-testid="preset-transcribe-only"
+              onClick={() =>
+                setJobOptions({
+                  targetLanguage: "none",
+                  polishSerbian: false,
+                })
+              }
+              className={`rounded-xl border px-3 py-2 text-left transition ${
+                jobOptions.targetLanguage === "none"
+                  ? "border-amber-400/60 bg-amber-500/15 text-amber-100 shadow-sm"
+                  : "border-slate-800 bg-slate-950/70 text-slate-300 hover:border-slate-700 hover:text-slate-100"
+              }`}
+            >
+              <div className="text-xs font-semibold">
+                {t.workspace.presetTranscribeOnly}
+              </div>
+              <div className="mt-0.5 text-[10px] leading-snug text-slate-400">
+                {t.workspace.presetTranscribeOnlyHint}
+              </div>
+            </button>
+          </div>
+        </div>
+
         <div className="grid gap-4 md:grid-cols-2 lg:grid-cols-4">
           {/* 1. Source & Target Languages */}
           <div className="space-y-2.5">

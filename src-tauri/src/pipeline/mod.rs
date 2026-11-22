@@ -193,7 +193,7 @@ async fn run_project_llm_stage(
 
     let phase = match operation {
         BatchOperation::Translate => JobPhase::Translating,
-        BatchOperation::PolishSerbian => JobPhase::Polishing,
+        BatchOperation::PolishSerbian | BatchOperation::CondenseCps => JobPhase::Polishing,
     };
 
     project.phase = phase;
@@ -210,6 +210,7 @@ async fn run_project_llm_stage(
         match operation {
             BatchOperation::Translate => "Preparing subtitle translation...",
             BatchOperation::PolishSerbian => "Preparing Serbian subtitle polishing...",
+            BatchOperation::CondenseCps => "Preparing subtitle CPS condensing...",
         },
     );
 
@@ -465,6 +466,28 @@ pub async fn polish_project(
         JobPhase::Completed,
         100.0,
         "Serbian subtitle polishing completed.",
+    );
+    Ok(project)
+}
+
+pub async fn condense_project_cps(
+    app: &AppHandle,
+    state: &PipelineState,
+    mut project: SubtitleProject,
+) -> Result<SubtitleProject> {
+    let job_id = project.job_id.clone();
+    let cancel_flag = state.register_job(&job_id).await;
+    let res =
+        run_project_llm_stage(app, &mut project, BatchOperation::CondenseCps, &cancel_flag).await;
+    state.finish_job(&job_id).await;
+    res?;
+
+    emit_job_progress(
+        app,
+        &job_id,
+        JobPhase::Completed,
+        100.0,
+        "Subtitle CPS condensing completed.",
     );
     Ok(project)
 }

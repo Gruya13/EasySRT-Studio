@@ -43,6 +43,7 @@ pub fn run() {
             commands::resegment_project,
             commands::translate_project,
             commands::polish_project,
+            commands::condense_project_cps,
             commands::run_full_pipeline,
             commands::cancel_job,
             commands::convert_cues_script,

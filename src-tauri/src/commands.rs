@@ -171,6 +171,17 @@ pub async fn polish_project(
 }
 
 #[tauri::command]
+pub async fn condense_project_cps(
+    app: AppHandle,
+    state: State<'_, PipelineState>,
+    project: SubtitleProject,
+) -> Result<SubtitleProject, String> {
+    pipeline::condense_project_cps(&app, state.inner(), project)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn run_full_pipeline(
     app: AppHandle,
     state: State<'_, PipelineState>,

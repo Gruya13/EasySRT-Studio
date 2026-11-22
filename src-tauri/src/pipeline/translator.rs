@@ -10,7 +10,7 @@
 //! normalizes Serbian script (Latin/Cyrillic), wraps balanced lines, updates CPS/warnings,
 //! and checkpoints after every batch.
 
-use crate::models::{SubtitleCue, SubtitleProject};
+use crate::models::{SegmentRules, SubtitleCue, SubtitleProject};
 use crate::pipeline::{segmenter, sr_script};
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
@@ -34,6 +34,7 @@ pub struct LlmEndpointConfig {
 pub enum BatchOperation {
     Translate,
     PolishSerbian,
+    CondenseCps,
 }
 
 #[derive(Debug, Serialize)]
@@ -72,6 +73,8 @@ struct BatchPromptPayload {
 struct PromptCueItem {
     id: u32,
     text: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_chars: Option<u32>,
 }
 
 fn normalize_cue_single_line(text: &str) -> String {
@@ -244,7 +247,7 @@ fn build_system_prompt(
                 "You are an expert subtitle translator from '{}' to '{}'. {}\n\
                  STRICT RULES:\n\
                  1. Reconstruct full sentences mentally across adjacent cues (`context_before`, `translate_cues`, `context_after`) so that phrases split across cue boundaries translate into coherent, natural grammar.\n\
-                 2. Translate ONLY the items in `translate_cues`, preserving each cue's corresponding portion of the sentence.\n\
+                 2. Translate ONLY the items in `translate_cues`, preserving each cue's corresponding portion of the sentence and staying within each item's `max_chars` reading-speed budget whenever natural.\n\
                  3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
                  4. Output ONLY a valid JSON object mapping each cue ID string to its translated text: `{{\"1\": \"...\", \"2\": \"...\"}}` with no markdown fences and no commentary.",
                 source_language, target_language, target_instructions
@@ -254,9 +257,18 @@ fn build_system_prompt(
             "You are an expert Serbian subtitle editor and proofreader.\n\
              STRICT RULES:\n\
              1. Reconstruct full sentences mentally across `context_before`, `translate_cues`, and `context_after`, and polish ONLY the items in `translate_cues`.\n\
-             2. Fix speech-to-text recognition errors, punctuation, capitalization, and normalize any Ijekavian/Croatian forms into natural Serbian Ekavian standard without changing the speaker's meaning or inventing words.\n\
+             2. Fix speech-to-text recognition errors, punctuation, capitalization, and normalize any Ijekavian/Croatian forms into natural Serbian Ekavian standard without changing the speaker's meaning or inventing words, staying within each item's `max_chars` budget when feasible.\n\
              3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
              4. Output ONLY a valid JSON object mapping each cue ID string to its polished text: `{\"1\": \"...\", \"2\": \"...\"}` with no markdown fences and no commentary."
+                .to_string()
+        }
+        BatchOperation::CondenseCps => {
+            "You are an expert subtitle editor specializing in tightening verbose subtitles to comfortable reading speed (CPS).\n\
+             STRICT RULES:\n\
+             1. Rewrite ONLY the cues in `translate_cues` using `context_before` and `context_after` for continuity so every rewritten cue fits cleanly within its `max_chars` budget (shorten by ~15-30% when needed).\n\
+             2. Preserve the core meaning, tone, speaker intent, and target language (when Serbian, strictly use natural Ekavian standard — never Ijekavian/Croatian forms) by cutting filler words and tightening phrasing without inventing facts.\n\
+             3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+             4. Output ONLY a valid JSON object mapping each cue ID string to its condensed text: `{\"1\": \"...\", \"2\": \"...\"}` with no markdown fences and no commentary."
                 .to_string()
         }
     };
@@ -273,22 +285,69 @@ fn build_system_prompt(
     prompt
 }
 
+fn cue_visible_text(cue: &SubtitleCue) -> &str {
+    if cue.translated_text.trim().is_empty() {
+        &cue.source_text
+    } else {
+        &cue.translated_text
+    }
+}
+
+fn cue_max_chars(cue: &SubtitleCue, rules: &SegmentRules) -> u32 {
+    let duration_secs = (cue.end_ms.saturating_sub(cue.start_ms) as f64) / 1000.0;
+    let cps_budget = (duration_secs * rules.max_cps).floor() as u32;
+    let layout_budget = rules.max_chars_per_line.saturating_mul(rules.max_lines).max(12);
+    cps_budget.clamp(12, layout_budget)
+}
+
+fn cue_needs_condensing(cue: &SubtitleCue, rules: &SegmentRules) -> bool {
+    let mut probe = cue.clone();
+    segmenter::compute_cue_metrics(&mut probe, rules);
+    probe.cps > rules.max_cps
+        || probe
+            .warnings
+            .iter()
+            .any(|w| w == "high_cps" || w == "line_too_long")
+}
+
+fn raw_for_op(operation: BatchOperation, c: &SubtitleCue) -> &str {
+    match operation {
+        BatchOperation::CondenseCps => cue_visible_text(c),
+        BatchOperation::Translate | BatchOperation::PolishSerbian => &c.source_text,
+    }
+}
+
 fn build_user_prompt(
+    operation: BatchOperation,
+    rules: &SegmentRules,
+    all_cues: &[SubtitleCue],
     context_before: &[SubtitleCue],
-    target_cues: &[SubtitleCue],
+    target_indices: &[usize],
     context_after: &[SubtitleCue],
 ) -> Result<String> {
-    let to_item = |c: &SubtitleCue| -> PromptCueItem {
+    let to_context_item = |c: &SubtitleCue| -> PromptCueItem {
         PromptCueItem {
             id: c.id,
-            text: normalize_cue_single_line(&c.source_text),
+            text: normalize_cue_single_line(raw_for_op(operation, c)),
+            max_chars: None,
+        }
+    };
+
+    let to_target_item = |c: &SubtitleCue| -> PromptCueItem {
+        PromptCueItem {
+            id: c.id,
+            text: normalize_cue_single_line(raw_for_op(operation, c)),
+            max_chars: Some(cue_max_chars(c, rules)),
         }
     };
 
     let payload = BatchPromptPayload {
-        context_before: context_before.iter().map(to_item).collect(),
-        translate_cues: target_cues.iter().map(to_item).collect(),
-        context_after: context_after.iter().map(to_item).collect(),
+        context_before: context_before.iter().map(to_context_item).collect(),
+        translate_cues: target_indices
+            .iter()
+            .map(|&idx| to_target_item(&all_cues[idx]))
+            .collect(),
+        context_after: context_after.iter().map(to_context_item).collect(),
     };
 
     serde_json::to_string(&payload).context("Failed to serialize batch prompt payload")
@@ -387,28 +446,42 @@ async fn call_chat_completions(
 async fn translate_slice_with_subdivision(
     client: &reqwest::Client,
     endpoint: &LlmEndpointConfig,
+    operation: BatchOperation,
+    rules: &SegmentRules,
     system_prompt: &str,
     all_cues: &[SubtitleCue],
-    slice_start: usize,
-    slice_end: usize,
+    target_indices: &[usize],
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<BTreeMap<u32, String>> {
     let mut out = BTreeMap::new();
-    let mut queue = vec![(slice_start, slice_end)];
+    if target_indices.is_empty() {
+        return Ok(out);
+    }
 
-    while let Some((start, end)) = queue.pop() {
+    let mut queue = vec![(0usize, target_indices.len())];
+
+    while let Some((q_start, q_end)) = queue.pop() {
         if cancel_flag.load(Ordering::SeqCst) {
             return Err(anyhow!("Job cancelled"));
         }
 
-        let target_cues = &all_cues[start..end];
-        let ctx_before = &all_cues[start.saturating_sub(3)..start];
-        let ctx_after = &all_cues[end..(end + 3).min(all_cues.len())];
-        let expected_ids: Vec<u32> = target_cues.iter().map(|c| c.id).collect();
-        let user_prompt = build_user_prompt(ctx_before, target_cues, ctx_after)?;
+        let slice_indices = &target_indices[q_start..q_end];
+        let first_idx = slice_indices[0];
+        let last_idx = *slice_indices.last().unwrap_or(&first_idx);
+        let ctx_before = &all_cues[first_idx.saturating_sub(3)..first_idx];
+        let ctx_after = &all_cues[(last_idx + 1)..(last_idx + 4).min(all_cues.len())];
+        let expected_ids: Vec<u32> = slice_indices.iter().map(|&idx| all_cues[idx].id).collect();
+        let user_prompt = build_user_prompt(
+            operation,
+            rules,
+            all_cues,
+            ctx_before,
+            slice_indices,
+            ctx_after,
+        )?;
         let response_format = build_response_format(endpoint, &expected_ids);
 
-        let max_attempts = if target_cues.len() == 1 { 2 } else { 1 };
+        let max_attempts = if slice_indices.len() == 1 { 2 } else { 1 };
         let mut last_err = None;
         let mut succeeded = None;
 
@@ -439,14 +512,14 @@ async fn translate_slice_with_subdivision(
 
         if let Some(batch_map) = succeeded {
             out.extend(batch_map);
-        } else if target_cues.len() > 1 {
+        } else if slice_indices.len() > 1 {
             // Subdivide failed batch into two smaller halves to guarantee 1:1 cue ID alignment
-            let mid = start + (target_cues.len() / 2);
-            queue.push((mid, end));
-            queue.push((start, mid));
+            let mid = q_start + (slice_indices.len() / 2);
+            queue.push((mid, q_end));
+            queue.push((q_start, mid));
         } else {
             return Err(last_err.unwrap_or_else(|| {
-                anyhow!("Failed to translate cue id {}", target_cues[0].id)
+                anyhow!("Failed to process cue id {}", all_cues[first_idx].id)
             }));
         }
     }
@@ -487,7 +560,14 @@ where
         .context("Failed to initialize translation HTTP client")?;
 
     let is_serbian_target = operation == BatchOperation::PolishSerbian
-        || project.options.target_language.eq_ignore_ascii_case("sr");
+        || project.options.target_language.eq_ignore_ascii_case("sr")
+        || (operation == BatchOperation::CondenseCps
+            && project.options.target_language == "none"
+            && (project
+                .detected_language
+                .as_deref()
+                .is_some_and(|l| l.eq_ignore_ascii_case("sr"))
+                || project.options.source_language.eq_ignore_ascii_case("sr")));
     let rules = segmenter::normalize_rules(&project.options.segment_rules);
 
     for batch_idx in 0..total_batches {
@@ -499,17 +579,40 @@ where
         let end = ((batch_idx + 1) * batch_size).min(project.cues.len());
 
         // Resume support: skip already completed batches from a saved checkpoint
-        let already_translated = (batch_idx as u32) < project.completed_translation_batches
-            && project.cues[start..end]
-                .iter()
-                .all(|c| !c.translated_text.trim().is_empty());
+        // (CondenseCps operates on cues that may already have completed_translation_batches set).
+        if operation != BatchOperation::CondenseCps {
+            let already_translated = (batch_idx as u32) < project.completed_translation_batches
+                && project.cues[start..end]
+                    .iter()
+                    .all(|c| !c.translated_text.trim().is_empty());
 
-        if already_translated {
+            if already_translated {
+                let pct = ((batch_idx + 1) as f64 / total_batches as f64) * 100.0;
+                on_progress(
+                    pct,
+                    format!(
+                        "Skipped completed batch {}/{} from checkpoint",
+                        batch_idx + 1,
+                        total_batches
+                    ),
+                );
+                continue;
+            }
+        }
+
+        let target_indices: Vec<usize> = match operation {
+            BatchOperation::CondenseCps => (start..end)
+                .filter(|&idx| cue_needs_condensing(&project.cues[idx], &rules))
+                .collect(),
+            BatchOperation::Translate | BatchOperation::PolishSerbian => (start..end).collect(),
+        };
+
+        if target_indices.is_empty() {
             let pct = ((batch_idx + 1) as f64 / total_batches as f64) * 100.0;
             on_progress(
                 pct,
                 format!(
-                    "Skipped completed batch {}/{} from checkpoint",
+                    "Skipped batch {}/{} (all cues within CPS limits)",
                     batch_idx + 1,
                     total_batches
                 ),
@@ -520,33 +623,43 @@ where
         let batch_results = translate_slice_with_subdivision(
             &client,
             endpoint,
+            operation,
+            &rules,
             &system_prompt,
             &project.cues,
-            start,
-            end,
+            &target_indices,
             cancel_flag,
         )
         .await?;
 
-        for cue in &mut project.cues[start..end] {
-            if let Some(translated) = batch_results.get(&cue.id) {
+        for &idx in &target_indices {
+            let cue = &mut project.cues[idx];
+            if let Some(updated_text) = batch_results.get(&cue.id) {
                 let scripted = if is_serbian_target {
-                    let ekavian = sr_script::normalize_ekavian(translated);
+                    let ekavian = sr_script::normalize_ekavian(updated_text);
                     sr_script::convert_script(&ekavian, project.options.script)
                 } else {
-                    translated.clone()
+                    updated_text.clone()
                 };
                 let wrapped = segmenter::wrap_balanced_lines(
                     &scripted,
                     rules.max_chars_per_line,
                     rules.max_lines,
                 );
-                cue.translated_text = wrapped;
+                if operation == BatchOperation::CondenseCps
+                    && cue.translated_text.trim().is_empty()
+                {
+                    cue.source_text = wrapped;
+                } else {
+                    cue.translated_text = wrapped;
+                }
                 segmenter::compute_cue_metrics(cue, &rules);
             }
         }
 
-        project.completed_translation_batches = (batch_idx + 1) as u32;
+        if operation != BatchOperation::CondenseCps {
+            project.completed_translation_batches = (batch_idx + 1) as u32;
+        }
         project.updated_at = chrono::Utc::now().to_rfc3339();
         on_checkpoint(project)?;
 
@@ -554,6 +667,7 @@ where
         let action_label = match operation {
             BatchOperation::Translate => "Translated",
             BatchOperation::PolishSerbian => "Polished",
+            BatchOperation::CondenseCps => "Condensed",
         };
         on_progress(
             pct,
@@ -607,6 +721,29 @@ where
     run_batch_operation(
         project,
         BatchOperation::PolishSerbian,
+        endpoint,
+        cancel_flag,
+        on_checkpoint,
+        on_progress,
+    )
+    .await
+}
+
+/// Condenses cues that exceed CPS or line-length limits using per-cue `max_chars` budgets.
+pub async fn condense_cps_cues<FCheckpoint, FProgress>(
+    project: &mut SubtitleProject,
+    endpoint: &LlmEndpointConfig,
+    cancel_flag: &Arc<AtomicBool>,
+    on_checkpoint: FCheckpoint,
+    on_progress: FProgress,
+) -> Result<()>
+where
+    FCheckpoint: FnMut(&SubtitleProject) -> Result<()>,
+    FProgress: FnMut(f64, String),
+{
+    run_batch_operation(
+        project,
+        BatchOperation::CondenseCps,
         endpoint,
         cancel_flag,
         on_checkpoint,
@@ -905,5 +1042,122 @@ mod tests {
         };
         let cloud_rf = build_response_format(&cloud_ep, &[1, 2]).unwrap();
         assert_eq!(cloud_rf["type"], "json_object");
+    }
+
+    #[tokio::test]
+    async fn condenses_high_cps_cues_within_budget() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let call_counter = Arc::new(AtomicUsize::new(0));
+        let counter_clone = Arc::clone(&call_counter);
+        let captured_max_chars = Arc::new(tokio::sync::Mutex::new(Vec::<(u64, u64)>::new()));
+        let captured_clone = Arc::clone(&captured_max_chars);
+
+        let server_task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let counter_clone = Arc::clone(&counter_clone);
+                let captured_clone = Arc::clone(&captured_clone);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 32768];
+                    let n = socket.read(&mut buf).await.unwrap_or(0);
+                    let raw_req = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body_part = raw_req.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let req_json: serde_json::Value =
+                        serde_json::from_str(body_part).unwrap_or_default();
+                    let user_content = req_json["messages"][1]["content"]
+                        .as_str()
+                        .unwrap_or("{}");
+                    let prompt_payload: serde_json::Value =
+                        serde_json::from_str(user_content).unwrap_or_default();
+                    let targets = prompt_payload["translate_cues"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    counter_clone.fetch_add(1, Ordering::SeqCst);
+
+                    let mut map_out = serde_json::Map::new();
+                    {
+                        let mut guard = captured_clone.lock().await;
+                        for t in &targets {
+                            let id = t["id"].as_u64().unwrap_or(1);
+                            let max_c = t["max_chars"].as_u64().unwrap_or(0);
+                            guard.push((id, max_c));
+                            map_out.insert(
+                                id.to_string(),
+                                serde_json::Value::String("Kraći tekst.".to_string()),
+                            );
+                        }
+                    }
+
+                    let resp_json = serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Object(map_out).to_string()
+                            }
+                        }]
+                    });
+                    let resp_body = serde_json::to_string(&resp_json).unwrap();
+                    let http_resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = socket.write_all(http_resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut project = sample_project(SerbianScript::Latin);
+        project.completed_translation_batches = 2;
+        // Cue 1 (0..2000ms -> budget 34 chars at 17 CPS): make it long/high-CPS
+        project.cues[0].translated_text = "Ovo je izuzetno predugačka rečenica za titl od dve sekunde.".to_string();
+        segmenter::compute_cue_metrics(&mut project.cues[0], &project.options.segment_rules);
+        // Cue 2 (1200..3000ms -> 1.8s -> 32 chars): keep it short and compliant
+        project.cues[1].translated_text = "Kratak titl.".to_string();
+        segmenter::compute_cue_metrics(&mut project.cues[1], &project.options.segment_rules);
+        // Batch 2 (cues 3 & 4): keep both short & compliant -> whole batch must be skipped!
+        project.cues[2].translated_text = "U redu.".to_string();
+        segmenter::compute_cue_metrics(&mut project.cues[2], &project.options.segment_rules);
+        project.cues[3].translated_text = "Hvala.".to_string();
+        segmenter::compute_cue_metrics(&mut project.cues[3], &project.options.segment_rules);
+
+        let endpoint = LlmEndpointConfig {
+            base_url: format!("http://127.0.0.1:{}/v1", addr.port()),
+            model: "test-model".to_string(),
+            api_key: Some("test-key".to_string()),
+            batch_size: 2,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut checkpoints = 0usize;
+
+        condense_cps_cues(
+            &mut project,
+            &endpoint,
+            &cancel,
+            |_| {
+                checkpoints += 1;
+                Ok(())
+            },
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        server_task.abort();
+
+        // Only Batch 1 should hit the HTTP server, and ONLY Cue 1 should appear in translate_cues
+        assert_eq!(call_counter.load(Ordering::SeqCst), 1);
+        assert_eq!(checkpoints, 1);
+        let sent = captured_max_chars.lock().await;
+        assert_eq!(*sent, vec![(1, 34)]);
+        assert_eq!(project.cues[0].translated_text, "Kraći tekst.");
+        assert!(project.cues[0].cps <= project.options.segment_rules.max_cps);
+        assert_eq!(project.cues[1].translated_text, "Kratak titl.");
+        assert_eq!(project.completed_translation_batches, 2);
     }
 }

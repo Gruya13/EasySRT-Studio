@@ -25,18 +25,18 @@ flowchart TD
     I --> E
     D --> E["Checkpoint Saved\n(<data_dir>/checkpoints/<job_id>.easysrt.json)"]
 
-    subgraph LLM["3. Sequential VRAM Handoff & LLM Processing (VRAM Stage 2)"]
+    subgraph LLM["3. VRAM Handoff / Cloud Pipeline & LLM Processing"]
         E --> F{"Translation / Polishing Provider"}
-        F -->|"Offline (LocalLlama)"| G["LlamaServerGuard (llama-server -ngl 99)\nEphemeral 127.0.0.1:<port>/v1"]
-        F -->|"Online (DeepSeek / CustomOpenAi)"| H["HTTPS OpenAI-Compatible API\n(api.deepseek.com/v1)"]
-        G --> J["ID-Locked Context-Window Batch Engine\n(pipeline::translator)"]
+        F -->|"Offline (LocalLlama)"| G["LlamaServerGuard (-np 1 -fitc 2048 -ctk q8_0)\nEphemeral 127.0.0.1:<port>/v1"]
+        F -->|"Online (DeepSeek / CustomOpenAi)\nCan overlap with Whisper on next queued file"| H["HTTPS OpenAI-Compatible API\n(api.deepseek.com/v1)"]
+        G --> J["ID-Locked Context-Window Batch Engine\n(Translate / PolishSerbian / CondenseCps + max_chars)"]
         H --> J
     end
 
     subgraph Post["4. Deterministic Post-Processing & Export"]
-        J -->|"LlamaServerGuard::drop kills & reaps llama-server"| K["Serbian Script Converter\n(pipeline::sr_script: Latin <-> Cyrillic)"]
+        J -->|"LlamaServerGuard::drop kills & reaps llama-server"| K["Ekavian Normalizer + Script Converter\n(pipeline::sr_script: normalize_ekavian & Latin <-> Cyrillic)"]
         K --> L["Balanced Line Wrapper & CPS / Warning Metrics"]
-        L --> M["Interactive Subtitle Studio\n(Inline Edit, Audio Segment Player, Search & Replace, Undo/Redo)"]
+        L --> M["Interactive Subtitle Studio\n(Inline Edit, Auto-Fit CPS, Audio Player, Search & Replace, Undo/Redo)"]
         M --> N["Multi-Format Exporter\n(pipeline::exporter: .SRT, .VTT, .TXT + Optional UTF-8 BOM)"]
     end
 ```
@@ -50,11 +50,11 @@ flowchart TD
 | `storage.rs` | `Portable` (`portable.flag`) vs `Installed` path resolution, atomic `config.json` and checkpoint persistence (`<job_id>.easysrt.json`), and OS Keyring + portable credential fallback. |
 | `setup_manager.rs` | Curated catalog loader (`resources/catalog.json`), resumable HTTP `Range` downloader (`.part` files), SHA-256 verification, ZIP/TAR.GZ extractor, and custom `.bin`/`.gguf` model management. |
 | `pipeline/ffmpeg.rs` | Spawns `ffmpeg -y -i <input> -vn -acodec pcm_s16le -ar 16000 -ac 1 <temp.16k.wav>` with cancellation polling and WAV header duration calculation. |
-| `pipeline/whisper.rs` | Runs `whisper-cli -ojf` with Silero VAD (`--vad -vm`) and glossary hints (`--prompt`), parses BPE subword tokens into `Vec<TimedWord>` with proportional fallback. |
-| `pipeline/segmenter.rs` | Groups `TimedWord`s into `SubtitleCue`s using punctuation, pause (`>= 350ms`), duration, and character limits (`Standard` 2×42, `Reels` 1×20, `Custom`), balanced 2-line wrapping, and CPS metrics. |
-| `pipeline/llama_server.rs` | RAII `LlamaServerGuard` binding an ephemeral localhost TCP port, polling `/health`, and guaranteeing process termination on `stop()` and `Drop`. |
-| `pipeline/translator.rs` | ID-locked sliding context-window batch translator and Serbian ASR polisher with `<think>`/fence stripping, recursive sub-batch subdivision retry, and per-batch atomic checkpointing. |
-| `pipeline/sr_script.rs` | Deterministic Serbian Cyrillic ↔ Latin converter with smart digraph casing (`Љ`/`Њ`/`Џ`) and morphological prefix-boundary exception handling. |
+| `pipeline/whisper.rs` | Runs `whisper-cli -ojf` with Silero VAD (`--vad -vm`), glossary hints (`--prompt`), physical-thread cap, and `-bs 1 -bo 1 -nf -fa` decoding; parses BPE subword tokens into `Vec<TimedWord>` with proportional fallback. |
+| `pipeline/segmenter.rs` | Groups `TimedWord`s into `SubtitleCue`s using punctuation, pause (`>= 350ms`), dangling-word penalty (`is_dangling_function_word`), duration, and character limits (`Standard` 2×42, `Reels` 1×20, `Custom`), balanced 2-line wrapping, and CPS metrics. |
+| `pipeline/llama_server.rs` | RAII `LlamaServerGuard` binding an ephemeral localhost TCP port with 4 GB VRAM auto-fit (`-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0`), automatic `-ngl 0` CPU fallback, `/health` polling, and `Drop` process reaping. |
+| `pipeline/translator.rs` | ID-locked sliding context-window batch translator, Serbian ASR polisher, and targeted CPS condenser (`BatchOperation::CondenseCps`) with per-cue `max_chars` budgets, keyed `json_schema` / `json_object` decoding, recursive subdivision retry, and per-batch atomic checkpointing. |
+| `pipeline/sr_script.rs` | Deterministic Ijekavian→Ekavian lexical/stem normalizer (`normalize_ekavian`) and Serbian Cyrillic ↔ Latin converter with smart digraph casing (`Љ`/`Њ`/`Џ`) and morphological prefix-boundary exception handling. |
 | `pipeline/importer.rs` | Parses `.srt` and `.vtt` files (UTF-8 BOM, CRLF/LF, comma/dot timestamps, WebVTT headers and cue settings) into `SubtitleProject` instances. |
 | `pipeline/exporter.rs` | Formats `.srt`, `.vtt`, and `.txt` outputs with optional UTF-8 BOM (`\u{FEFF}`) and dual source + translated `.srt` export (`includeSourceSrt`). |
 
@@ -74,8 +74,15 @@ EasySRT Studio eliminates VRAM contention through strict **Sequential Process Li
    - The segmented `SubtitleProject` (with `words` and source `cues`) is atomically saved to `<data_dir>/checkpoints/<job_id>.easysrt.json`.
 3. **Stage 2 — Translation / Serbian Polishing (`llama-server`)**:
    - Only after `whisper-cli` has exited does `pipeline::run_project_llm_stage` instantiate `LlamaServerGuard::start`.
-   - `llama-server` binds to an ephemeral `127.0.0.1:<port>` with `-ngl 99` and `-c <contextWindow>`, having the entire GPU VRAM budget exclusively to itself.
+   - `llama-server` binds to an ephemeral `127.0.0.1:<port>` with `-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0 -c <contextWindow>` (and automatically retries with `-ngl 0` CPU fallback if GPU layer fitting fails on constrained cards), having the entire GPU VRAM budget exclusively to itself.
    - The moment batch translation or polishing finishes (or if the user cancels the job or an error occurs), `LlamaServerGuard::stop()` and `Drop` explicitly `kill()` and `wait()` on the child process, immediately returning all GPU VRAM to the OS.
+
+### 2.1 Pipelined Cloud Batch Overlap & Smart Workflow Presets
+While local `llama-server` batches must serialize GPU access per stage, cloud endpoints (`DeepSeek`, `CustomOpenAI`) use virtually zero local VRAM. When running a multi-file batch (`runnable.length > 1`) in `Full` mode with a cloud provider, `appStore::startBatchPipeline` pipelines execution:
+- **`transcribeAudio` (Stage 1)** runs sequentially on the GPU across queued audio files.
+- Immediately after file `i` completes ASR + segmentation, its **cloud `translateProject` / `polishProject` call (Stage 2)** is launched asynchronously alongside GPU transcription of file `i + 1`.
+- Both stages surface in the `BatchQueuePanel` simultaneously, reducing end-to-end multi-file cloud wall time to roughly $\max(\sum T_{\text{whisper}}, T_{\text{cloud}})$.
+- In `JobWorkspace.tsx`, **3 Smart Workflow Presets** (`Hybrid Turbo: GPU + DeepSeek`, `100% Offline: Local AI`, `Transcribe Only: No LLM`) switch both `targetLanguage`/`polishSerbian` and `providerOverride` in a single click.
 
 ### Hardware Tier Matrix
 
@@ -129,18 +136,20 @@ Translating or polishing subtitles cue-by-cue lacks sentence context across cue 
 
 `pipeline::translator` implements a deterministic **ID-Locked Overlapping Context-Window Batch Protocol** shared identically across local `llama-server` (`http://127.0.0.1:<port>/v1`), **DeepSeek API** (`https://api.deepseek.com/v1`), and custom OpenAI-compatible endpoints:
 
-### 4.1 Sliding Context Window (`3 Before + N Target + 3 After`)
-For every batch `all_cues[start..end]` (default `batch_size = 12`):
+### 4.1 Sliding Context Window (`3 Before + N Target + 3 After`) & CPS Budget
+For every batch `all_cues[start..end]` (default `batch_size = 25`):
 - `context_before`: Up to **3 preceding cues** (`all_cues[start.saturating_sub(3)..start]`) provided read-only so the model sees how an ongoing sentence started.
-- `translate_cues`: The target slice `all_cues[start..end]`, each carrying its immutable 1-based `{ "id": u32, "text": "..." }`.
+- `translate_cues`: The target slice `all_cues[start..end]`, each carrying its immutable 1-based `{ "id": u32, "text": "...", "max_chars": u32 }` where `max_chars` encodes the per-cue character budget (`clamp(floor(duration_sec * max_cps), 12, max_chars_per_line * max_lines)`).
 - `context_after`: Up to **3 following cues** (`all_cues[end..(end + 3).min(len)]`) provided read-only so the model knows how a split clause continues.
 
-### 4.2 Serbian Ekavian Standard & Mandatory Glossary Enforcement
+### 4.2 Operations, Serbian Ekavian Enforcement & Constrained JSON Schema
 - **Translation (`BatchOperation::Translate`)**: When `target_language == "sr"`, the system prompt mandates idiomatic Serbian in strict **Ekavian standard** (*mleko*, *devojka*, *vreme*, *gde*, *lepo* — never Ijekavian/Croatian forms) and injects user glossary pairs (`source => target`) under `MANDATORY GLOSSARY TERMS`.
 - **Serbian ASR Polishing (`BatchOperation::PolishSerbian`)**: When the audio is already in Serbian (or `sr`/`hr`/`bs` -> `sr` with `polish_serbian: true`), the LLM proofreads speech-to-text errors, restores punctuation/capitalization, and normalizes Ijekavian/Croatian transcripts into Serbian Ekavian without altering speaker meaning or cue timestamps.
+- **Targeted CPS Condensing (`BatchOperation::CondenseCps`)**: Invoked via the **"Sažmi preduge (CPS)" / "Auto-Fit CPS"** button (`condense_project_cps`) when cues trigger `high_cps` or `line_too_long`. Batches with zero warning cues are skipped without calling the LLM, and only offending cues are sent with their exact `max_chars` budget to tighten phrasing by ~15–30%.
+- **Structured Output (`build_response_format`)**: Local `llama-server` endpoints receive a strict keyed JSON Schema (`{ "type": "json_schema", "schema": { "required": ["1", "2", ...], "additionalProperties": false } }`) which eliminates missing-ID retries and boosts throughput; cloud endpoints use `{"type": "json_object"}`.
 
 ### 4.3 `<think>` Tag & Markdown Fence Stripping
-Reasoning and instruct models occasionally wrap JSON output in `<think>...</think>` blocks or ```` ```json ... ``` ```` fences. `clean_llm_json_response()` strips all `(?is)<think>.*?</think>` spans, removes markdown fences, isolates the outermost `[...]` JSON array (or wrapped `{ "items" | "cues" | "translations" | "results": [...] }` envelope), and validates that **every expected cue `id` in `translate_cues` is present and non-empty**.
+Reasoning and instruct models occasionally wrap JSON output in `<think>...</think>` blocks or ```` ```json ... ``` ```` fences. `clean_llm_json_response()` strips all `(?is)<think>.*?</think>` spans, removes markdown fences, parses either a keyed `{"1": "...", ...}` object or legacy `[{ "id": 1, "text": "..." }]` array/envelope, and validates that **every expected cue `id` in `translate_cues` is present and non-empty**.
 
 ### 4.4 Recursive Sub-Batch Subdivision Retry
 If an LLM omits or merges a cue ID in a batch of size $K > 1$:
@@ -149,9 +158,12 @@ If an LLM omits or merges a cue ID in a batch of size $K > 1$:
 
 ### 4.5 Per-Batch Atomic Checkpointing & Resume
 After each batch succeeds:
-1. Each cue's output is passed through `sr_script::convert_script` (when target is Serbian), re-wrapped into balanced lines via `segmenter::wrap_balanced_lines`, and re-scored for CPS and warnings (`high_cps`, `line_too_long`, `duration_too_short`, `duration_too_long`).
-2. `project.completed_translation_batches` is incremented and `storage::save_checkpoint` writes `<data_dir>/checkpoints/<job_id>.easysrt.json` atomically (`write to .tmp.<pid>` + `rename`).
-3. If a job is interrupted or cancelled, resuming from the checkpoint skips all completed batches where `batch_idx < completed_translation_batches` and `translated_text` is populated.
+1. When the target is Serbian, each cue's output passes through **`sr_script::normalize_ekavian`** (deterministic Ijekavian → Ekavian exact + stem dictionary preserving case and valid prefixes like `sjedinjenje`) followed by `sr_script::convert_script` (Latin ↔ Cyrillic).
+2. Text is re-wrapped into balanced lines via `segmenter::wrap_balanced_lines`, and re-scored for CPS and warnings (`high_cps`, `line_too_long`, `duration_too_short`, `duration_too_long`).
+3. For `Translate` and `PolishSerbian`, `project.completed_translation_batches` is incremented and `storage::save_checkpoint` writes `<data_dir>/checkpoints/<job_id>.easysrt.json` atomically (`write to .tmp.<pid>` + `rename`). `CondenseCps` checkpoints updated cues without overwriting `completed_translation_batches`.
+4. If a translation/polish job is interrupted or cancelled, resuming from the checkpoint skips all completed batches where `batch_idx < completed_translation_batches` and `translated_text` is populated.
+
+> For empirical 10-file benchmark measurements (CPU vs. CUDA Whisper, Local `Gemma 3 4B` vs. `DeepSeek API` sequential and pipelined) and planned engineering milestones, see [`docs/ROADMAP.md`](ROADMAP.md).
 
 ---
 

@@ -671,6 +671,68 @@ export const browserFallback = {
     };
   },
 
+  async condenseProjectCps(project: SubtitleProject): Promise<SubtitleProject> {
+    jobListeners.forEach((fn) =>
+      fn({
+        jobId: project.jobId,
+        phase: "polishing",
+        percent: 65,
+        detail: "Condensing high-CPS subtitle cues",
+      }),
+    );
+    await new Promise((r) => setTimeout(r, 140));
+    const rules = project.options.segmentRules;
+    const condenseTextToBudget = (text: string, maxChars: number): string => {
+      const single = text.replace(/\s+/g, " ").trim();
+      if (single.length <= maxChars) return single;
+      const words = single.split(" ");
+      let out = "";
+      for (const w of words) {
+        const candidate = out ? `${out} ${w}` : w;
+        if (candidate.length > maxChars - 1 && out) break;
+        out = candidate;
+      }
+      if (!out || out.length > maxChars) {
+        return single.slice(0, Math.max(4, maxChars - 1)).trimEnd() + "…";
+      }
+      return `${out.replace(/[,;:\-]+$/, "")}.`;
+    };
+
+    const nextCues = project.cues.map((c) => {
+      const needsFix =
+        c.cps > rules.maxCps ||
+        c.warnings.includes("high_cps") ||
+        c.warnings.includes("line_too_long");
+      if (!needsFix) return c;
+      const durSec = Math.max(0.2, (c.endMs - c.startMs) / 1000);
+      const maxChars = Math.min(
+        rules.maxCharsPerLine * rules.maxLines,
+        Math.max(12, Math.floor(durSec * rules.maxCps)),
+      );
+      const hasTranslated = c.translatedText.trim().length > 0;
+      const raw = hasTranslated ? c.translatedText : c.sourceText;
+      const condensed = condenseTextToBudget(raw, maxChars);
+      return recalculateCue(
+        hasTranslated
+          ? { ...c, translatedText: condensed }
+          : { ...c, sourceText: condensed },
+        rules,
+      );
+    });
+
+    const nextProject: SubtitleProject = {
+      ...project,
+      cues: nextCues,
+      phase: "completed",
+      updatedAt: new Date().toISOString(),
+    };
+    mockCheckpoints = [
+      nextProject,
+      ...mockCheckpoints.filter((c) => c.jobId !== project.jobId),
+    ];
+    return nextProject;
+  },
+
   async runFullPipeline(
     audioPath: string,
     options: JobOptions,
