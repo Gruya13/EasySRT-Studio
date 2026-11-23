@@ -109,6 +109,76 @@ fn is_special_whisper_token(raw: &str) -> bool {
         || (trimmed.starts_with("<|") && trimmed.ends_with("|>"))
 }
 
+/// Maps a GGML Whisper model filename to its corresponding `whisper-cli -dtw` architecture preset.
+pub fn infer_dtw_model_preset(whisper_model_path: &Path) -> Option<&'static str> {
+    let name = whisper_model_path
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    if name.contains("turbo") {
+        Some("large.v3.turbo")
+    } else if name.contains("large-v3") || name.contains("large.v3") {
+        Some("large.v3")
+    } else if name.contains("large-v2") || name.contains("large.v2") {
+        Some("large.v2")
+    } else if name.contains("large") {
+        Some("large.v1")
+    } else if name.contains("medium.en") || name.contains("medium-en") {
+        Some("medium.en")
+    } else if name.contains("medium") {
+        Some("medium")
+    } else if name.contains("small.en") || name.contains("small-en") {
+        Some("small.en")
+    } else if name.contains("small") {
+        Some("small")
+    } else if name.contains("base.en") || name.contains("base-en") {
+        Some("base.en")
+    } else if name.contains("base") {
+        Some("base")
+    } else if name.contains("tiny.en") || name.contains("tiny-en") {
+        Some("tiny.en")
+    } else if name.contains("tiny") {
+        Some("tiny")
+    } else {
+        None
+    }
+}
+
+/// Parses Silero VAD speech intervals `(start_ms, end_ms)` logged to `whisper-cli` stderr.
+pub fn parse_vad_segments_from_stderr(stderr: &str) -> Vec<(u64, u64)> {
+    let mut intervals = Vec::new();
+    for line in stderr.lines() {
+        if !line.contains("VAD segment") {
+            continue;
+        }
+        let Some(start_pos) = line.find("start = ") else {
+            continue;
+        };
+        let after_start = &line[start_pos + "start = ".len()..];
+        let start_str = after_start
+            .split(|c: char| c == ',' || c.is_whitespace())
+            .next()
+            .unwrap_or("");
+        let Some(end_pos) = line.find("end = ") else {
+            continue;
+        };
+        let after_end = &line[end_pos + "end = ".len()..];
+        let end_str = after_end
+            .split(|c: char| c.is_whitespace() || c == '(' || c == ',')
+            .next()
+            .unwrap_or("");
+        if let (Ok(start_s), Ok(end_s)) = (start_str.parse::<f64>(), end_str.parse::<f64>()) {
+            let start_ms = (start_s.max(0.0) * 1000.0).round() as u64;
+            let end_ms = (end_s.max(0.0) * 1000.0).round() as u64;
+            if end_ms > start_ms {
+                intervals.push((start_ms, end_ms));
+            }
+        }
+    }
+    intervals.sort_by_key(|&(s, _)| s);
+    intervals
+}
+
 fn split_text_proportionally(
     text: &str,
     from_ms: u64,
@@ -230,15 +300,38 @@ fn align_segment_words_to_offsets(seg_words: &mut [TimedWord], seg_from: u64, se
             i = j;
         }
     }
+}
 
-    // Smooth artificial intra-segment token pauses (> 160ms) so the segmenter
-    // does not split mid-phrase on Whisper BPE timing jitter inside one VAD chunk.
-    for k in 0..seg_words.len().saturating_sub(1) {
-        let next_start = seg_words[k + 1].start_ms;
-        if next_start > seg_words[k].end_ms + 160 {
-            seg_words[k].end_ms = next_start.saturating_sub(80).max(seg_words[k].end_ms);
+struct VadTokenWord {
+    start_vad: u64,
+    end_vad: u64,
+    text: String,
+    probability: f64,
+}
+
+fn map_point_onto_vad_subs(
+    t_raw: u64,
+    seg_vad_min: u64,
+    seg_vad_max: u64,
+    subs: &[(u64, u64, u64, usize)],
+) -> (u64, usize) {
+    let total_speech: u64 = subs.iter().map(|s| s.2).sum();
+    let span = seg_vad_max.saturating_sub(seg_vad_min).max(1);
+    let clamped_rel_num = t_raw.saturating_sub(seg_vad_min).min(span);
+    let target = (clamped_rel_num as u128 * total_speech as u128) / (span as u128);
+    let mut acc: u128 = 0;
+
+    for (idx, &(s, _e, d, _vi)) in subs.iter().enumerate() {
+        let d_u128 = d as u128;
+        if acc + d_u128 >= target || idx + 1 == subs.len() {
+            let into_sub = target.saturating_sub(acc).min(d_u128) as u64;
+            return (s.saturating_add(into_sub), idx);
         }
+        acc += d_u128;
     }
+
+    let last = subs.last().copied().unwrap_or((0, 0, 0, 0));
+    (last.1, subs.len().saturating_sub(1))
 }
 
 fn is_trailing_silence_hallucination(
@@ -268,8 +361,17 @@ fn is_trailing_silence_hallucination(
     avg_prob < 0.78
 }
 
-/// Parses `whisper.cpp` `-ojf` full JSON output into `WhisperOutput` (`detected_language` + `Vec<TimedWord>`).
+/// Parses `whisper.cpp` `-ojf` full JSON output into `WhisperOutput`.
 pub fn parse_whisper_ojf_json(json_str: &str) -> Result<WhisperOutput> {
+    parse_whisper_ojf_json_with_vad(json_str, &[])
+}
+
+/// Parses `whisper.cpp` `-ojf` JSON using Silero VAD speech sub-intervals from stderr when
+/// available so stripped silence gaps are preserved piecewise and DTW timestamps stay frame-accurate.
+pub fn parse_whisper_ojf_json_with_vad(
+    json_str: &str,
+    vad_intervals: &[(u64, u64)],
+) -> Result<WhisperOutput> {
     let root: WhisperJsonRoot =
         serde_json::from_str(json_str).context("Failed to parse whisper-cli -ojf JSON output")?;
 
@@ -279,12 +381,206 @@ pub fn parse_whisper_ojf_json(json_str: &str) -> Result<WhisperOutput> {
         .map(|l| l.trim().to_string())
         .filter(|l| !l.is_empty());
 
-    let mut words = Vec::new();
+    let mut words: Vec<TimedWord> = Vec::new();
     let seg_count = root.transcription.len();
+    let use_piecewise_vad = !vad_intervals.is_empty();
+    let mut last_consumed_vad_idx: Option<usize> = None;
 
     for (seg_idx, seg) in root.transcription.iter().enumerate() {
         let raw_seg_from = seg.offsets.from.max(0) as u64;
         let raw_seg_to = seg.offsets.to.max(seg.offsets.from).max(0) as u64;
+
+        if use_piecewise_vad {
+            let mut subs: Vec<(u64, u64, u64, usize)> = Vec::new();
+            for (vi, &(vs, ve)) in vad_intervals.iter().enumerate() {
+                let s = raw_seg_from.max(vs);
+                let e = raw_seg_to.min(ve);
+                if e > s {
+                    let has_later_vad = vad_intervals[vi + 1..]
+                        .iter()
+                        .any(|&(lvs, lve)| raw_seg_to.min(lve) > raw_seg_from.max(lvs));
+                    if last_consumed_vad_idx == Some(vi)
+                        && ve.saturating_sub(raw_seg_from) <= 600
+                        && has_later_vad
+                    {
+                        if let Some(prev_word) = words.last_mut() {
+                            prev_word.end_ms = prev_word.end_ms.max(ve);
+                        }
+                        continue;
+                    }
+                    subs.push((s, e, e - s, vi));
+                }
+            }
+            if subs.is_empty() {
+                subs.push((
+                    raw_seg_from,
+                    raw_seg_to,
+                    raw_seg_to.saturating_sub(raw_seg_from).max(1),
+                    last_consumed_vad_idx.unwrap_or(0),
+                ));
+            }
+            if let Some(last_sub) = subs.last() {
+                last_consumed_vad_idx = Some(last_sub.3);
+            }
+
+            let mut tok_off_min: Option<u64> = None;
+            let mut tok_off_max: Option<u64> = None;
+            let mut raw_words: Vec<VadTokenWord> = Vec::new();
+            let mut current: Option<(u64, u64, String, f64, usize)> = None;
+
+            for tok in &seg.tokens {
+                if tok.offsets.from > 0 || tok.offsets.to > 0 {
+                    let f = tok.offsets.from.max(0) as u64;
+                    let t = tok.offsets.to.max(0) as u64;
+                    tok_off_min = Some(tok_off_min.map_or(f, |m| m.min(f)));
+                    tok_off_max = Some(tok_off_max.map_or(t, |m| m.max(t)));
+                }
+                if is_special_whisper_token(&tok.text) {
+                    continue;
+                }
+
+                let (tok_from, tok_to) = if tok.t_dtw > 0 {
+                    let dtw_ms = (tok.t_dtw as u64) * 10;
+                    (dtw_ms, dtw_ms)
+                } else {
+                    let tf = tok.offsets.from.max(0) as u64;
+                    let tt = tok.offsets.to.max(tok.offsets.from).max(0) as u64;
+                    (tf, tt)
+                };
+
+                let starts_with_space = tok
+                    .text
+                    .chars()
+                    .next()
+                    .map(|c| c.is_whitespace())
+                    .unwrap_or(false);
+                let trimmed = tok.text.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+
+                if trimmed.split_whitespace().count() > 1 {
+                    if let Some((s, e, txt, p_sum, p_cnt)) = current.take() {
+                        if !txt.is_empty() {
+                            raw_words.push(VadTokenWord {
+                                start_vad: s,
+                                end_vad: e.max(s),
+                                text: txt,
+                                probability: p_sum / (p_cnt.max(1) as f64),
+                            });
+                        }
+                    }
+                    let multi = split_text_proportionally(trimmed, tok_from, tok_to, tok.p);
+                    for mw in multi {
+                        raw_words.push(VadTokenWord {
+                            start_vad: mw.start_ms,
+                            end_vad: mw.end_ms,
+                            text: mw.text,
+                            probability: mw.probability,
+                        });
+                    }
+                    continue;
+                }
+
+                if starts_with_space {
+                    if let Some((s, e, txt, p_sum, p_cnt)) = current.take() {
+                        if !txt.is_empty() {
+                            raw_words.push(VadTokenWord {
+                                start_vad: s,
+                                end_vad: e.max(s),
+                                text: txt,
+                                probability: p_sum / (p_cnt.max(1) as f64),
+                            });
+                        }
+                    }
+                    current = Some((tok_from, tok_to, trimmed.to_string(), tok.p, 1));
+                } else if let Some((_s, ref mut e, ref mut txt, ref mut p_sum, ref mut p_cnt)) =
+                    current
+                {
+                    txt.push_str(trimmed);
+                    *e = (*e).max(tok_to);
+                    *p_sum += tok.p;
+                    *p_cnt += 1;
+                } else {
+                    current = Some((tok_from, tok_to, trimmed.to_string(), tok.p, 1));
+                }
+            }
+
+            if let Some((s, e, txt, p_sum, p_cnt)) = current.take() {
+                if !txt.is_empty() {
+                    raw_words.push(VadTokenWord {
+                        start_vad: s,
+                        end_vad: e.max(s),
+                        text: txt,
+                        probability: p_sum / (p_cnt.max(1) as f64),
+                    });
+                }
+            }
+
+            let mut seg_words: Vec<TimedWord> = Vec::new();
+            if raw_words.is_empty() {
+                if !seg.text.trim().is_empty() {
+                    let sub_start = subs.first().map(|s| s.0).unwrap_or(raw_seg_from);
+                    let sub_end = subs.last().map(|s| s.1).unwrap_or(raw_seg_to);
+                    seg_words =
+                        split_text_proportionally(seg.text.trim(), sub_start, sub_end, 1.0);
+                }
+            } else {
+                let eff_vad_min =
+                    tok_off_min.unwrap_or_else(|| raw_words[0].start_vad.saturating_sub(80));
+                let eff_vad_max = tok_off_max
+                    .unwrap_or(raw_words.last().map_or(eff_vad_min + 1, |w| w.end_vad))
+                    .max(eff_vad_min + 1);
+
+                let mut prev_end_vad = eff_vad_min;
+                for (i, rw) in raw_words.iter().enumerate() {
+                    let p_end = rw.end_vad.max(prev_end_vad);
+                    let est_dur = ((rw.text.chars().count() as u64) * 45).clamp(90, 350);
+                    let p_start = if i > 0 {
+                        prev_end_vad
+                    } else {
+                        p_end.saturating_sub(est_dur)
+                    }
+                    .max(eff_vad_min);
+                    prev_end_vad = p_end;
+
+                    let (mut ms0, idx0) =
+                        map_point_onto_vad_subs(p_start, eff_vad_min, eff_vad_max, &subs);
+                    let (mut ms1, idx1) =
+                        map_point_onto_vad_subs(p_end, eff_vad_min, eff_vad_max, &subs);
+                    if idx1 > idx0 || i == 0 {
+                        ms0 = subs[idx1].0;
+                    }
+                    if let Some(prev) = seg_words.last() {
+                        ms0 = ms0.max(prev.end_ms);
+                    }
+                    if ms1 <= ms0 {
+                        ms1 = subs[idx1].1.min(ms0.saturating_add(60)).max(ms0);
+                    }
+                    seg_words.push(TimedWord {
+                        start_ms: ms0,
+                        end_ms: ms1,
+                        text: rw.text.clone(),
+                        probability: rw.probability,
+                    });
+                }
+            }
+
+            if is_trailing_silence_hallucination(
+                seg_idx,
+                seg_count,
+                raw_seg_from,
+                raw_seg_to,
+                &seg.text,
+                &seg_words,
+            ) {
+                continue;
+            }
+
+            words.extend(seg_words);
+            continue;
+        }
+
         let prev_seg_to = seg_idx
             .checked_sub(1)
             .map(|idx| root.transcription[idx].offsets.to.max(0) as u64);
@@ -601,11 +897,15 @@ where
         .arg("-bs")
         .arg("1")
         .arg("-bo")
-        .arg("1")
-        .arg("-fa")
-        .arg("-ojf")
-        .arg("-of")
-        .arg(&output_prefix);
+        .arg("1");
+
+    if let Some(dtw_preset) = infer_dtw_model_preset(whisper_model_path) {
+        cmd.arg("-nfa").arg("-dtw").arg(dtw_preset);
+    } else {
+        cmd.arg("-fa");
+    }
+
+    cmd.arg("-ojf").arg("-of").arg(&output_prefix);
 
     if let Some(vp) = vad_model_path {
         if vp.exists() {
@@ -686,7 +986,8 @@ where
     let _ = fs::remove_file(&expected_json_path);
 
     on_progress(90.0, "Parsing Whisper word timestamps...".to_string());
-    parse_whisper_ojf_json(&raw_json).map_err(WhisperExecError::Other)
+    let vad_intervals = parse_vad_segments_from_stderr(&stderr_buf);
+    parse_whisper_ojf_json_with_vad(&raw_json, &vad_intervals).map_err(WhisperExecError::Other)
 }
 
 /// Runs `whisper-cli` on a 16 kHz mono WAV file and parses the resulting `-ojf` JSON output.
@@ -1004,6 +1305,88 @@ mod tests {
             "expected >= 200ms gap between touching VAD segments, got {boundary_gap}"
         );
         assert_eq!(out.words[4].end_ms, 12730);
+    }
+
+    #[test]
+    fn infers_dtw_model_presets_and_parses_vad_stderr() {
+        assert_eq!(
+            infer_dtw_model_preset(Path::new("/models/ggml-large-v3-turbo-q5_0.bin")),
+            Some("large.v3.turbo")
+        );
+        assert_eq!(
+            infer_dtw_model_preset(Path::new("/models/ggml-medium.en.bin")),
+            Some("medium.en")
+        );
+        assert_eq!(infer_dtw_model_preset(Path::new("/models/custom.bin")), None);
+
+        let stderr = r#"
+whisper_vad_segments_from_probs: VAD segment 0: start = 0.51, end = 1.89 (duration: 1.38)
+whisper_vad_segments_from_probs: VAD segment 1: start = 2.79, end = 6.94 (duration: 4.15)
+"#;
+        let intervals = parse_vad_segments_from_stderr(stderr);
+        assert_eq!(intervals, vec![(510, 1890), (2790, 6940)]);
+    }
+
+    #[test]
+    fn maps_dtw_tokens_piecewise_across_multi_vad_intervals_and_skips_noise_intro() {
+        // Case A: segment spanning two VAD speech intervals separated by a 900ms silence
+        let vad_speech = vec![(510, 1890), (2790, 3400)];
+        let payload = r#"{
+            "result": { "language": "en" },
+            "transcription": [
+                {
+                    "offsets": { "from": 510, "to": 3400 },
+                    "text": " My fellow citizens, I have requested",
+                    "tokens": [
+                        { "text": "[_BEG_]", "offsets": { "from": 0, "to": 0 }, "t_dtw": -1, "p": 0.99 },
+                        { "text": " My", "offsets": { "from": 80, "to": 100 }, "t_dtw": 18, "p": 0.96 },
+                        { "text": " fellow", "offsets": { "from": 100, "to": 420 }, "t_dtw": 46, "p": 0.97 },
+                        { "text": " citizens", "offsets": { "from": 420, "to": 820 }, "t_dtw": 94, "p": 0.98 },
+                        { "text": ",", "offsets": { "from": 820, "to": 960 }, "t_dtw": 144, "p": 0.99 },
+                        { "text": " I", "offsets": { "from": 960, "to": 1000 }, "t_dtw": 174, "p": 0.96 },
+                        { "text": " have", "offsets": { "from": 1030, "to": 1300 }, "t_dtw": 198, "p": 0.97 },
+                        { "text": " requested", "offsets": { "from": 1610, "to": 2070 }, "t_dtw": 244, "p": 0.97 }
+                    ]
+                }
+            ]
+        }"#;
+
+        let out = parse_whisper_ojf_json_with_vad(payload, &vad_speech).unwrap();
+        assert_eq!(out.words.len(), 6);
+        assert_eq!(out.words[0].text, "My");
+        assert_eq!(out.words[0].start_ms, 510);
+        assert_eq!(out.words[2].text, "citizens,");
+        assert_eq!(out.words[3].text, "I");
+        let silence_gap = out.words[3].start_ms.saturating_sub(out.words[2].end_ms);
+        assert!(
+            silence_gap >= 900,
+            "expected >= 900ms silence preserved between VAD 0 (1890ms) and VAD 1 (2790ms), got {silence_gap}"
+        );
+        assert!(out.words[3].start_ms >= 2790);
+
+        // Case B: opening non-speech static VAD burst [1120..1820] followed by real speech [5380..9890]
+        let vad_with_static = vec![(1120, 1820), (5380, 9890)];
+        let payload_static = r#"{
+            "result": { "language": "en" },
+            "transcription": [
+                {
+                    "offsets": { "from": 1120, "to": 9890 },
+                    "text": " This chase after",
+                    "tokens": [
+                        { "text": " This", "offsets": { "from": 0, "to": 420 }, "t_dtw": 110, "p": 0.95 },
+                        { "text": " chase", "offsets": { "from": 420, "to": 940 }, "t_dtw": 154, "p": 0.96 },
+                        { "text": " after", "offsets": { "from": 940, "to": 1460 }, "t_dtw": 192, "p": 0.97 }
+                    ]
+                }
+            ]
+        }"#;
+        let out_static = parse_whisper_ojf_json_with_vad(payload_static, &vad_with_static).unwrap();
+        assert_eq!(out_static.words.len(), 3);
+        assert!(
+            out_static.words[0].start_ms >= 5380,
+            "expected 'This' to snap to real speech start 5380ms rather than 1120ms static burst, got {}",
+            out_static.words[0].start_ms
+        );
     }
 
     #[cfg(unix)]

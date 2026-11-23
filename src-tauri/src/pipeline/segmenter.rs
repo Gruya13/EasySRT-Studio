@@ -252,6 +252,57 @@ fn slice_char_len(words: &[TimedWord]) -> usize {
     len
 }
 
+/// Returns `true` for relative pronouns, subordinating conjunctions, and prepositions
+/// that naturally continue a clause after a brief speaker breath pause.
+fn is_continuation_starter(word: &str) -> bool {
+    let clean = word
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    matches!(
+        clean.as_str(),
+        "which"
+            | "that"
+            | "who"
+            | "whom"
+            | "whose"
+            | "where"
+            | "when"
+            | "while"
+            | "because"
+            | "although"
+            | "since"
+            | "until"
+            | "unless"
+            | "of"
+            | "to"
+            | "for"
+            | "with"
+            | "by"
+            | "from"
+            | "into"
+            | "onto"
+            | "upon"
+            | "without"
+            | "within"
+            | "between"
+            | "through"
+            | "koji"
+            | "koja"
+            | "koje"
+            | "kojeg"
+            | "kojem"
+            | "kojim"
+            | "čiji"
+            | "čija"
+            | "čije"
+            | "što"
+            | "jer"
+            | "gdje"
+            | "gde"
+            | "kako"
+    )
+}
+
 fn distance_to_next_natural_break(words: &[TimedWord], from_idx: usize, max_chars: usize) -> usize {
     let mut len = 0usize;
     for idx in from_idx..words.len() {
@@ -338,7 +389,9 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
                 let candidate_duration = cleaned_words[i].end_ms.saturating_sub(cue_start_ms);
 
                 if ends_with_clause_punct(&cleaned_words[i].text)
-                    && ((char_len >= 22 && candidate_duration >= 1100 && gap >= INTER_SEGMENT_PAUSE_MS)
+                    && ((char_len >= 14
+                        && candidate_duration >= 900
+                        && gap >= INTER_SEGMENT_PAUSE_MS)
                         || gap >= 380)
                 {
                     last_fit_idx = i;
@@ -349,54 +402,105 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
                 if !is_dangling_function_word(&cleaned_words[i].text)
                     && gap >= INTER_SEGMENT_PAUSE_MS
                 {
-                    let next_chunk_len =
-                        distance_to_next_natural_break(&cleaned_words, i + 1, max_total_chars);
-                    let would_overflow_next = char_len + 1 + next_chunk_len > max_total_chars;
-                    if (char_len >= 26 && candidate_duration >= 1200)
-                        || gap >= HARD_PAUSE_MS
-                        || would_overflow_next
-                    {
-                        last_fit_idx = i;
-                        hit_hard_limit = false;
-                        break;
+                    let next_is_closing_word = (ends_with_clause_punct(&next_word.text)
+                        || ends_with_sentence_punct(&next_word.text))
+                        && (char_len + 1 + next_word.text.chars().count()) <= max_total_chars
+                        && next_word.end_ms.saturating_sub(cue_start_ms) <= rules.max_duration_ms;
+
+                    if !next_is_closing_word {
+                        let next_chunk_len =
+                            distance_to_next_natural_break(&cleaned_words, i + 1, max_total_chars);
+                        let would_overflow_next =
+                            char_len + 1 + next_chunk_len > max_total_chars;
+                        let words_in_cue = i - start_idx + 1;
+                        let single_short = words_in_cue == 1 && char_len < 8;
+                        let next_is_cont = is_continuation_starter(&next_word.text);
+
+                        if would_overflow_next
+                            || (!single_short
+                                && !(next_is_cont && gap < 1100)
+                                && ((char_len >= 26 && candidate_duration >= 1200)
+                                    || gap >= HARD_PAUSE_MS))
+                        {
+                            last_fit_idx = i;
+                            hit_hard_limit = false;
+                            break;
+                        }
                     }
                 }
             }
         }
 
         // If we stopped because adding the next word would exceed max chars or max duration,
-        // look back within start_idx..=last_fit_idx for a natural clause boundary or pause
-        // while keeping a minimum readable prefix length.
+        // look back within start_idx..=last_fit_idx for a balanced prepositional/clause break
+        // so we don't strand a 1-2 word tail like "of an accident." on the next cue.
         let mut end_idx = last_fit_idx;
         if hit_hard_limit && last_fit_idx > start_idx {
-            let min_prefix_chars = if max_total_chars >= 36 {
-                (max_total_chars / 3).max(18)
+            let rem = distance_to_next_natural_break(
+                &cleaned_words,
+                last_fit_idx + 1,
+                max_total_chars,
+            );
+            let balanced_mid_split = if rem < 24 && max_total_chars >= 36 {
+                let target_half = (char_len + rem) / 2;
+                let mut best_idx: Option<usize> = None;
+                let mut best_score = isize::MAX;
+                for idx in start_idx..last_fit_idx {
+                    if is_dangling_function_word(&cleaned_words[idx].text) {
+                        continue;
+                    }
+                    let prefix_len = slice_char_len(&cleaned_words[start_idx..=idx]);
+                    if prefix_len < 24 {
+                        continue;
+                    }
+                    let bonus = if is_continuation_starter(&cleaned_words[idx + 1].text) {
+                        10
+                    } else {
+                        0
+                    };
+                    let score = (prefix_len as isize - target_half as isize).abs() - bonus;
+                    if score < best_score {
+                        best_score = score;
+                        best_idx = Some(idx);
+                    }
+                }
+                best_idx
             } else {
-                (max_total_chars / 3).max(1)
+                None
             };
 
-            if let Some(clause_idx) = (start_idx..=last_fit_idx).rev().find(|&idx| {
-                ends_with_clause_punct(&cleaned_words[idx].text)
-                    && !is_dangling_function_word(&cleaned_words[idx].text)
-                    && slice_char_len(&cleaned_words[start_idx..=idx]) >= min_prefix_chars
-            }) {
-                end_idx = clause_idx;
-            } else if let Some(pause_idx) = (start_idx..last_fit_idx).rev().find(|&idx| {
-                cleaned_words[idx + 1]
-                    .start_ms
-                    .saturating_sub(cleaned_words[idx].end_ms)
-                    >= SOFT_PAUSE_THRESHOLD_MS
-                    && !is_dangling_function_word(&cleaned_words[idx].text)
-                    && slice_char_len(&cleaned_words[start_idx..=idx]) >= min_prefix_chars
-            }) {
-                end_idx = pause_idx;
-            } else if is_dangling_function_word(&cleaned_words[last_fit_idx].text) {
-                if let Some(non_dangling) = (start_idx..last_fit_idx)
-                    .rev()
-                    .take(4)
-                    .find(|&idx| !is_dangling_function_word(&cleaned_words[idx].text))
-                {
-                    end_idx = non_dangling;
+            if let Some(mid_idx) = balanced_mid_split {
+                end_idx = mid_idx;
+            } else {
+                let min_prefix_chars = if max_total_chars >= 36 {
+                    (max_total_chars / 3).max(18)
+                } else {
+                    (max_total_chars / 3).max(1)
+                };
+
+                if let Some(clause_idx) = (start_idx..=last_fit_idx).rev().find(|&idx| {
+                    ends_with_clause_punct(&cleaned_words[idx].text)
+                        && !is_dangling_function_word(&cleaned_words[idx].text)
+                        && slice_char_len(&cleaned_words[start_idx..=idx]) >= min_prefix_chars
+                }) {
+                    end_idx = clause_idx;
+                } else if let Some(pause_idx) = (start_idx..last_fit_idx).rev().find(|&idx| {
+                    cleaned_words[idx + 1]
+                        .start_ms
+                        .saturating_sub(cleaned_words[idx].end_ms)
+                        >= SOFT_PAUSE_THRESHOLD_MS
+                        && !is_dangling_function_word(&cleaned_words[idx].text)
+                        && slice_char_len(&cleaned_words[start_idx..=idx]) >= min_prefix_chars
+                }) {
+                    end_idx = pause_idx;
+                } else if is_dangling_function_word(&cleaned_words[last_fit_idx].text) {
+                    if let Some(non_dangling) = (start_idx..last_fit_idx)
+                        .rev()
+                        .take(4)
+                        .find(|&idx| !is_dangling_function_word(&cleaned_words[idx].text))
+                    {
+                        end_idx = non_dangling;
+                    }
                 }
             }
         }
@@ -413,11 +517,16 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
         let start_ms = cleaned_words[start_idx].start_ms;
         let mut end_ms = cleaned_words[end_idx].end_ms;
 
-        // Enforce min_duration_ms where possible without overlapping the next word
+        // Enforce min_duration_ms where possible without erasing natural pause gaps
         let desired_min_end = start_ms.saturating_add(rules.min_duration_ms);
         if end_ms < desired_min_end {
             if let Some(next_word) = cleaned_words.get(end_idx + 1) {
-                end_ms = desired_min_end.min(next_word.start_ms).max(end_ms);
+                let safe_cap = if next_word.start_ms > end_ms + 120 {
+                    next_word.start_ms.saturating_sub(80)
+                } else {
+                    next_word.start_ms
+                };
+                end_ms = desired_min_end.min(safe_cap).max(end_ms);
             } else {
                 end_ms = desired_min_end;
             }
