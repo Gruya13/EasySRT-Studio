@@ -146,26 +146,31 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev cmake build-essential
-          if apt-cache show glslc >/dev/null 2>&1; then
-            sudo apt-get install -y glslc
-          else
-            # Ubuntu 22.04 lacks the glslc apt package; install glslc from the official LunarG SDK tarball
-            curl -fsSL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz
-            mkdir -p /tmp/vulkan-sdk
-            tar -xf /tmp/vulkan-sdk.tar.xz -C /tmp/vulkan-sdk --strip-components=1
-            GLSLC_DIR="$(dirname "$(find /tmp/vulkan-sdk -type f -name glslc | head -n 1)")"
-            export PATH="$GLSLC_DIR:$PATH"
-          fi
 
-          GLSLC_BIN="$(command -v glslc)"
+          # Ubuntu 22.04 ships outdated Vulkan headers and lacks glslc; use the official LunarG Vulkan SDK
+          curl -fsSL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz
+          rm -rf /tmp/vulkan-sdk
+          mkdir -p /tmp/vulkan-sdk
+          tar -xf /tmp/vulkan-sdk.tar.xz -C /tmp/vulkan-sdk --strip-components=1
+
+          GLSLC_BIN="$(find /tmp/vulkan-sdk -type f -name glslc | head -n 1)"
           test -n "$GLSLC_BIN"
+          export PATH="$(dirname "$GLSLC_BIN"):$PATH"
+
+          VULKAN_HEADER="$(find /tmp/vulkan-sdk -path '*/include/vulkan/vulkan.h' | head -n 1)"
+          test -n "$VULKAN_HEADER"
+          VULKAN_INCLUDE_DIR="$(dirname "$(dirname "$VULKAN_HEADER")")"
+          VULKAN_SDK_PREFIX="$(dirname "$VULKAN_INCLUDE_DIR")"
+          export VULKAN_SDK="$VULKAN_SDK_PREFIX"
 
           rm -rf /tmp/whisper-cpp-src /tmp/whisper-cpp-build whisper-bin-ubuntu-vulkan-x64
           git clone --depth 1 --branch b5907 https://github.com/ggml-org/whisper.cpp.git /tmp/whisper-cpp-src
           cmake -S /tmp/whisper-cpp-src -B /tmp/whisper-cpp-build \
             -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_PREFIX_PATH="$VULKAN_SDK_PREFIX" \
             -DBUILD_SHARED_LIBS=OFF \
             -DGGML_VULKAN=ON \
+            -DVulkan_INCLUDE_DIR="$VULKAN_INCLUDE_DIR" \
             -DVulkan_GLSLC_EXECUTABLE="$GLSLC_BIN" \
             -DWHISPER_BUILD_TESTS=OFF \
             -DWHISPER_BUILD_EXAMPLES=ON
