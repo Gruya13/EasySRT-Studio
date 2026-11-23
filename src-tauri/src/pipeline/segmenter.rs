@@ -5,6 +5,11 @@ use crate::models::{SegmentPreset, SegmentRules, SubtitleCue, TimedWord};
 const INTER_SEGMENT_PAUSE_MS: u64 = 200;
 const HARD_PAUSE_MS: u64 = 500;
 const SOFT_PAUSE_THRESHOLD_MS: u64 = 150;
+const SHORT_SILENCE_BRIDGE_MS: u64 = 500;
+const SHORT_SILENCE_BRIDGE_REELS_MS: u64 = 350;
+const POST_SPEECH_HOLD_MS: u64 = 350;
+const POST_SPEECH_HOLD_REELS_MS: u64 = 250;
+const MIN_PAUSE_CLEAR_GAP_MS: u64 = 200;
 
 /// Returns preset rules for `Standard` (2x42) or `Reels` (1x20), or preserves custom values.
 pub fn normalize_rules(rules: &SegmentRules) -> SegmentRules {
@@ -515,22 +520,38 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
             wrap_balanced_lines(&raw_text, rules.max_chars_per_line, rules.max_lines);
 
         let start_ms = cleaned_words[start_idx].start_ms;
-        let mut end_ms = cleaned_words[end_idx].end_ms;
-
-        // Enforce min_duration_ms where possible without erasing natural pause gaps
+        let speech_end_ms = cleaned_words[end_idx].end_ms;
+        let max_allowed_end = start_ms
+            .saturating_add(rules.max_duration_ms)
+            .max(speech_end_ms);
         let desired_min_end = start_ms.saturating_add(rules.min_duration_ms);
-        if end_ms < desired_min_end {
-            if let Some(next_word) = cleaned_words.get(end_idx + 1) {
-                let safe_cap = if next_word.start_ms > end_ms + 120 {
-                    next_word.start_ms.saturating_sub(80)
-                } else {
-                    next_word.start_ms
-                };
-                end_ms = desired_min_end.min(safe_cap).max(end_ms);
-            } else {
-                end_ms = desired_min_end;
+        let (bridge_threshold_ms, hold_ms) = match rules.preset {
+            SegmentPreset::Reels => (SHORT_SILENCE_BRIDGE_REELS_MS, POST_SPEECH_HOLD_REELS_MS),
+            SegmentPreset::Standard | SegmentPreset::Custom => {
+                (SHORT_SILENCE_BRIDGE_MS, POST_SPEECH_HOLD_MS)
             }
-        }
+        };
+        let desired_comfort_end = speech_end_ms
+            .saturating_add(hold_ms)
+            .max(desired_min_end)
+            .min(max_allowed_end);
+
+        let end_ms = if let Some(next_word) = cleaned_words.get(end_idx + 1) {
+            let silence_gap_ms = next_word.start_ms.saturating_sub(speech_end_ms);
+            if silence_gap_ms <= bridge_threshold_ms {
+                // Short silence: bridge the end of this cue directly to the start of the next cue
+                next_word.start_ms.min(max_allowed_end).max(speech_end_ms)
+            } else {
+                // Longer pause: extend by post-speech comfort hold / min_duration, then leave a clear blank gap before the next cue
+                let safe_cap = next_word
+                    .start_ms
+                    .saturating_sub(MIN_PAUSE_CLEAR_GAP_MS)
+                    .max(speech_end_ms);
+                desired_comfort_end.min(safe_cap).max(speech_end_ms)
+            }
+        } else {
+            desired_comfort_end
+        };
 
         let mut cue = SubtitleCue {
             id: (cues.len() + 1) as u32,
@@ -685,7 +706,8 @@ mod tests {
         assert_eq!(cues[1].id, 2);
         assert_eq!(cues[1].source_text, "Kako ste danas?");
         assert_eq!(cues[1].start_ms, 1200);
-        assert_eq!(cues[1].end_ms, 2200);
+        // Final cue gets 350ms post-speech hold (2200 + 350 = 2550)
+        assert_eq!(cues[1].end_ms, 2550);
     }
 
     #[test]
@@ -819,5 +841,30 @@ mod tests {
                 cue.source_text
             );
         }
+    }
+
+    #[test]
+    fn bridges_short_silence_and_adds_comfort_hold_before_longer_pause() {
+        let words = vec![
+            // Cue 1: 0..1400ms, followed by 320ms silence (<= 500ms -> should bridge to 1720ms)
+            word(0, 700, "Prva"),
+            word(700, 1400, "rečenica."),
+            // Cue 2: 1720..3200ms, followed by 1100ms pause (> 500ms -> should hold +350ms to 3550ms)
+            word(1720, 2400, "Druga"),
+            word(2400, 3200, "rečenica."),
+            // Cue 3: 4300..5600ms (final cue -> should hold +350ms to 5950ms)
+            word(4300, 4900, "Treća"),
+            word(4900, 5600, "rečenica."),
+        ];
+        let rules = SegmentRules::default();
+        let cues = segment_words(&words, &rules);
+
+        assert_eq!(cues.len(), 3);
+        assert_eq!(cues[0].start_ms, 0);
+        assert_eq!(cues[0].end_ms, 1720);
+        assert_eq!(cues[1].start_ms, 1720);
+        assert_eq!(cues[1].end_ms, 3550);
+        assert_eq!(cues[2].start_ms, 4300);
+        assert_eq!(cues[2].end_ms, 5950);
     }
 }

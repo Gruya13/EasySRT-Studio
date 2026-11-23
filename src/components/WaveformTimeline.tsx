@@ -74,6 +74,8 @@ function findCueForTime(
   allowNearestPreceding: boolean,
 ): SubtitleCue | null {
   if (cueList.length === 0) return null;
+  const activeHalfOpen = cueList.find((c) => ms >= c.startMs && ms < c.endMs);
+  if (activeHalfOpen) return activeHalfOpen;
   const exact = cueList.find((c) => ms >= c.startMs && ms <= c.endMs);
   if (exact) return exact;
   if (!allowNearestPreceding) return null;
