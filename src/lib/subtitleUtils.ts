@@ -791,3 +791,21 @@ export function resolveInitialBatchActiveJobId(
   }
   return currentActiveJobId;
 }
+
+/** Compares two semantic version strings (with optional leading "v"). Returns 1 if a > b, -1 if a < b, 0 if equal. */
+export function compareSemver(a: string, b: string): number {
+  const parse = (raw: string): [number, number, number] => {
+    const cleaned = raw.trim().replace(/^v/i, "").split("-")[0] ?? "";
+    const parts = cleaned.split(".").map((n) => {
+      const parsed = Number.parseInt(n, 10);
+      return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+    });
+    return [parts[0] ?? 0, parts[1] ?? 0, parts[2] ?? 0];
+  };
+  const [aMaj, aMin, aPatch] = parse(a);
+  const [bMaj, bMin, bPatch] = parse(b);
+  if (aMaj !== bMaj) return aMaj > bMaj ? 1 : -1;
+  if (aMin !== bMin) return aMin > bMin ? 1 : -1;
+  if (aPatch !== bPatch) return aPatch > bPatch ? 1 : -1;
+  return 0;
+}

@@ -10,10 +10,15 @@ export function TopBar() {
   const setupStatus = useAppStore((s) => s.setupStatus);
   const activeProject = useAppStore((s) => s.activeProject);
   const banner = useAppStore((s) => s.banner);
+  const appVersion = useAppStore((s) => s.appVersion);
+  const availableUpdateVersion = useAppStore(
+    (s) => s.availableUpdateVersion,
+  );
 
   const setBanner = useAppStore((s) => s.setBanner);
   const setSetupOpen = useAppStore((s) => s.setSetupOpen);
   const setExportOpen = useAppStore((s) => s.setExportOpen);
+  const setUpdaterOpen = useAppStore((s) => s.setUpdaterOpen);
 
   const [maximized, setMaximized] = useState(false);
 
@@ -123,7 +128,25 @@ export function TopBar() {
 
       <div className="titlebar-center">
         <span className="app-name">EasySRT Studio</span>
-        <span className="app-version">v0.1.1</span>
+        <button
+          type="button"
+          className="app-version"
+          onClick={() => setUpdaterOpen(true)}
+          title={
+            availableUpdateVersion
+              ? lang === "en"
+                ? `Update available: v${availableUpdateVersion} (click to install from GitHub)`
+                : `Dostupno ažuriranje: v${availableUpdateVersion} (klikni za instalaciju sa GitHub-a)`
+              : lang === "en"
+                ? "Check version & GitHub updates"
+                : "Proveri verziju i ažuriranja sa GitHub-a"
+          }
+        >
+          {availableUpdateVersion && (
+            <span className="app-version-dot" aria-hidden="true" />
+          )}
+          <span>v{appVersion}</span>
+        </button>
       </div>
 
       <div className="window-controls">

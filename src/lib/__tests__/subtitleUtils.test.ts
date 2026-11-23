@@ -6,6 +6,7 @@ import assert from "node:assert/strict";
 import {
   calculateCps,
   calculateCueMetrics,
+  compareSemver,
   computeCueWarnings,
   convertSerbianScriptText,
   cyrillicToLatin,
@@ -344,5 +345,16 @@ describe("Batch Queue Active Selection Locking", () => {
 
     // Explicit user actions (loading checkpoint / importing subtitle) force activation
     assert.equal(shouldActivateSyncedProject("job-1", "job-2", true), true);
+  });
+});
+
+describe("Semantic Version Comparison", () => {
+  it("compares semver strings with or without v-prefix cleanly", () => {
+    assert.equal(compareSemver("v0.1.2", "0.1.1"), 1);
+    assert.equal(compareSemver("0.2.0", "v0.1.9"), 1);
+    assert.equal(compareSemver("1.0.0", "0.9.9"), 1);
+    assert.equal(compareSemver("v0.1.1", "0.1.1"), 0);
+    assert.equal(compareSemver("0.1.1-beta", "v0.1.1"), 0);
+    assert.equal(compareSemver("v0.1.0", "0.1.1"), -1);
   });
 });

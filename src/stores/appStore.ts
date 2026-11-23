@@ -1,7 +1,9 @@
+import { getVersion } from "@tauri-apps/api/app";
 import { create } from "zustand";
 import { normalizeUiLanguage, type UiLanguage } from "../i18n";
 import {
   calculateCueMetrics,
+  compareSemver,
   convertSerbianScriptText,
   getPresetSegmentRules,
   isTauriRuntime,
@@ -172,6 +174,8 @@ interface AppStoreState {
   isExportOpen: boolean;
   isUpdaterOpen: boolean;
   isCheckpointsOpen: boolean;
+  appVersion: string;
+  availableUpdateVersion: string | null;
   onlineConfirm: OnlineConfirmState;
   onlineApprovedForSession: boolean;
 
@@ -179,6 +183,7 @@ interface AppStoreState {
 
   initApp: () => Promise<void>;
   setBanner: (banner: BannerNotification | null) => void;
+  setAvailableUpdateVersion: (version: string | null) => void;
   setUiLanguage: (lang: UiLanguage) => Promise<void>;
   updateConfig: (patch: Partial<AppConfig>) => Promise<void>;
   refreshSetupAndCatalog: () => Promise<void>;
@@ -412,6 +417,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     isExportOpen: false,
     isUpdaterOpen: false,
     isCheckpointsOpen: false,
+    appVersion: "0.1.1",
+    availableUpdateVersion: null,
     onlineConfirm: {
       open: false,
       provider: "deepSeek",
@@ -462,14 +469,23 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }
 
       try {
-        const [setupStatus, catalog, loadedConfig, apiKeyStatus, checkpoints] =
-          await Promise.all([
-            getSetupStatus(),
-            getCatalog(),
-            getConfig(),
-            getApiKeyStatus(),
-            listCheckpoints(),
-          ]);
+        const [
+          setupStatus,
+          catalog,
+          loadedConfig,
+          apiKeyStatus,
+          checkpoints,
+          appVersion,
+        ] = await Promise.all([
+          getSetupStatus(),
+          getCatalog(),
+          getConfig(),
+          getApiKeyStatus(),
+          listCheckpoints(),
+          isTauriRuntime()
+            ? getVersion().catch(() => "0.1.1")
+            : Promise.resolve("0.1.1"),
+        ]);
 
         const config: AppConfig = {
           ...DEFAULT_CONFIG,
@@ -497,12 +513,30 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           apiKeyStatus,
           checkpoints,
           jobOptions,
+          appVersion,
           isSetupOpen: shouldShowSetup,
           activeProject: stateBeforeInit.activeProject,
           activeJobId: stateBeforeInit.activeJobId,
           activeCueId: stateBeforeInit.activeCueId,
           batchQueue: stateBeforeInit.batchQueue,
         });
+
+        // Background GitHub latest-release version check (silent, non-blocking)
+        void fetch(
+          "https://api.github.com/repos/Gruya13/EasySRT-Studio/releases/latest",
+          { headers: { Accept: "application/vnd.github+json" } },
+        )
+          .then(async (res) => {
+            if (!res.ok) return;
+            const data = (await res.json()) as { tag_name?: string };
+            const remoteTag = data.tag_name?.trim();
+            if (remoteTag && compareSemver(remoteTag, appVersion) > 0) {
+              set({ availableUpdateVersion: remoteTag.replace(/^v/i, "") });
+            }
+          })
+          .catch(() => {
+            // Offline or GitHub unreachable — ignore silently at startup
+          });
       } catch (err) {
         set({
           initialized: true,
@@ -515,6 +549,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     },
 
     setBanner: (banner) => set({ banner }),
+    setAvailableUpdateVersion: (version) =>
+      set({ availableUpdateVersion: version }),
 
     setUiLanguage: async (lang) => {
       const nextConfig: AppConfig = {

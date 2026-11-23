@@ -129,6 +129,10 @@ export function SettingsPanel() {
   const setUiLanguage = useAppStore((s) => s.setUiLanguage);
   const setSetupOpen = useAppStore((s) => s.setSetupOpen);
   const setUpdaterOpen = useAppStore((s) => s.setUpdaterOpen);
+  const appVersion = useAppStore((s) => s.appVersion);
+  const availableUpdateVersion = useAppStore(
+    (s) => s.availableUpdateVersion,
+  );
   const runImportCustomModel = useAppStore((s) => s.runImportCustomModel);
   const runSetApiKey = useAppStore((s) => s.runSetApiKey);
   const runClearApiKey = useAppStore((s) => s.runClearApiKey);
@@ -1577,9 +1581,13 @@ export function SettingsPanel() {
 
             <div className="s-action-row">
               <span id="s-update-status" className="s-note">
-                {lang === "en"
-                  ? "Updates • EasySRT Studio v0.1.1"
-                  : "Ažuriranja • EasySRT Studio v0.1.1"}
+                {availableUpdateVersion
+                  ? lang === "en"
+                    ? `Updates • EasySRT Studio v${appVersion} → v${availableUpdateVersion} available`
+                    : `Ažuriranja • EasySRT Studio v${appVersion} → dostupna v${availableUpdateVersion}`
+                  : lang === "en"
+                    ? `Updates • EasySRT Studio v${appVersion}`
+                    : `Ažuriranja • EasySRT Studio v${appVersion}`}
               </span>
               <button
                 id="s-btn-check-updates"

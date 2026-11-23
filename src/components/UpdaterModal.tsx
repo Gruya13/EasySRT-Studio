@@ -3,30 +3,167 @@ import { check, type Update } from "@tauri-apps/plugin-updater";
 import {
   CheckCircle2,
   Download,
+  ExternalLink,
   Loader2,
   RefreshCw,
   RotateCcw,
   Sparkles,
   X,
 } from "lucide-react";
-import { useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
-import { formatBytes, isTauriRuntime } from "../lib/subtitleUtils";
+import {
+  compareSemver,
+  formatBytes,
+  isTauriRuntime,
+} from "../lib/subtitleUtils";
 import { useAppStore } from "../stores/appStore";
+
+interface GitHubLatestRelease {
+  version: string;
+  htmlUrl: string;
+  body: string;
+  publishedAt: string;
+}
+
+const GITHUB_RELEASES_URL = "https://github.com/Gruya13/EasySRT-Studio/releases";
+const GITHUB_LATEST_API_URL =
+  "https://api.github.com/repos/Gruya13/EasySRT-Studio/releases/latest";
 
 export function UpdaterModal() {
   const isOpen = useAppStore((s) => s.isUpdaterOpen);
   const setUpdaterOpen = useAppStore((s) => s.setUpdaterOpen);
   const config = useAppStore((s) => s.config);
+  const appVersion = useAppStore((s) => s.appVersion);
+  const setAvailableUpdateVersion = useAppStore(
+    (s) => s.setAvailableUpdateVersion,
+  );
 
   const [checking, setChecking] = useState(false);
   const [checkedOnce, setCheckedOnce] = useState(false);
   const [updateObj, setUpdateObj] = useState<Update | null>(null);
+  const [githubRelease, setGithubRelease] =
+    useState<GitHubLatestRelease | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
   const [readyToRestart, setReadyToRestart] = useState(false);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
+
+  const handleCheckUpdates = useCallback(async () => {
+    setChecking(true);
+    setErrorMessage(null);
+
+    try {
+      const ghPromise = fetch(GITHUB_LATEST_API_URL, {
+        headers: { Accept: "application/vnd.github+json" },
+      })
+        .then(
+          async (
+            res,
+          ): Promise<{
+            release: GitHubLatestRelease | null;
+            error: string | null;
+          }> => {
+            if (res.status === 404) {
+              return { release: null, error: null };
+            }
+            if (!res.ok) {
+              return { release: null, error: `GitHub HTTP ${res.status}` };
+            }
+            const data = (await res.json()) as {
+              tag_name?: string;
+              html_url?: string;
+              body?: string;
+              published_at?: string;
+            };
+            const tag = data.tag_name?.trim();
+            if (!tag) {
+              return { release: null, error: null };
+            }
+            return {
+              release: {
+                version: tag.replace(/^v/i, ""),
+                htmlUrl: data.html_url || GITHUB_RELEASES_URL,
+                body: data.body || "",
+                publishedAt: data.published_at || "",
+              },
+              error: null,
+            };
+          },
+        )
+        .catch(
+          (
+            err,
+          ): { release: GitHubLatestRelease | null; error: string | null } => ({
+            release: null,
+            error: err instanceof Error ? err.message : String(err),
+          }),
+        );
+
+      const tauriPromise = isTauriRuntime()
+        ? check()
+            .then(
+              (update): { update: Update | null; error: string | null } => ({
+                update,
+                error: null,
+              }),
+            )
+            .catch(
+              (err): { update: Update | null; error: string | null } => ({
+                update: null,
+                error: err instanceof Error ? err.message : String(err),
+              }),
+            )
+        : Promise.resolve<{ update: Update | null; error: string | null }>({
+            update: null,
+            error: null,
+          });
+
+      const [ghResult, tauriResult] = await Promise.all([
+        ghPromise,
+        tauriPromise,
+      ]);
+      const latestGh = ghResult.release;
+      const tauriUpdate = tauriResult.update;
+      const tauriCheckErr = tauriResult.error;
+      const ghErr = ghResult.error;
+
+      setGithubRelease(latestGh);
+      setUpdateObj(tauriUpdate);
+      setCheckedOnce(true);
+
+      if (tauriUpdate) {
+        setAvailableUpdateVersion(tauriUpdate.version.replace(/^v/i, ""));
+      } else if (latestGh && compareSemver(latestGh.version, appVersion) > 0) {
+        setAvailableUpdateVersion(latestGh.version);
+      } else {
+        setAvailableUpdateVersion(null);
+        if (tauriCheckErr && ghErr) {
+          setErrorMessage(tauriCheckErr);
+        } else if (
+          tauriCheckErr &&
+          !tauriCheckErr.toLowerCase().includes("up to date") &&
+          latestGh !== null
+        ) {
+          const lowerErr = tauriCheckErr.toLowerCase();
+          if (!lowerErr.includes("valid release json")) {
+            setErrorMessage(tauriCheckErr);
+          }
+        } else if (ghErr && !isTauriRuntime()) {
+          setErrorMessage(ghErr);
+        }
+      }
+    } finally {
+      setChecking(false);
+    }
+  }, [appVersion, setAvailableUpdateVersion]);
+
+  useEffect(() => {
+    if (isOpen) {
+      void handleCheckUpdates();
+    }
+  }, [isOpen, handleCheckUpdates]);
 
   if (!isOpen) {
     return null;
@@ -35,31 +172,12 @@ export function UpdaterModal() {
   const lang = normalizeUiLanguage(config.uiLanguage);
   const t = getDictionary(lang);
 
-  const handleCheckUpdates = async () => {
-    setChecking(true);
-    setErrorMessage(null);
-    try {
-      if (!isTauriRuntime()) {
-        await new Promise((r) => setTimeout(r, 350));
-        setUpdateObj(null);
-        setCheckedOnce(true);
-        return;
-      }
-      const update = await check();
-      setUpdateObj(update);
-      setCheckedOnce(true);
-    } catch (err) {
-      // Friendly handling when placeholder key or no GitHub release published yet
-      const msg = err instanceof Error ? err.message : String(err);
-      setUpdateObj(null);
-      setCheckedOnce(true);
-      if (msg && !msg.toLowerCase().includes("up to date")) {
-        setErrorMessage(msg);
-      }
-    } finally {
-      setChecking(false);
-    }
-  };
+  const githubHasNewer = Boolean(
+    !updateObj &&
+      githubRelease &&
+      compareSemver(githubRelease.version, appVersion) > 0,
+  );
+  const isUpToDate = Boolean(!updateObj && !githubHasNewer && checkedOnce && !errorMessage);
 
   const handleDownloadAndInstall = async () => {
     if (!updateObj) {
@@ -127,13 +245,38 @@ export function UpdaterModal() {
         </div>
 
         {/* Body */}
-        <div className="space-y-4 p-5 text-xs">
+        <div className="space-y-3.5 p-5 text-xs">
           <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/70 px-3.5 py-2.5">
             <span className="text-slate-400">{t.updater.currentVersion}</span>
-            <span className="font-mono font-bold text-emerald-300">v0.1.1</span>
+            <span className="font-mono font-bold text-emerald-300">
+              v{appVersion}
+            </span>
           </div>
 
-          {!updateObj && checkedOnce && !errorMessage && (
+          <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/40 px-3.5 py-2.5">
+            <span className="text-slate-400">
+              {lang === "en" ? "Latest on GitHub" : "Najnovije na GitHub-u"}
+            </span>
+            <a
+              href={githubRelease?.htmlUrl ?? GITHUB_RELEASES_URL}
+              target="_blank"
+              rel="noreferrer"
+              className="inline-flex items-center gap-1.5 font-mono font-semibold text-cyan-300 hover:underline"
+            >
+              <span>
+                {checking
+                  ? "..."
+                  : githubRelease
+                    ? `v${githubRelease.version}`
+                    : lang === "en"
+                      ? "No release yet"
+                      : "Još nema release-a"}
+              </span>
+              <ExternalLink className="h-3 w-3" />
+            </a>
+          </div>
+
+          {isUpToDate && (
             <div className="flex items-center gap-2 rounded-xl border border-emerald-500/30 bg-emerald-950/20 p-3 text-emerald-300">
               <CheckCircle2 className="h-4 w-4 shrink-0" />
               <span className="font-medium">{t.updater.upToDate}</span>
@@ -146,69 +289,90 @@ export function UpdaterModal() {
             </div>
           )}
 
-          {updateObj && (
+          {(updateObj || githubHasNewer) && (
             <div className="space-y-3 rounded-xl border border-cyan-500/30 bg-cyan-950/20 p-3.5">
               <div className="flex items-center justify-between">
                 <span className="inline-flex items-center gap-1.5 font-bold text-cyan-300">
                   <Sparkles className="h-4 w-4" />
                   <span>
-                    {t.updater.updateAvailable}: v{updateObj.version}
+                    {t.updater.updateAvailable}: v
+                    {updateObj?.version ?? githubRelease?.version}
                   </span>
                 </span>
               </div>
 
-              {updateObj.body && (
+              {(updateObj?.body || githubRelease?.body) && (
                 <div className="space-y-1">
                   <div className="text-[11px] font-semibold text-slate-400">
                     {t.updater.releaseNotes}:
                   </div>
                   <div className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-950 p-2.5 text-[11px] text-slate-300">
-                    {updateObj.body}
+                    {updateObj?.body || githubRelease?.body}
                   </div>
                 </div>
               )}
 
-              {downloading && (
-                <div className="space-y-1">
-                  <div className="flex justify-between font-mono text-[11px] text-cyan-300">
-                    <span>{t.updater.downloading}</span>
-                    <span>
-                      {percent}% ({formatBytes(downloadedBytes)}
-                      {totalBytes ? ` / ${formatBytes(totalBytes)}` : ""})
-                    </span>
-                  </div>
-                  <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
-                    <div
-                      className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-cyan-400 transition-all"
-                      style={{ width: `${Math.max(5, percent)}%` }}
-                    />
-                  </div>
-                </div>
-              )}
-
-              {readyToRestart ? (
-                <button
-                  type="button"
-                  onClick={() => void handleRelaunch()}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow"
-                >
-                  <RotateCcw className="h-4 w-4" />
-                  <span>{t.updater.relaunchNow}</span>
-                </button>
-              ) : (
-                <button
-                  type="button"
-                  disabled={downloading}
-                  onClick={() => void handleDownloadAndInstall()}
-                  className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow disabled:opacity-50"
-                >
-                  {downloading ? (
-                    <Loader2 className="h-4 w-4 animate-spin" />
-                  ) : (
-                    <Download className="h-4 w-4" />
+              {updateObj ? (
+                <>
+                  {downloading && (
+                    <div className="space-y-1">
+                      <div className="flex justify-between font-mono text-[11px] text-cyan-300">
+                        <span>{t.updater.downloading}</span>
+                        <span>
+                          {percent}% ({formatBytes(downloadedBytes)}
+                          {totalBytes ? ` / ${formatBytes(totalBytes)}` : ""})
+                        </span>
+                      </div>
+                      <div className="h-1.5 w-full overflow-hidden rounded-full bg-slate-800">
+                        <div
+                          className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-cyan-400 transition-all"
+                          style={{ width: `${Math.max(5, percent)}%` }}
+                        />
+                      </div>
+                    </div>
                   )}
-                  <span>{t.updater.downloadAndInstall}</span>
-                </button>
+
+                  {readyToRestart ? (
+                    <button
+                      type="button"
+                      onClick={() => void handleRelaunch()}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow"
+                    >
+                      <RotateCcw className="h-4 w-4" />
+                      <span>{t.updater.relaunchNow}</span>
+                    </button>
+                  ) : (
+                    <button
+                      type="button"
+                      disabled={downloading}
+                      onClick={() => void handleDownloadAndInstall()}
+                      className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow disabled:opacity-50"
+                    >
+                      {downloading ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Download className="h-4 w-4" />
+                      )}
+                      <span>{t.updater.downloadAndInstall}</span>
+                    </button>
+                  )}
+                </>
+              ) : (
+                githubRelease && (
+                  <a
+                    href={githubRelease.htmlUrl}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow"
+                  >
+                    <ExternalLink className="h-4 w-4" />
+                    <span>
+                      {lang === "en"
+                        ? "Open Release on GitHub"
+                        : "Otvori Release na GitHub-u"}
+                    </span>
+                  </a>
+                )
               )}
             </div>
           )}
