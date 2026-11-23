@@ -238,6 +238,17 @@ export function DualEditorBand() {
               if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
                 e.preventDefault();
                 saveOriginal();
+                return;
+              }
+              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                e.preventDefault();
+                saveOriginal();
+                e.currentTarget.blur();
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.currentTarget.blur();
               }
             }}
           />
@@ -349,6 +360,17 @@ export function DualEditorBand() {
               if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === "s") {
                 e.preventDefault();
                 savePrevod();
+                return;
+              }
+              if ((e.ctrlKey || e.metaKey) && e.key === "Enter") {
+                e.preventDefault();
+                savePrevod();
+                e.currentTarget.blur();
+                return;
+              }
+              if (e.key === "Escape") {
+                e.preventDefault();
+                e.currentTarget.blur();
               }
             }}
           />

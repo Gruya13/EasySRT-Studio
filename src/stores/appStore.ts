@@ -241,7 +241,7 @@ interface AppStoreState {
     edge: "start" | "end",
     deltaMs: number,
   ) => void;
-  splitCueAtMidpoint: (cueId: number) => void;
+  splitCueAtMidpoint: (cueId: number, splitMs?: number) => void;
   mergeCueWithNext: (cueId: number) => void;
   deleteCueById: (cueId: number) => void;
   addCueAtEnd: () => void;
@@ -1843,7 +1843,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }
     },
 
-    splitCueAtMidpoint: (cueId) => {
+    splitCueAtMidpoint: (cueId, splitMs) => {
       const { activeProject, jobOptions } = get();
       if (!activeProject) {
         return;
@@ -1852,38 +1852,86 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       if (idx === -1) {
         return;
       }
-      pushUndoSnapshot(activeProject.cues);
       const cue = activeProject.cues[idx];
-      const midMs = Math.round((cue.startMs + cue.endMs) / 2);
+      const MIN_SPLIT_MARGIN_MS = 80;
+      const hasValidCustomSplit =
+        typeof splitMs === "number" &&
+        Number.isFinite(splitMs) &&
+        splitMs >= cue.startMs + MIN_SPLIT_MARGIN_MS &&
+        splitMs <= cue.endMs - MIN_SPLIT_MARGIN_MS;
+      const cutMs = hasValidCustomSplit
+        ? Math.round(splitMs)
+        : Math.round((cue.startMs + cue.endMs) / 2);
+      if (cutMs <= cue.startMs || cutMs >= cue.endMs) {
+        return;
+      }
 
-      const splitWords = (text: string): [string, string] => {
+      pushUndoSnapshot(activeProject.cues);
+
+      const durationMs = Math.max(1, cue.endMs - cue.startMs);
+      const ratio = Math.max(
+        0.05,
+        Math.min(0.95, (cutMs - cue.startMs) / durationMs),
+      );
+      const cueWords = activeProject.words.filter(
+        (w) => w.endMs > cue.startMs + 20 && w.startMs < cue.endMs - 20,
+      );
+
+      const splitWords = (
+        text: string,
+        useTimedWords: boolean,
+      ): [string, string] => {
         const trimmed = text.trim();
         if (!trimmed) {
           return ["", ""];
         }
+        const rawTokens = trimmed.split(/\s+/).filter(Boolean);
+        if (
+          useTimedWords &&
+          cueWords.length === rawTokens.length &&
+          rawTokens.length >= 2
+        ) {
+          const wordsBeforeCut = cueWords.filter(
+            (w) => (w.startMs + w.endMs) / 2 <= cutMs,
+          ).length;
+          const cutIdx = Math.max(
+            1,
+            Math.min(rawTokens.length - 1, wordsBeforeCut),
+          );
+          return [
+            rawTokens.slice(0, cutIdx).join(" "),
+            rawTokens.slice(cutIdx).join(" "),
+          ];
+        }
+
         const lines = trimmed.split("\n");
-        if (lines.length >= 2) {
+        if (!hasValidCustomSplit && lines.length >= 2) {
           const half = Math.ceil(lines.length / 2);
           return [
             lines.slice(0, half).join("\n"),
             lines.slice(half).join("\n"),
           ];
         }
-        const words = trimmed.split(/\s+/);
-        if (words.length <= 1) {
-          return [trimmed, ""];
+        if (rawTokens.length <= 1) {
+          return ratio < 0.5 ? ["", trimmed] : [trimmed, ""];
         }
-        const half = Math.ceil(words.length / 2);
-        return [words.slice(0, half).join(" "), words.slice(half).join(" ")];
+        const cutIdx = Math.max(
+          1,
+          Math.min(rawTokens.length - 1, Math.round(rawTokens.length * ratio)),
+        );
+        return [
+          rawTokens.slice(0, cutIdx).join(" "),
+          rawTokens.slice(cutIdx).join(" "),
+        ];
       };
 
-      const [src1, src2] = splitWords(cue.sourceText);
-      const [tr1, tr2] = splitWords(cue.translatedText);
+      const [src1, src2] = splitWords(cue.sourceText, true);
+      const [tr1, tr2] = splitWords(cue.translatedText, false);
 
       const firstHalf = recalculateCue(
         {
           ...cue,
-          endMs: midMs,
+          endMs: cutMs,
           sourceText: src1,
           translatedText: tr1,
         },
@@ -1893,7 +1941,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       const secondHalf = recalculateCue(
         {
           ...cue,
-          startMs: midMs,
+          startMs: cutMs,
           sourceText: src2,
           translatedText: tr2,
         },
@@ -1912,6 +1960,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         cues: nextCues,
         updatedAt: new Date().toISOString(),
       });
+      set({ activeCueId: idx + 2 });
     },
 
     mergeCueWithNext: (cueId) => {

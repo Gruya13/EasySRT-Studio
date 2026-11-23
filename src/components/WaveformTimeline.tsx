@@ -15,6 +15,10 @@ const PROCESSING_PHASES = new Set<JobPhase>([
   "polishing",
 ]);
 
+const FRAME_STEP_MS = 40; // 1 frame @ 25fps
+const LARGE_JUMP_MS = 1000; // 1 second jump
+const MIN_SPLIT_MARGIN_MS = 80;
+
 interface TrackState {
   mp3: { muted: boolean; locked: boolean };
   original: { hidden: boolean; locked: boolean };
@@ -220,6 +224,7 @@ export function WaveformTimeline() {
   const canRedo = useAppStore((s) => s.canRedo);
 
   const setActiveCueId = useAppStore((s) => s.setActiveCueId);
+  const playCueSegment = useAppStore((s) => s.playCueSegment);
   const updateCue = useAppStore((s) => s.updateCue);
   const splitCueAtMidpoint = useAppStore((s) => s.splitCueAtMidpoint);
   const mergeCueWithNext = useAppStore((s) => s.mergeCueWithNext);
@@ -774,6 +779,18 @@ export function WaveformTimeline() {
     setIsPlaying(true);
   }, [isPlaying, audioBlobUrl, seekPlayhead]);
 
+  const playFromStart = useCallback(() => {
+    segmentEndMsRef.current = null;
+    seekPlayhead(0, true);
+    if (webAudioCtxRef.current?.state === "suspended") {
+      void webAudioCtxRef.current.resume().catch(() => {});
+    }
+    if (audioRef.current && audioBlobUrl && !audioRef.current.error) {
+      audioRef.current.muted = tracksRef.current.mp3.muted;
+    }
+    setIsPlaying(true);
+  }, [audioBlobUrl, seekPlayhead]);
+
   const stopTimeline = useCallback(() => {
     segmentEndMsRef.current = null;
     setIsPlaying(false);
@@ -907,13 +924,91 @@ export function WaveformTimeline() {
     return () => ro.disconnect();
   }, [drawWaveform]);
 
-  // Global keyboard shortcuts (Space, Ctrl+Z, Ctrl+Y, Alt+ArrowUp/Down)
+  // Global keyboard shortcuts (Space, Shift+Space, C, Arrow frame/jump/segment, Alt+1/2, Ctrl+Z/Y)
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      const st = useAppStore.getState();
+      if (
+        st.isSettingsOpen ||
+        st.isExportOpen ||
+        st.isSetupOpen ||
+        st.isUpdaterOpen ||
+        st.isCheckpointsOpen ||
+        st.onlineConfirm.open
+      ) {
+        return;
+      }
+
       const mod = e.ctrlKey || e.metaKey;
       const keyLower = e.key.toLowerCase();
       const inEditable = isEditableElement(e.target);
 
+      // Alt + 1 (Original transcript) / Alt + 2 (Prevod)
+      if (
+        e.altKey &&
+        !mod &&
+        !e.shiftKey &&
+        (e.code === "Digit1" ||
+          e.code === "Numpad1" ||
+          e.key === "1" ||
+          e.code === "Digit2" ||
+          e.code === "Numpad2" ||
+          e.key === "2")
+      ) {
+        e.preventDefault();
+        const isOrig =
+          e.code === "Digit1" || e.code === "Numpad1" || e.key === "1";
+        const targetId = isOrig ? "textarea-original" : "textarea-prevod";
+
+        if (activeCueIdRef.current === null && cuesRef.current.length > 0) {
+          const fallbackCue =
+            findCueForTime(cuesRef.current, playheadRef.current, true) ??
+            cuesRef.current[0];
+          if (fallbackCue) {
+            activeCueIdRef.current = fallbackCue.id;
+            setActiveCueId(fallbackCue.id);
+            seekPlayhead(fallbackCue.startMs, false);
+          }
+        }
+
+        const focusBox = () => {
+          const el = document.getElementById(
+            targetId,
+          ) as HTMLTextAreaElement | null;
+          if (el && !el.disabled) {
+            el.focus();
+            const len = el.value.length;
+            el.setSelectionRange(len, len);
+            return true;
+          }
+          return false;
+        };
+
+        if (!focusBox()) {
+          window.requestAnimationFrame(() => {
+            window.requestAnimationFrame(() => {
+              focusBox();
+            });
+          });
+        }
+        return;
+      }
+
+      // Shift + Space: Play from start (0 ms)
+      if (
+        e.code === "Space" &&
+        !mod &&
+        !e.altKey &&
+        e.shiftKey &&
+        !inEditable &&
+        !(e.target instanceof HTMLButtonElement)
+      ) {
+        e.preventDefault();
+        playFromStart();
+        return;
+      }
+
+      // Space: Start / Stop playback at current marker
       if (
         e.code === "Space" &&
         !mod &&
@@ -927,6 +1022,7 @@ export function WaveformTimeline() {
         return;
       }
 
+      // Ctrl/Cmd+Z / Ctrl/Cmd+Y: Undo / Redo
       if (mod && !e.altKey && !inEditable) {
         if (keyLower === "z" && !e.shiftKey) {
           e.preventDefault();
@@ -940,26 +1036,74 @@ export function WaveformTimeline() {
         }
       }
 
+      // C: Split segment under playhead marker
       if (
-        e.altKey &&
+        !inEditable &&
         !mod &&
-        cues.length > 0 &&
-        (e.key === "ArrowDown" || e.key === "ArrowUp")
+        !e.altKey &&
+        !e.shiftKey &&
+        (keyLower === "c" || e.code === "KeyC")
+      ) {
+        const ms = playheadRef.current;
+        const cueUnderMarker = cuesRef.current.find(
+          (c) =>
+            ms >= c.startMs + MIN_SPLIT_MARGIN_MS &&
+            ms <= c.endMs - MIN_SPLIT_MARGIN_MS,
+        );
+        if (cueUnderMarker) {
+          e.preventDefault();
+          splitCueAtMidpoint(cueUnderMarker.id, Math.round(ms));
+        }
+        return;
+      }
+
+      // ArrowLeft / ArrowRight (+ Shift): Step playhead by frame (40ms) or large jump (1000ms)
+      if (
+        !inEditable &&
+        !mod &&
+        !e.altKey &&
+        (e.key === "ArrowLeft" || e.key === "ArrowRight")
       ) {
         e.preventDefault();
-        const curIdx = cues.findIndex((c) => c.id === activeCue?.id);
-        const nextIdx =
-          e.key === "ArrowDown"
-            ? curIdx === -1
-              ? 0
-              : Math.min(cues.length - 1, curIdx + 1)
-            : curIdx === -1
-              ? cues.length - 1
-              : Math.max(0, curIdx - 1);
-        const target = cues[nextIdx];
+        const step = e.shiftKey ? LARGE_JUMP_MS : FRAME_STEP_MS;
+        const delta = e.key === "ArrowRight" ? step : -step;
+        segmentEndMsRef.current = null;
+        seekPlayhead(playheadRef.current + delta, true);
+        return;
+      }
+
+      // ArrowUp (Play next segment) / ArrowDown (Play previous segment)
+      if (
+        !inEditable &&
+        !mod &&
+        !e.altKey &&
+        !e.shiftKey &&
+        cuesRef.current.length > 0 &&
+        (e.key === "ArrowUp" || e.key === "ArrowDown")
+      ) {
+        e.preventDefault();
+        const list = cuesRef.current;
+        const curIdx =
+          activeCueIdRef.current !== null
+            ? list.findIndex((c) => c.id === activeCueIdRef.current)
+            : -1;
+        let target: SubtitleCue | undefined;
+        if (e.key === "ArrowUp") {
+          target =
+            curIdx !== -1
+              ? list[Math.min(list.length - 1, curIdx + 1)]
+              : (list.find((c) => c.startMs > playheadRef.current) ??
+                list[list.length - 1]);
+        } else {
+          target =
+            curIdx !== -1
+              ? list[Math.max(0, curIdx - 1)]
+              : ([...list]
+                  .reverse()
+                  .find((c) => c.startMs < playheadRef.current) ?? list[0]);
+        }
         if (target) {
-          setActiveCueId(target.id);
-          seekPlayhead(target.startMs);
+          playCueSegment(target);
         }
       }
     };
@@ -968,10 +1112,11 @@ export function WaveformTimeline() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
     togglePlayTimeline,
+    playFromStart,
     undoCueEdit,
     redoCueEdit,
-    cues,
-    activeCue?.id,
+    splitCueAtMidpoint,
+    playCueSegment,
     setActiveCueId,
     seekPlayhead,
   ]);
@@ -1291,9 +1436,27 @@ export function WaveformTimeline() {
           <button
             type="button"
             className="tl-icon-btn"
-            disabled={!activeCue}
-            onClick={() => activeCue && splitCueAtMidpoint(activeCue.id)}
-            title={t.table.splitCue}
+            disabled={
+              !activeCue &&
+              !cues.some(
+                (c) =>
+                  playheadMs >= c.startMs + MIN_SPLIT_MARGIN_MS &&
+                  playheadMs <= c.endMs - MIN_SPLIT_MARGIN_MS,
+              )
+            }
+            onClick={() => {
+              const markerCue = cues.find(
+                (c) =>
+                  playheadRef.current >= c.startMs + MIN_SPLIT_MARGIN_MS &&
+                  playheadRef.current <= c.endMs - MIN_SPLIT_MARGIN_MS,
+              );
+              if (markerCue) {
+                splitCueAtMidpoint(markerCue.id, Math.round(playheadRef.current));
+              } else if (activeCue) {
+                splitCueAtMidpoint(activeCue.id);
+              }
+            }}
+            title={`${t.table.splitCue} (C)`}
           >
             <Scissors size={12} />
           </button>
