@@ -62,6 +62,58 @@ jobs:
           npm test
           cargo test --manifest-path src-tauri/Cargo.toml
 
+      - name: Stage Windows MSVC Runtime DLLs
+        if: matrix.platform == 'windows-latest'
+        shell: pwsh
+        run: |
+          $destDir = Join-Path $PWD "src-tauri\resources\vcruntime"
+          New-Item -ItemType Directory -Force -Path $destDir | Out-Null
+
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vsPath = ""
+          if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath | Select-Object -First 1
+          }
+
+          $searchRoots = @()
+          if ($vsPath) { $searchRoots += (Join-Path $vsPath "VC\Redist\MSVC") }
+          $searchRoots += "C:\Program Files\Microsoft Visual Studio\*\*\VC\Redist\MSVC"
+          $searchRoots += "C:\Program Files (x86)\Microsoft Visual Studio\*\*\VC\Redist\MSVC"
+
+          $dllNames = @(
+            "vcruntime140.dll",
+            "vcruntime140_1.dll",
+            "msvcp140.dll",
+            "msvcp140_1.dll",
+            "msvcp140_2.dll",
+            "concrt140.dll",
+            "vcomp140.dll"
+          )
+
+          foreach ($dll in $dllNames) {
+            $found = $null
+            foreach ($root in $searchRoots) {
+              $found = Get-ChildItem -Path $root -Recurse -File -Filter $dll -ErrorAction SilentlyContinue |
+                Where-Object { $_.FullName -match '\\x64\\' -and $_.FullName -notmatch 'onecore|debug_nonredist' } |
+                Sort-Object FullName -Descending |
+                Select-Object -First 1
+              if ($found) { break }
+            }
+            if ($found) {
+              Copy-Item -Path $found.FullName -Destination (Join-Path $destDir $dll) -Force
+              Write-Output "Staged $dll from $($found.FullName)"
+            } else {
+              Write-Warning "Optional/candidate DLL not found in VS Redist: $dll"
+            }
+          }
+
+          foreach ($requiredDll in @("vcruntime140.dll", "vcruntime140_1.dll", "msvcp140.dll", "vcomp140.dll")) {
+            $staged = Join-Path $destDir $requiredDll
+            if (-not (Test-Path $staged)) {
+              throw "Required MSVC runtime DLL missing after staging: $staged"
+            }
+          }
+
       - name: Build and publish Tauri bundles
         id: tauri-build
         uses: tauri-apps/tauri-action@v0
@@ -72,74 +124,11 @@ jobs:
         with:
           tagName: v__VERSION__
           releaseName: "EasySRT Studio v__VERSION__"
-          releaseBody: "See the assets below to download EasySRT Studio (Windows NSIS installer, Windows Portable ZIP, or Linux AppImage)."
+          releaseBody: "Download EasySRT Studio below (Windows Setup Installer with automatic FFmpeg/CUDA/Whisper/llama.cpp setup, or Linux AppImage)."
           releaseDraft: false
           prerelease: false
           includeUpdaterJson: true
           args: ${{ matrix.args }}
-
-      - name: Package Windows Portable ZIP
-        if: matrix.platform == 'windows-latest'
-        shell: pwsh
-        run: |
-          $stageDir = Join-Path $PWD "portable-stage"
-          $resourcesDir = Join-Path $stageDir "resources"
-          New-Item -ItemType Directory -Force -Path $resourcesDir | Out-Null
-
-          $exePath = Join-Path $PWD "src-tauri\target\release\easysrt-studio.exe"
-          if (-not (Test-Path $exePath)) {
-            throw "Expected release binary not found at $exePath"
-          }
-
-          Copy-Item -Path $exePath -Destination (Join-Path $stageDir "EasySRT Studio.exe")
-          Copy-Item -Path (Join-Path $PWD "src-tauri\resources\catalog.json") -Destination (Join-Path $resourcesDir "catalog.json")
-          Set-Content -Path (Join-Path $stageDir "portable.flag") -Value "portable" -NoNewline -Encoding UTF8
-
-          $zipPath = Join-Path $PWD "EasySRT-Studio-windows-x64-portable.zip"
-          if (Test-Path $zipPath) { Remove-Item $zipPath -Force }
-          Compress-Archive -Path (Join-Path $stageDir "*") -DestinationPath $zipPath
-
-      - name: Upload Windows Portable ZIP to GitHub Release
-        if: matrix.platform == 'windows-latest' && steps.tauri-build.outputs.releaseUploadUrl != ''
-        shell: pwsh
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_ID: ${{ steps.tauri-build.outputs.releaseId }}
-          UPLOAD_URL: ${{ steps.tauri-build.outputs.releaseUploadUrl }}
-        run: |
-          $assetName = "EasySRT-Studio-windows-x64-portable.zip"
-          $zipPath = Join-Path $PWD $assetName
-          $headers = @{
-            Authorization = "Bearer $env:GITHUB_TOKEN"
-            Accept        = "application/vnd.github+json"
-          }
-
-          # Remove existing portable asset if re-running on the same release
-          if ($env:RELEASE_ID) {
-            $assetsUrl = "https://api.github.com/repos/${{ github.repository }}/releases/$env:RELEASE_ID/assets"
-            $existing = Invoke-RestMethod -Uri $assetsUrl -Headers $headers -Method Get
-            foreach ($asset in $existing) {
-              if ($asset.name -eq $assetName) {
-                Invoke-RestMethod -Uri $asset.url -Headers $headers -Method Delete
-              }
-            }
-          }
-
-          $baseUploadUrl = $env:UPLOAD_URL -replace '\{\?name,label\}$', ''
-          $targetUrl = "${baseUploadUrl}?name=$([uri]::EscapeDataString($assetName))"
-          Invoke-RestMethod `
-            -Uri $targetUrl `
-            -Method Post `
-            -Headers $headers `
-            -ContentType "application/zip" `
-            -InFile $zipPath
-
-      - name: Upload Portable ZIP workflow artifact
-        if: matrix.platform == 'windows-latest'
-        uses: actions/upload-artifact@v4
-        with:
-          name: EasySRT-Studio-windows-x64-portable
-          path: EasySRT-Studio-windows-x64-portable.zip
 
       - name: Build Linux Vulkan whisper-cli tarball
         if: matrix.platform == 'ubuntu-22.04'

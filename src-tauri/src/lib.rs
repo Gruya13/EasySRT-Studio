@@ -27,6 +27,7 @@ pub fn run() {
             commands::get_setup_status,
             commands::get_catalog,
             commands::install_component,
+            commands::install_core_runtime,
             commands::install_recommended_bundle,
             commands::import_custom_model,
             commands::delete_model,

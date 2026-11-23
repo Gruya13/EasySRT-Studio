@@ -272,7 +272,7 @@ let mockConfig: AppConfig = {
 let mockApiKeyStatus: ApiKeyStatus = {
   hasDeepSeekKey: false,
   hasCustomApiKey: false,
-  storageBackend: "portable-file",
+  storageBackend: "local-file",
 };
 
 const downloadListeners = new Set<(event: DownloadProgressEvent) => void>();
@@ -410,16 +410,28 @@ function buildSetupStatus(): SetupStatus {
       sizeBytes: item.sizeBytes,
     }),
   );
-  const requiredIds = [
+  const coreRequiredIds = [
     "ffmpeg-win-x64",
     "whisper-win-cuda",
+    "cudart-win-cuda12.4",
+    "llama-win-cuda",
     "vad-silero-v6.2.0",
     "whisper-large-v3-turbo-q5_0",
   ];
-  const missingRequired = requiredIds.filter(
+  const hasLlmModel =
+    FALLBACK_CATALOG_ITEMS.some(
+      (i) => i.kind === "llmModel" && mockInstalledIds.has(i.id),
+    ) || mockConfig.customModels.some((cm) => cm.kind === "llmModel");
+  const missingCore = coreRequiredIds.filter(
     (id) => !mockInstalledIds.has(id),
   );
+  const coreRuntimeReady = missingCore.length === 0;
+  const missingRequired = hasLlmModel
+    ? missingCore
+    : [...missingCore, "llm-gemma4-e4b-qat"];
+
   return {
+    platform: "windows-x64",
     gpu: {
       hasNvidia: true,
       gpuName: "NVIDIA GeForce RTX 3060",
@@ -427,15 +439,19 @@ function buildSetupStatus(): SetupStatus {
       recommendedTier: "vram8Gb",
     },
     storage: {
-      mode: "portable",
-      rootDir: "C:/EasySRT Studio",
-      binDir: "C:/EasySRT Studio/bin",
-      modelsDir: mockConfig.modelsDirOverride ?? "C:/EasySRT Studio/models",
-      dataDir: "C:/EasySRT Studio/data",
-      configPath: "C:/EasySRT Studio/data/config.json",
+      mode: "installed",
+      rootDir: "C:/Users/gru/AppData/Local/com.easysrt.studio",
+      binDir: "C:/Users/gru/AppData/Local/com.easysrt.studio/bin",
+      modelsDir:
+        mockConfig.modelsDirOverride ??
+        "C:/Users/gru/AppData/Local/com.easysrt.studio/models",
+      dataDir: "C:/Users/gru/AppData/Local/com.easysrt.studio/data",
+      configPath: "C:/Users/gru/AppData/Local/com.easysrt.studio/config.json",
     },
     components,
-    readyForOffline: missingRequired.length === 0,
+    coreRuntimeReady,
+    hasLlmModel,
+    readyForOffline: coreRuntimeReady && hasLlmModel,
     missingRequired,
   };
 }
@@ -475,6 +491,23 @@ export const browserFallback = {
       path: `C:/EasySRT Studio/${item?.targetSubdir ?? "models"}/${itemId}`,
       sizeBytes: total,
     };
+  },
+
+  async installCoreRuntime(): Promise<SetupStatus> {
+    const coreIds = [
+      "ffmpeg-win-x64",
+      "whisper-win-cuda",
+      "cudart-win-cuda12.4",
+      "llama-win-cuda",
+      "vad-silero-v6.2.0",
+      "whisper-large-v3-turbo-q5_0",
+    ];
+    for (const id of coreIds) {
+      if (!mockInstalledIds.has(id)) {
+        await this.installComponent(id);
+      }
+    }
+    return buildSetupStatus();
   },
 
   async installRecommendedBundle(): Promise<SetupStatus> {

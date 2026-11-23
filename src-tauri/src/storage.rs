@@ -1,4 +1,4 @@
-//! Storage path resolution (Installed vs Portable), config persistence,
+//! Storage path resolution (`%LOCALAPPDATA%\com.easysrt.studio`), config persistence,
 //! checkpoint storage, and API key management.
 
 use crate::models::{
@@ -14,34 +14,26 @@ use tauri::{AppHandle, Manager};
 pub const KEYRING_SERVICE: &str = "com.easysrt.studio";
 pub const KEYRING_USER_DEEPSEEK: &str = "deepseek";
 pub const KEYRING_USER_CUSTOM_OPENAI: &str = "custom_openai";
-pub const PORTABLE_FLAG_FILE: &str = "portable.flag";
 pub const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
 
-const OBFUSCATION_KEY: &[u8] = b"EasySRT-Studio-Portable-Credential-Mask-2026";
+const OBFUSCATION_KEY: &[u8] = b"EasySRT-Studio-Credential-Mask-2026";
 const OBFUSCATION_PREFIX: &str = "obf1:";
 
-/// Determine the fallback installed root directory when Tauri path state is unavailable.
+/// Determine the canonical installed root directory matching Tauri's `app_local_data_dir()`
+/// (`%LOCALAPPDATA%\com.easysrt.studio` on Windows, `~/.local/share/com.easysrt.studio` on Linux).
 pub fn default_installed_root_dir() -> PathBuf {
     dirs::data_local_dir()
         .unwrap_or_else(std::env::temp_dir)
-        .join("EasySRT Studio")
+        .join("com.easysrt.studio")
 }
 
-/// Core testable path resolution logic given an optional current executable path and the
-/// installed app data root directory.
+/// Core testable path resolution logic using `installed_root` and an optional models override.
 pub fn resolve_storage_paths_with_exe(
-    current_exe: Option<&Path>,
+    _current_exe: Option<&Path>,
     installed_root: &Path,
     models_dir_override: Option<&str>,
 ) -> Result<StoragePaths> {
-    let (mode, root_dir) = match current_exe.and_then(|p| p.parent()) {
-        Some(exe_dir) if exe_dir.join(PORTABLE_FLAG_FILE).is_file() => {
-            (StorageMode::Portable, exe_dir.to_path_buf())
-        }
-        _ => (StorageMode::Installed, installed_root.to_path_buf()),
-    };
-
-    resolve_storage_paths_from_root(&root_dir, mode, models_dir_override)
+    resolve_storage_paths_from_root(installed_root, StorageMode::Installed, models_dir_override)
 }
 
 /// Construct and ensure storage directories from a resolved root directory and storage mode.
@@ -101,19 +93,17 @@ pub fn resolve_storage_paths_from_root(
     })
 }
 
-/// Resolve application storage paths (Portable if `portable.flag` exists next to executable,
-/// otherwise Installed under `app_local_data_dir`).
+/// Resolve application storage paths under `app_local_data_dir` (canonical `Installed` mode).
 pub fn resolve_storage_paths(
     app: &AppHandle,
     models_dir_override: Option<&str>,
 ) -> Result<StoragePaths> {
-    let exe_path = std::env::current_exe().ok();
     let installed_root = app
         .path()
         .app_local_data_dir()
         .unwrap_or_else(|_| default_installed_root_dir());
 
-    resolve_storage_paths_with_exe(exe_path.as_deref(), &installed_root, models_dir_override)
+    resolve_storage_paths_from_root(&installed_root, StorageMode::Installed, models_dir_override)
 }
 
 /// Default `AppConfig` with Serbian Latin (`"sr"`) as the default UI language.
@@ -243,7 +233,7 @@ pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<AppConfig> {
 }
 
 // ---------------------------------------------------------------------------
-// API Key Storage (OS Keyring with Portable / Headless File Fallback)
+// API Key Storage (OS Keyring with Headless Local File Fallback)
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -349,7 +339,7 @@ pub fn get_api_key_for_paths(
 
     let cred_path = credentials_file_path(paths);
 
-    if paths.mode != StorageMode::Portable && !force_file_fallback {
+    if !force_file_fallback {
         match try_keyring_get(user) {
             Ok(Some(secret)) => return Ok(Some(secret)),
             Ok(None) => {
@@ -377,7 +367,7 @@ pub fn get_api_key_status_for_paths(
     let cred_path = credentials_file_path(paths);
     let file_creds = read_credentials_file(&cred_path);
 
-    let mut keyring_available = paths.mode != StorageMode::Portable && !force_file_fallback;
+    let mut keyring_available = !force_file_fallback;
     let mut kr_deepseek = None;
     let mut kr_custom = None;
 
@@ -415,7 +405,7 @@ pub fn get_api_key_status_for_paths(
         || (kr_custom.is_none() && file_custom.is_some());
 
     let storage_backend = if using_file {
-        "portable-file".to_string()
+        "local-file".to_string()
     } else {
         "keyring".to_string()
     };
@@ -445,10 +435,7 @@ pub fn set_api_key_for_paths(
 
     let cred_path = credentials_file_path(paths);
 
-    if paths.mode != StorageMode::Portable
-        && !force_file_fallback
-        && try_keyring_set(user, trimmed).is_ok()
-    {
+    if !force_file_fallback && try_keyring_set(user, trimmed).is_ok() {
         // If fallback file also had an entry, clean it up so keyring is authoritative
         if cred_path.is_file() {
             let mut creds = read_credentials_file(&cred_path);
@@ -478,7 +465,7 @@ pub fn clear_api_key_for_paths(
         return get_api_key_status_for_paths(paths, force_file_fallback);
     };
 
-    if paths.mode != StorageMode::Portable && !force_file_fallback {
+    if !force_file_fallback {
         let _ = try_keyring_delete(user);
     }
 
@@ -499,7 +486,7 @@ pub fn get_api_key(app: &AppHandle, provider: TranslationProviderKind) -> Result
     get_api_key_for_paths(&paths, provider, false)
 }
 
-/// Return current API key presence and active backend (`"keyring"` or `"portable-file"`).
+/// Return current API key presence and active backend (`"keyring"` or `"local-file"`).
 pub fn get_api_key_status(app: &AppHandle) -> Result<ApiKeyStatus> {
     let paths = resolve_storage_paths(app, None)?;
     get_api_key_status_for_paths(&paths, false)
@@ -663,7 +650,7 @@ mod tests {
     }
 
     #[test]
-    fn portable_vs_installed_path_resolution() {
+    fn installed_path_resolution_and_override() {
         let base = make_temp_dir("paths");
         let exe_dir = base.join("exe_folder");
         let installed_dir = base.join("installed_data");
@@ -671,7 +658,9 @@ mod tests {
         let fake_exe = exe_dir.join("easysrt-studio.exe");
         fs::write(&fake_exe, b"binary").unwrap();
 
-        // 1. Without portable.flag -> Installed mode
+        assert!(default_installed_root_dir().ends_with("com.easysrt.studio"));
+
+        // 1. Canonical Installed mode
         let paths_installed =
             resolve_storage_paths_with_exe(Some(&fake_exe), &installed_dir, None).unwrap();
         assert_eq!(paths_installed.mode, StorageMode::Installed);
@@ -686,15 +675,14 @@ mod tests {
             .join("checkpoints")
             .is_dir());
 
-        // 2. With portable.flag -> Portable mode
-        fs::write(exe_dir.join(PORTABLE_FLAG_FILE), b"").unwrap();
-        let paths_portable =
+        // 2. Legacy portable.flag beside executable is ignored -> always Installed mode
+        fs::write(exe_dir.join("portable.flag"), b"").unwrap();
+        let paths_still_installed =
             resolve_storage_paths_with_exe(Some(&fake_exe), &installed_dir, None).unwrap();
-        assert_eq!(paths_portable.mode, StorageMode::Portable);
-        assert_eq!(Path::new(&paths_portable.root_dir), exe_dir.as_path());
+        assert_eq!(paths_still_installed.mode, StorageMode::Installed);
         assert_eq!(
-            Path::new(&paths_portable.models_dir),
-            exe_dir.join("models").as_path()
+            Path::new(&paths_still_installed.root_dir),
+            installed_dir.as_path()
         );
 
         // 3. With models_dir_override -> custom models dir created and used
@@ -748,7 +736,7 @@ mod tests {
     #[test]
     fn checkpoint_crud_and_descending_sort() {
         let base = make_temp_dir("checkpoints");
-        let paths = resolve_storage_paths_from_root(&base, StorageMode::Portable, None).unwrap();
+        let paths = resolve_storage_paths_from_root(&base, StorageMode::Installed, None).unwrap();
         let data_dir = Path::new(&paths.data_dir);
 
         let proj_older = SubtitleProject {
@@ -803,26 +791,26 @@ mod tests {
     }
 
     #[test]
-    fn credential_file_fallback_and_portable_mode() {
+    fn credential_file_fallback_works() {
         let base = make_temp_dir("creds");
-        let paths = resolve_storage_paths_from_root(&base, StorageMode::Portable, None).unwrap();
+        let paths = resolve_storage_paths_from_root(&base, StorageMode::Installed, None).unwrap();
 
-        let initial_status = get_api_key_status_for_paths(&paths, false).unwrap();
+        let initial_status = get_api_key_status_for_paths(&paths, true).unwrap();
         assert!(!initial_status.has_deep_seek_key);
         assert!(!initial_status.has_custom_api_key);
-        assert_eq!(initial_status.storage_backend, "portable-file");
+        assert_eq!(initial_status.storage_backend, "local-file");
 
         // Save DeepSeek key
         let after_ds = set_api_key_for_paths(
             &paths,
             TranslationProviderKind::DeepSeek,
             "sk-deepseek-test-12345",
-            false,
+            true,
         )
         .unwrap();
         assert!(after_ds.has_deep_seek_key);
         assert!(!after_ds.has_custom_api_key);
-        assert_eq!(after_ds.storage_backend, "portable-file");
+        assert_eq!(after_ds.storage_backend, "local-file");
 
         // Verify obfuscated storage on disk (raw secret must not appear in plaintext)
         let cred_file = credentials_file_path(&paths);
@@ -831,7 +819,7 @@ mod tests {
 
         // Verify retrieval de-obfuscates accurately
         let fetched =
-            get_api_key_for_paths(&paths, TranslationProviderKind::DeepSeek, false).unwrap();
+            get_api_key_for_paths(&paths, TranslationProviderKind::DeepSeek, true).unwrap();
         assert_eq!(fetched.as_deref(), Some("sk-deepseek-test-12345"));
 
         // Save CustomOpenAi key
@@ -839,7 +827,7 @@ mod tests {
             &paths,
             TranslationProviderKind::CustomOpenAi,
             "sk-custom-999",
-            false,
+            true,
         )
         .unwrap();
         assert!(after_custom.has_deep_seek_key);
@@ -847,11 +835,11 @@ mod tests {
 
         // Clear DeepSeek key
         let after_clear =
-            clear_api_key_for_paths(&paths, TranslationProviderKind::DeepSeek, false).unwrap();
+            clear_api_key_for_paths(&paths, TranslationProviderKind::DeepSeek, true).unwrap();
         assert!(!after_clear.has_deep_seek_key);
         assert!(after_clear.has_custom_api_key);
         assert_eq!(
-            get_api_key_for_paths(&paths, TranslationProviderKind::DeepSeek, false).unwrap(),
+            get_api_key_for_paths(&paths, TranslationProviderKind::DeepSeek, true).unwrap(),
             None
         );
 

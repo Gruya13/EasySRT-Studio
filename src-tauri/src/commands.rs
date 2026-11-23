@@ -39,6 +39,13 @@ pub async fn install_component(
 }
 
 #[tauri::command]
+pub async fn install_core_runtime(app: AppHandle) -> Result<SetupStatus, String> {
+    setup_manager::install_core_runtime(&app)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn install_recommended_bundle(app: AppHandle) -> Result<SetupStatus, String> {
     setup_manager::install_recommended_bundle(&app)
         .await

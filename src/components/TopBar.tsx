@@ -24,7 +24,10 @@ export function TopBar() {
 
   const lang = normalizeUiLanguage(config.uiLanguage);
   const t = getDictionary(lang);
-  const readyForOffline = setupStatus?.readyForOffline ?? false;
+  const needsSetupDot =
+    !(setupStatus?.coreRuntimeReady ?? false) ||
+    (config.translation.provider === "localLlama" &&
+      !(setupStatus?.hasLlmModel ?? false));
   const canExport = Boolean(activeProject && activeProject.cues.length > 0);
 
   useEffect(() => {
@@ -90,7 +93,7 @@ export function TopBar() {
           onClick={() => setSetupOpen(true)}
           title={t.topBar.setupWizard}
         >
-          {!readyForOffline && (
+          {needsSetupDot && (
             <span className="tb-quick-dot" aria-hidden="true" />
           )}
           <span>{lang === "en" ? "Models" : "Modeli"}</span>

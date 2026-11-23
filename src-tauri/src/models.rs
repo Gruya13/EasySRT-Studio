@@ -11,7 +11,6 @@ pub const EVENT_JOB_PROGRESS: &str = "job-progress";
 #[serde(rename_all = "camelCase")]
 pub enum StorageMode {
     Installed,
-    Portable,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -112,9 +111,12 @@ pub struct InstalledComponentStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SetupStatus {
+    pub platform: String,
     pub gpu: GpuInfo,
     pub storage: StoragePaths,
     pub components: Vec<InstalledComponentStatus>,
+    pub core_runtime_ready: bool,
+    pub has_llm_model: bool,
     pub ready_for_offline: bool,
     pub missing_required: Vec<String>,
 }
@@ -396,7 +398,6 @@ mod tests {
     #[test]
     fn enum_camel_case_serialization_matches_ts_contract() {
         assert_eq!(serde_json::to_value(StorageMode::Installed).unwrap(), json!("installed"));
-        assert_eq!(serde_json::to_value(StorageMode::Portable).unwrap(), json!("portable"));
 
         assert_eq!(serde_json::to_value(VramTier::CpuOnly).unwrap(), json!("cpuOnly"));
         assert_eq!(serde_json::to_value(VramTier::Vram4Gb).unwrap(), json!("vram4Gb"));

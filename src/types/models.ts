@@ -3,7 +3,7 @@
  * All Rust structs and enums use `#[serde(rename_all = "camelCase")]`.
  */
 
-export type StorageMode = "installed" | "portable";
+export type StorageMode = "installed";
 
 export interface StoragePaths {
   mode: StorageMode;
@@ -65,9 +65,12 @@ export interface InstalledComponentStatus {
 }
 
 export interface SetupStatus {
+  platform: string;
   gpu: GpuInfo;
   storage: StoragePaths;
   components: InstalledComponentStatus[];
+  coreRuntimeReady: boolean;
+  hasLlmModel: boolean;
   readyForOffline: boolean;
   missingRequired: string[];
 }

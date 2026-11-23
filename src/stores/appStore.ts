@@ -27,6 +27,7 @@ import {
   importCustomModel,
   importSubtitleFile,
   installComponent,
+  installCoreRuntime,
   installRecommendedBundle,
   listCheckpoints,
   loadCheckpoint,
@@ -195,6 +196,7 @@ interface AppStoreState {
   setCheckpointsOpen: (open: boolean) => void;
 
   runInstallComponent: (itemId: string) => Promise<void>;
+  runInstallCoreRuntime: () => Promise<void>;
   runInstallRecommendedBundle: () => Promise<void>;
   runImportCustomModel: (
     sourcePath: string,
@@ -417,7 +419,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     isExportOpen: false,
     isUpdaterOpen: false,
     isCheckpointsOpen: false,
-    appVersion: "0.1.1",
+    appVersion: "0.2.0",
     availableUpdateVersion: null,
     onlineConfirm: {
       open: false,
@@ -483,8 +485,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getApiKeyStatus(),
           listCheckpoints(),
           isTauriRuntime()
-            ? getVersion().catch(() => "0.1.1")
-            : Promise.resolve("0.1.1"),
+            ? getVersion().catch(() => "0.2.0")
+            : Promise.resolve("0.2.0"),
         ]);
 
         const config: AppConfig = {
@@ -500,8 +502,14 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           providerOverride: config.translation.provider,
         };
 
+        const hasCloudKey =
+          apiKeyStatus.hasDeepSeekKey || apiKeyStatus.hasCustomApiKey;
+        const hasTranslationReady =
+          setupStatus.hasLlmModel ||
+          (config.translation.provider !== "localLlama" && hasCloudKey);
         const shouldShowSetup =
-          !config.hasCompletedSetup && !setupStatus.readyForOffline;
+          !config.hasCompletedSetup &&
+          (!setupStatus.coreRuntimeReady || !hasTranslationReady);
 
         const stateBeforeInit = get();
 
@@ -616,8 +624,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }));
       try {
         await installComponent(itemId);
-        const setupStatus = await getSetupStatus();
-        set({ setupStatus });
+        const [setupStatus, config] = await Promise.all([
+          getSetupStatus(),
+          getConfig(),
+        ]);
+        set({ setupStatus, config });
       } catch (err) {
         set({
           banner: {
@@ -631,6 +642,34 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           delete next[itemId];
           return { installingItemIds: next };
         });
+      }
+    },
+
+    runInstallCoreRuntime: async () => {
+      set({ installingBundle: true });
+      try {
+        const setupStatus = await installCoreRuntime();
+        const config = await getConfig();
+        set({
+          setupStatus,
+          config,
+          banner: {
+            type: "success",
+            message:
+              config.uiLanguage === "en"
+                ? "Core AI runtime (FFmpeg, Whisper, llama.cpp, VAD) installed!"
+                : "Osnovni AI sistem (FFmpeg, Whisper, llama.cpp, VAD) je uspešno instaliran!",
+          },
+        });
+      } catch (err) {
+        set({
+          banner: {
+            type: "error",
+            message: err instanceof Error ? err.message : String(err),
+          },
+        });
+      } finally {
+        set({ installingBundle: false });
       }
     },
 

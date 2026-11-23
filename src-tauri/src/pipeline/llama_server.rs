@@ -44,33 +44,15 @@ fn configure_std_command_env(cmd: &mut Command, binary_path: &Path) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    if let Some(parent) = binary_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            cmd.current_dir(parent);
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            let mut dirs = vec![parent.to_string_lossy().to_string()];
-            if let Some(grandparent) = parent.parent() {
-                if !grandparent.as_os_str().is_empty() && grandparent != parent {
-                    dirs.push(grandparent.to_string_lossy().to_string());
-                }
-            }
-            let prefix = dirs.join(sep);
-
-            if let Ok(existing_path) = std::env::var("PATH") {
-                cmd.env("PATH", format!("{prefix}{sep}{existing_path}"));
-            } else {
-                cmd.env("PATH", &prefix);
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                if let Ok(existing_ld) = std::env::var("LD_LIBRARY_PATH") {
-                    cmd.env("LD_LIBRARY_PATH", format!("{prefix}:{existing_ld}"));
-                } else {
-                    cmd.env("LD_LIBRARY_PATH", &prefix);
-                }
-            }
-        }
+    let (dir, path_val, ld_val) = crate::pipeline::ffmpeg::build_binary_env_strings(binary_path);
+    if let Some(parent) = dir {
+        cmd.current_dir(parent);
+    }
+    if let Some(path) = path_val {
+        cmd.env("PATH", path);
+    }
+    if let Some(ld) = ld_val {
+        cmd.env("LD_LIBRARY_PATH", ld);
     }
 }
 

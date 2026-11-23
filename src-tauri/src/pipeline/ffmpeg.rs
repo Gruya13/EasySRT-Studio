@@ -30,6 +30,53 @@ pub fn compute_pcm16_mono_16khz_duration_ms(file_size: u64) -> u64 {
     (file_size.saturating_sub(WAV_HEADER_BYTES) * 1000) / BYTES_PER_SECOND_16KHZ_MONO_S16LE
 }
 
+/// Builds the effective `(current_dir, PATH, LD_LIBRARY_PATH)` strings for a binary,
+/// prioritizing its parent directory, grandparent directory, and bundled MSVC runtime DLLs on Windows.
+pub fn build_binary_env_strings(
+    binary_path: &Path,
+) -> (Option<PathBuf>, Option<String>, Option<String>) {
+    let Some(parent) = binary_path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+    else {
+        return (None, None, None);
+    };
+
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    let mut dirs: Vec<String> = vec![parent.to_string_lossy().into_owned()];
+
+    if let Some(grandparent) = parent
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty() && *p != parent)
+    {
+        dirs.push(grandparent.to_string_lossy().into_owned());
+    }
+
+    #[cfg(windows)]
+    if let Some(vcruntime_dir) = crate::setup_manager::find_bundled_vcruntime_dir(None) {
+        let vc_str = vcruntime_dir.to_string_lossy().into_owned();
+        if !dirs.iter().any(|d| d == &vc_str) {
+            dirs.push(vc_str);
+        }
+    }
+
+    let prefix = dirs.join(sep);
+    let path_val = match std::env::var("PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{prefix}{sep}{existing}"),
+        _ => prefix.clone(),
+    };
+
+    #[cfg(target_os = "linux")]
+    let ld_val = Some(match std::env::var("LD_LIBRARY_PATH") {
+        Ok(existing) if !existing.is_empty() => format!("{prefix}:{existing}"),
+        _ => prefix,
+    });
+    #[cfg(not(target_os = "linux"))]
+    let ld_val = None;
+
+    (Some(parent.to_path_buf()), Some(path_val), ld_val)
+}
+
 /// Configures environment variables (`PATH` and `LD_LIBRARY_PATH`) and Windows `CREATE_NO_WINDOW`
 /// on a `tokio::process::Command` so bundled DLLs/shared libraries next to the binary load cleanly.
 pub fn configure_command_env(cmd: &mut Command, binary_path: &Path) {
@@ -38,26 +85,15 @@ pub fn configure_command_env(cmd: &mut Command, binary_path: &Path) {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    if let Some(parent) = binary_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            cmd.current_dir(parent);
-            let sep = if cfg!(windows) { ";" } else { ":" };
-            let parent_str = parent.to_string_lossy();
-            if let Ok(existing_path) = std::env::var("PATH") {
-                cmd.env("PATH", format!("{parent_str}{sep}{existing_path}"));
-            } else {
-                cmd.env("PATH", parent_str.as_ref());
-            }
-
-            #[cfg(target_os = "linux")]
-            {
-                if let Ok(existing_ld) = std::env::var("LD_LIBRARY_PATH") {
-                    cmd.env("LD_LIBRARY_PATH", format!("{parent_str}:{existing_ld}"));
-                } else {
-                    cmd.env("LD_LIBRARY_PATH", parent_str.as_ref());
-                }
-            }
-        }
+    let (dir, path_val, ld_val) = build_binary_env_strings(binary_path);
+    if let Some(parent) = dir {
+        cmd.current_dir(parent);
+    }
+    if let Some(path) = path_val {
+        cmd.env("PATH", path);
+    }
+    if let Some(ld) = ld_val {
+        cmd.env("LD_LIBRARY_PATH", ld);
     }
 }
 

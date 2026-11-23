@@ -458,7 +458,7 @@ export function SettingsPanel() {
       ? `${setupStatus.gpu.gpuName} • ${setupStatus.gpu.vramMb} MB VRAM`
       : t.setup.noNvidiaGpu;
 
-  const storageMode = (setupStatus?.storage.mode ?? "portable").toUpperCase();
+  const storageMode = (setupStatus?.storage.mode ?? "installed").toUpperCase();
   const storageDataDir = setupStatus?.storage.dataDir ?? "./data";
 
   const tabs: Array<{ id: SettingsTabId; label: string }> = [

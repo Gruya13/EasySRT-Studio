@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
 
 const EMBEDDED_CATALOG_JSON: &str = include_str!("../resources/catalog.json");
+const CUDA_RUNTIME_DLLS: &[&str] = &["cublas64_12.dll", "cublasLt64_12.dll", "cudart64_12.dll"];
 
 /// Return the platform identifier matching `CatalogItem.platform`.
 pub fn current_platform_tag() -> &'static str {
@@ -39,20 +40,27 @@ pub fn load_embedded_catalog() -> Result<CatalogManifest> {
     Ok(manifest)
 }
 
-/// Load the component catalog, checking `<resource_dir>/resources/catalog.json` first if overridden
-/// on disk, and falling back to the compile-time embedded `catalog.json`.
-pub fn load_catalog(app: &AppHandle) -> Result<CatalogManifest> {
-    if let Ok(resource_dir) = app.path().resource_dir() {
-        for candidate in [
-            resource_dir.join("resources").join("catalog.json"),
-            resource_dir.join("catalog.json"),
-        ] {
-            if candidate.is_file() {
-                if let Ok(raw) = fs::read_to_string(&candidate) {
-                    if let Ok(manifest) = serde_json::from_str::<CatalogManifest>(&raw) {
-                        if !manifest.items.is_empty() {
-                            return Ok(manifest);
-                        }
+/// Load catalog from an explicit list of directories or executable siblings, falling back
+/// to the compile-time embedded `catalog.json`.
+pub fn load_catalog_from_dirs(resource_dir: Option<&Path>) -> Result<CatalogManifest> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(res_dir) = resource_dir {
+        candidates.push(res_dir.join("resources").join("catalog.json"));
+        candidates.push(res_dir.join("catalog.json"));
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("resources").join("catalog.json"));
+            candidates.push(exe_dir.join("catalog.json"));
+        }
+    }
+
+    for candidate in candidates {
+        if candidate.is_file() {
+            if let Ok(raw) = fs::read_to_string(&candidate) {
+                if let Ok(manifest) = serde_json::from_str::<CatalogManifest>(&raw) {
+                    if !manifest.items.is_empty() {
+                        return Ok(manifest);
                     }
                 }
             }
@@ -60,6 +68,111 @@ pub fn load_catalog(app: &AppHandle) -> Result<CatalogManifest> {
     }
 
     load_embedded_catalog()
+}
+
+/// Load the component catalog, checking `<resource_dir>/resources/catalog.json` first if overridden
+/// on disk, and falling back to the compile-time embedded `catalog.json`.
+pub fn load_catalog(app: &AppHandle) -> Result<CatalogManifest> {
+    let res_dir = app.path().resource_dir().ok();
+    load_catalog_from_dirs(res_dir.as_deref())
+}
+
+/// Find the directory containing bundled MSVC runtime `.dll` files (`resources/vcruntime`).
+pub fn find_bundled_vcruntime_dir(resource_dir: Option<&Path>) -> Option<PathBuf> {
+    let mut candidates: Vec<PathBuf> = Vec::new();
+    if let Some(res_dir) = resource_dir {
+        candidates.push(res_dir.join("resources").join("vcruntime"));
+        candidates.push(res_dir.join("vcruntime"));
+    }
+    if let Ok(exe_path) = std::env::current_exe() {
+        if let Some(exe_dir) = exe_path.parent() {
+            candidates.push(exe_dir.join("resources").join("vcruntime"));
+            candidates.push(exe_dir.join("vcruntime"));
+        }
+    }
+
+    for dir in candidates {
+        if !dir.is_dir() {
+            continue;
+        }
+        if let Ok(entries) = fs::read_dir(&dir) {
+            let has_dll = entries.flatten().any(|entry| {
+                let p = entry.path();
+                p.is_file()
+                    && p.extension()
+                        .and_then(|e| e.to_str())
+                        .map(|e| e.eq_ignore_ascii_case("dll"))
+                        .unwrap_or(false)
+            });
+            if has_dll {
+                return Some(dir);
+            }
+        }
+    }
+    None
+}
+
+/// Copy any MSVC runtime `.dll` files from `src_dir` into `target_dir` when missing or mismatched.
+pub fn copy_vcruntime_dlls_from_dir(src_dir: &Path, target_dir: &Path) -> Result<usize> {
+    if !src_dir.is_dir() {
+        return Ok(0);
+    }
+    fs::create_dir_all(target_dir).with_context(|| {
+        format!(
+            "Failed to create vcruntime destination directory: {}",
+            target_dir.display()
+        )
+    })?;
+
+    let mut copied = 0usize;
+    for entry in fs::read_dir(src_dir).with_context(|| {
+        format!(
+            "Failed to read bundled vcruntime directory: {}",
+            src_dir.display()
+        )
+    })? {
+        let entry = entry?;
+        let src_path = entry.path();
+        let is_dll = src_path.is_file()
+            && src_path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("dll"))
+                .unwrap_or(false);
+        if !is_dll {
+            continue;
+        }
+
+        let Some(file_name) = src_path.file_name() else {
+            continue;
+        };
+        let dst_path = target_dir.join(file_name);
+        let src_len = fs::metadata(&src_path).map(|m| m.len()).unwrap_or(0);
+        let dst_len = fs::metadata(&dst_path).map(|m| m.len()).unwrap_or(u64::MAX);
+        if !dst_path.is_file() || dst_len != src_len {
+            fs::copy(&src_path, &dst_path).with_context(|| {
+                format!(
+                    "Failed to copy {} to {}",
+                    src_path.display(),
+                    dst_path.display()
+                )
+            })?;
+            copied += 1;
+        }
+    }
+
+    Ok(copied)
+}
+
+/// Ensure bundled Windows MSVC runtime DLLs sit directly next to an extracted executable.
+pub fn ensure_windows_vcruntime_in_dir(
+    target_dir: &Path,
+    resource_dir: Option<&Path>,
+) -> Result<usize> {
+    let Some(src_dir) = find_bundled_vcruntime_dir(resource_dir) else {
+        return Ok(0);
+    };
+    copy_vcruntime_dlls_from_dir(&src_dir, target_dir)
 }
 
 /// Extract the filename segment from a download URL.
@@ -250,8 +363,9 @@ pub fn check_component_installed(
     }
 }
 
-/// Select the recommended bundle item IDs for a given GPU profile and platform (`"windows-x64"` or `"linux-x64"`).
-pub fn select_recommended_bundle_ids(gpu: &GpuInfo, platform: &str) -> Vec<String> {
+/// Select only the core AI runtime components (FFmpeg, CUDA/CPU binaries, Whisper, llama.cpp, VAD,
+/// and default Whisper ASR model) without downloading a heavy local LLM translation model.
+pub fn select_core_runtime_bundle_ids(gpu: &GpuInfo, platform: &str) -> Vec<String> {
     let mut ids = Vec::new();
     let use_gpu_binaries = gpu.has_nvidia && gpu.recommended_tier != VramTier::CpuOnly;
 
@@ -284,13 +398,22 @@ pub fn select_recommended_bundle_ids(gpu: &GpuInfo, platform: &str) -> Vec<Strin
     };
     ids.push(whisper_model.to_string());
 
-    let llm_model = match gpu.recommended_tier {
+    ids
+}
+
+/// Select the recommended local LLM translation model ID for a given GPU profile.
+pub fn select_recommended_llm_id(gpu: &GpuInfo) -> &'static str {
+    match gpu.recommended_tier {
         VramTier::Vram12GbPlus => "llm-gemma4-12b-qat",
         VramTier::Vram8Gb => "llm-gemma4-e4b-qat",
         VramTier::Vram4Gb | VramTier::CpuOnly => "llm-gemma3-4b-q4km",
-    };
-    ids.push(llm_model.to_string());
+    }
+}
 
+/// Select the complete recommended offline bundle (core runtime + recommended LLM translator).
+pub fn select_recommended_bundle_ids(gpu: &GpuInfo, platform: &str) -> Vec<String> {
+    let mut ids = select_core_runtime_bundle_ids(gpu, platform);
+    ids.push(select_recommended_llm_id(gpu).to_string());
     ids
 }
 
@@ -325,14 +448,8 @@ pub fn compute_setup_status(
                 .any(|cm| cm.kind == kind && Path::new(&cm.path).is_file())
     };
 
-    let recommended = select_recommended_bundle_ids(&gpu, platform);
-    let mut missing_required = Vec::new();
-
-    for rec_id in &recommended {
-        let Some(item) = catalog.items.iter().find(|i| i.id == *rec_id) else {
-            continue;
-        };
-        let satisfied = match item.kind {
+    let is_item_satisfied = |item: &CatalogItem| -> bool {
+        match item.kind {
             CatalogItemKind::Ffmpeg => {
                 has_kind_for_platform(CatalogItemKind::Ffmpeg)
                     || find_in_system_path("ffmpeg").is_some()
@@ -342,7 +459,7 @@ pub fn compute_setup_status(
                     || find_in_system_path("whisper-cli").is_some()
             }
             CatalogItemKind::CudaRuntime => {
-                // Only required if llama-win-cuda is used or no CPU llama is installed
+                // Only required when llama CUDA is present or CPU llama is not installed
                 is_installed("cudart-win-cuda12.4") || is_installed("llama-win-cpu")
             }
             CatalogItemKind::LlamaBin => {
@@ -352,19 +469,37 @@ pub fn compute_setup_status(
             CatalogItemKind::VadModel => has_kind_for_platform(CatalogItemKind::VadModel),
             CatalogItemKind::WhisperModel => has_kind_for_platform(CatalogItemKind::WhisperModel),
             CatalogItemKind::LlmModel => has_kind_for_platform(CatalogItemKind::LlmModel),
-        };
+        }
+    };
 
-        if !satisfied {
-            missing_required.push(rec_id.clone());
+    let core_ids = select_core_runtime_bundle_ids(&gpu, platform);
+    let mut missing_required = Vec::new();
+    let mut core_runtime_ready = true;
+
+    for core_id in &core_ids {
+        let Some(item) = catalog.items.iter().find(|i| i.id == *core_id) else {
+            continue;
+        };
+        if !is_item_satisfied(item) {
+            core_runtime_ready = false;
+            missing_required.push(core_id.clone());
         }
     }
 
-    let ready_for_offline = missing_required.is_empty();
+    let has_llm_model = has_kind_for_platform(CatalogItemKind::LlmModel);
+    if !has_llm_model {
+        missing_required.push(select_recommended_llm_id(&gpu).to_string());
+    }
+
+    let ready_for_offline = core_runtime_ready && has_llm_model;
 
     SetupStatus {
+        platform: platform.to_string(),
         gpu,
         storage,
         components,
+        core_runtime_ready,
+        has_llm_model,
         ready_for_offline,
         missing_required,
     }
@@ -538,14 +673,13 @@ fn move_file_across_fs(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn emit_download_progress(
-    app: &AppHandle,
+fn make_progress_event(
     item_id: &str,
     downloaded_bytes: u64,
     total_bytes: u64,
     stage: &str,
     message: String,
-) {
+) -> DownloadProgressEvent {
     let percent = if total_bytes > 0 {
         ((downloaded_bytes as f64 / total_bytes as f64) * 100.0).clamp(0.0, 100.0)
     } else if stage == "completed" {
@@ -554,34 +688,118 @@ fn emit_download_progress(
         0.0
     };
 
-    let _ = app.emit(
-        EVENT_DOWNLOAD_PROGRESS,
-        DownloadProgressEvent {
-            item_id: item_id.to_string(),
-            downloaded_bytes,
-            total_bytes,
-            percent,
-            stage: stage.to_string(),
-            message,
-        },
-    );
+    DownloadProgressEvent {
+        item_id: item_id.to_string(),
+        downloaded_bytes,
+        total_bytes,
+        percent,
+        stage: stage.to_string(),
+        message,
+    }
 }
 
-/// Download, checksum-verify, and extract/install a single catalog component by `item_id`.
-pub async fn install_component(
-    app: &AppHandle,
-    item_id: &str,
-) -> Result<InstalledComponentStatus> {
-    let mut config = storage::load_config(app)?;
-    let paths = storage::resolve_storage_paths(app, config.models_dir_override.as_deref())?;
-    let catalog = load_catalog(app)?;
+/// Reuse `cublas64_12.dll`, `cublasLt64_12.dll`, and `cudart64_12.dll` already extracted by
+/// `whisper-win-cuda` so Windows CUDA installs do not download the 391 MB runtime ZIP twice.
+pub fn try_reuse_cuda_dlls_from_whisper(paths: &StoragePaths) -> Result<bool> {
+    let whisper_release = Path::new(&paths.bin_dir).join("whisper").join("Release");
+    let llama_dir = Path::new(&paths.bin_dir).join("llama");
 
+    let all_present = CUDA_RUNTIME_DLLS.iter().all(|dll| {
+        let p = whisper_release.join(dll);
+        fs::metadata(&p).map(|m| m.is_file() && m.len() > 0).unwrap_or(false)
+    });
+    if !all_present {
+        return Ok(false);
+    }
+
+    fs::create_dir_all(&llama_dir).with_context(|| {
+        format!(
+            "Failed to create llama binary directory: {}",
+            llama_dir.display()
+        )
+    })?;
+
+    for dll in CUDA_RUNTIME_DLLS {
+        let src = whisper_release.join(dll);
+        let dst = llama_dir.join(dll);
+        let src_len = fs::metadata(&src)?.len();
+        let dst_len = fs::metadata(&dst).map(|m| m.len()).unwrap_or(u64::MAX);
+        if !dst.is_file() || dst_len != src_len {
+            fs::copy(&src, &dst).with_context(|| {
+                format!("Failed copying {} to {}", src.display(), dst.display())
+            })?;
+        }
+    }
+
+    Ok(true)
+}
+
+fn ensure_vcruntime_for_item_dir(
+    item: &CatalogItem,
+    paths: &StoragePaths,
+    resource_dir: Option<&Path>,
+) {
+    if item.platform != "windows-x64"
+        || !matches!(
+            item.kind,
+            CatalogItemKind::WhisperBin | CatalogItemKind::LlamaBin
+        )
+    {
+        return;
+    }
+
+    let exe_path = expected_item_path(item, paths);
+    if let Some(exe_parent) = exe_path.parent() {
+        let _ = ensure_windows_vcruntime_in_dir(exe_parent, resource_dir);
+    }
+}
+
+fn remove_stale_cpu_cuda_dlls(item: &CatalogItem, paths: &StoragePaths) {
+    if item.id == "whisper-win-cpu" || item.id == "llama-win-cpu" {
+        let subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
+        for rel in ["ggml-cuda.dll", "Release/ggml-cuda.dll"] {
+            let _ = fs::remove_file(subdir.join(rel));
+        }
+    }
+}
+
+/// Download, checksum-verify, and extract/install a single catalog component into explicit storage
+/// paths, reporting progress through `on_progress` (shared by Tauri UI and headless CLI bootstrap).
+pub async fn install_component_to_paths<F>(
+    catalog: &CatalogManifest,
+    paths: &StoragePaths,
+    config_path: &Path,
+    resource_dir: Option<&Path>,
+    item_id: &str,
+    mut on_progress: F,
+) -> Result<InstalledComponentStatus>
+where
+    F: FnMut(DownloadProgressEvent),
+{
+    let mut config = storage::load_config_from_path(config_path)?;
     let item = catalog
         .items
         .iter()
         .find(|i| i.id == item_id)
         .ok_or_else(|| anyhow!("Catalog item '{}' not found", item_id))?
         .clone();
+
+    if item.id == "cudart-win-cuda12.4" && try_reuse_cuda_dlls_from_whisper(paths)? {
+        let target_subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
+        let marker = marker_file_path(&target_subdir, &item.id);
+        fs::write(&marker, item.version.as_bytes())?;
+        let status = check_component_installed(&item, &catalog.items, paths);
+        if status.installed {
+            on_progress(make_progress_event(
+                &item.id,
+                item.size_bytes,
+                item.size_bytes,
+                "completed",
+                format!("{} je preuzet iz lokalnog Whisper CUDA paketa.", item.name),
+            ));
+            return Ok(status);
+        }
+    }
 
     let downloads_dir = Path::new(&paths.data_dir).join("downloads");
     fs::create_dir_all(&downloads_dir).with_context(|| {
@@ -598,18 +816,17 @@ pub async fn install_component(
         existing_len = 0;
     }
 
-    emit_download_progress(
-        app,
+    on_progress(make_progress_event(
         &item.id,
         existing_len,
         item.size_bytes,
         "downloading",
         format!("Preuzimanje {}...", item.name),
-    );
+    ));
 
     if item.size_bytes == 0 || existing_len < item.size_bytes {
         let client = reqwest::Client::builder()
-            .user_agent("EasySRT-Studio/0.1.0")
+            .user_agent("EasySRT-Studio/0.2.0")
             .connect_timeout(Duration::from_secs(30))
             .build()
             .context("Failed to initialize HTTP download client")?;
@@ -683,14 +900,13 @@ pub async fn install_component(
             downloaded_bytes += chunk.len() as u64;
 
             if last_emit.elapsed() >= Duration::from_millis(100) {
-                emit_download_progress(
-                    app,
+                on_progress(make_progress_event(
                     &item.id,
                     downloaded_bytes,
                     total_bytes,
                     "downloading",
                     format!("Preuzimanje {}...", item.name),
-                );
+                ));
                 last_emit = Instant::now();
             }
         }
@@ -700,14 +916,13 @@ pub async fn install_component(
     // Verify SHA-256 checksum
     if let Some(ref expected_sha) = item.sha256 {
         if !expected_sha.trim().is_empty() {
-            emit_download_progress(
-                app,
+            on_progress(make_progress_event(
                 &item.id,
                 item.size_bytes,
                 item.size_bytes,
                 "verifying",
                 format!("Provera SHA-256 potpisa za {}...", item.name),
-            );
+            ));
             if let Err(err) = verify_file_sha256(&part_path, expected_sha) {
                 let _ = fs::remove_file(&part_path);
                 return Err(err);
@@ -716,18 +931,18 @@ pub async fn install_component(
     }
 
     // Extract or move into target location
-    emit_download_progress(
-        app,
+    on_progress(make_progress_event(
         &item.id,
         item.size_bytes,
         item.size_bytes,
         "extracting",
         format!("Instalacija {}...", item.name),
-    );
+    ));
 
     if is_binary_kind(item.kind) {
         let target_subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
         fs::create_dir_all(&target_subdir)?;
+        remove_stale_cpu_cuda_dlls(&item, paths);
 
         match item.archive_type {
             ArchiveType::Zip => {
@@ -739,7 +954,7 @@ pub async fn install_component(
                 let _ = fs::remove_file(&part_path);
             }
             ArchiveType::Raw => {
-                let dest_path = expected_item_path(&item, &paths);
+                let dest_path = expected_item_path(&item, paths);
                 move_file_across_fs(&part_path, &dest_path)?;
                 set_executable_permission(&dest_path)?;
             }
@@ -749,6 +964,8 @@ pub async fn install_component(
             let exe_path = target_subdir.join(rel_exe);
             let _ = set_executable_permission(&exe_path);
         }
+
+        ensure_vcruntime_for_item_dir(&item, paths, resource_dir);
 
         // Remove competing markers of the same CatalogItemKind in this subdir
         for other in &catalog.items {
@@ -765,7 +982,7 @@ pub async fn install_component(
         let marker = marker_file_path(&target_subdir, &item.id);
         fs::write(&marker, item.version.as_bytes())?;
     } else {
-        let dest_path = expected_item_path(&item, &paths);
+        let dest_path = expected_item_path(&item, paths);
         move_file_across_fs(&part_path, &dest_path)?;
 
         // Auto-select newly installed model if none is currently active
@@ -778,29 +995,136 @@ pub async fn install_component(
             config_changed = true;
         }
         if config_changed {
-            let _ = storage::save_config(app, &config);
+            let _ = storage::save_config_to_path(config_path, &config);
         }
     }
 
-    let status = check_component_installed(&item, &catalog.items, &paths);
+    let status = check_component_installed(&item, &catalog.items, paths);
     if !status.installed {
         return Err(anyhow!(
             "Component '{}' failed post-install verification at expected path {}",
             item.id,
-            expected_item_path(&item, &paths).display()
+            expected_item_path(&item, paths).display()
         ));
     }
 
-    emit_download_progress(
-        app,
+    on_progress(make_progress_event(
         &item.id,
         item.size_bytes,
         item.size_bytes,
         "completed",
         format!("{} je uspešno instaliran.", item.name),
-    );
+    ));
 
     Ok(status)
+}
+
+/// Download, checksum-verify, and extract/install a single catalog component by `item_id`.
+pub async fn install_component(
+    app: &AppHandle,
+    item_id: &str,
+) -> Result<InstalledComponentStatus> {
+    let config = storage::load_config(app)?;
+    let paths = storage::resolve_storage_paths(app, config.models_dir_override.as_deref())?;
+    let catalog = load_catalog(app)?;
+    let resource_dir = app.path().resource_dir().ok();
+    let app_handle = app.clone();
+
+    install_component_to_paths(
+        &catalog,
+        &paths,
+        Path::new(&paths.config_path),
+        resource_dir.as_deref(),
+        item_id,
+        |evt| {
+            let _ = app_handle.emit(EVENT_DOWNLOAD_PROGRESS, evt);
+        },
+    )
+    .await
+}
+
+/// Install the core AI runtime bundle (FFmpeg, CUDA/CPU, Whisper, llama.cpp, VAD, default Whisper
+/// model) into explicit storage paths without installing large translation LLMs.
+pub async fn install_core_runtime_to_paths<F>(
+    catalog: &CatalogManifest,
+    gpu: GpuInfo,
+    paths: &StoragePaths,
+    config_path: &Path,
+    resource_dir: Option<&Path>,
+    platform: &str,
+    mut on_progress: F,
+) -> Result<SetupStatus>
+where
+    F: FnMut(DownloadProgressEvent),
+{
+    let bundle_ids = select_core_runtime_bundle_ids(&gpu, platform);
+    let mut installed_whisper_id: Option<String> = None;
+
+    for item_id in &bundle_ids {
+        let Some(item) = catalog.items.iter().find(|i| i.id == *item_id) else {
+            continue;
+        };
+
+        if item.kind == CatalogItemKind::WhisperModel {
+            installed_whisper_id = Some(item.id.clone());
+        }
+
+        let current_status = check_component_installed(item, &catalog.items, paths);
+        if !current_status.installed {
+            install_component_to_paths(
+                catalog,
+                paths,
+                config_path,
+                resource_dir,
+                item_id,
+                &mut on_progress,
+            )
+            .await?;
+        } else {
+            // Repair bundled MSVC runtime DLLs beside already-extracted Windows binaries
+            ensure_vcruntime_for_item_dir(item, paths, resource_dir);
+        }
+    }
+
+    let mut updated_config = storage::load_config_from_path(config_path)?;
+    if updated_config.active_whisper_model_id.is_none() {
+        if let Some(w_id) = installed_whisper_id {
+            updated_config.active_whisper_model_id = Some(w_id);
+        }
+    }
+    storage::save_config_to_path(config_path, &updated_config)?;
+
+    Ok(compute_setup_status(
+        catalog,
+        gpu,
+        paths.clone(),
+        &updated_config.custom_models,
+        platform,
+    ))
+}
+
+/// Install missing core runtime components inside the running Tauri application.
+pub async fn install_core_runtime(app: &AppHandle) -> Result<SetupStatus> {
+    let gpu = hardware::detect_gpu();
+    let platform = current_platform_tag();
+    let config = storage::load_config(app)?;
+    let paths = storage::resolve_storage_paths(app, config.models_dir_override.as_deref())?;
+    let catalog = load_catalog(app)?;
+    let resource_dir = app.path().resource_dir().ok();
+    let app_handle = app.clone();
+
+    install_core_runtime_to_paths(
+        &catalog,
+        gpu,
+        &paths,
+        Path::new(&paths.config_path),
+        resource_dir.as_deref(),
+        platform,
+        |evt| {
+            let _ = app_handle.emit(EVENT_DOWNLOAD_PROGRESS, evt);
+        },
+    )
+    .await
 }
 
 /// Install the complete recommended offline bundle for the detected GPU tier and platform,
@@ -813,6 +1137,8 @@ pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> 
     let config = storage::load_config(app)?;
     let paths = storage::resolve_storage_paths(app, config.models_dir_override.as_deref())?;
     let catalog = load_catalog(app)?;
+    let resource_dir = app.path().resource_dir().ok();
+    let app_handle = app.clone();
 
     let mut installed_whisper_id: Option<String> = None;
     let mut installed_llm_id: Option<String> = None;
@@ -830,7 +1156,19 @@ pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> 
 
         let current_status = check_component_installed(item, &catalog.items, &paths);
         if !current_status.installed {
-            install_component(app, item_id).await?;
+            install_component_to_paths(
+                &catalog,
+                &paths,
+                Path::new(&paths.config_path),
+                resource_dir.as_deref(),
+                item_id,
+                |evt| {
+                    let _ = app_handle.emit(EVENT_DOWNLOAD_PROGRESS, evt);
+                },
+            )
+            .await?;
+        } else {
+            ensure_vcruntime_for_item_dir(item, &paths, resource_dir.as_deref());
         }
     }
 
@@ -845,6 +1183,168 @@ pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> 
     storage::save_config(app, &updated_config)?;
 
     get_setup_status(app)
+}
+
+/// Run headless core runtime bootstrap (`--install-runtime`) invoked by NSIS `NSIS_HOOK_POSTINSTALL`.
+/// Logs flushed ASCII progress to stdout and `<data_dir>/setup-bootstrap.log`, returning `0` on success.
+pub fn run_cli_bootstrap(args: &[String]) -> i32 {
+    let mut data_dir_override: Option<PathBuf> = None;
+    let mut force_cpu = false;
+    let mut force_cuda = false;
+
+    let mut idx = 0usize;
+    while idx < args.len() {
+        let arg = args[idx].as_str();
+        if arg == "--data-dir" {
+            if let Some(val) = args.get(idx + 1) {
+                if !val.trim().is_empty() {
+                    data_dir_override = Some(PathBuf::from(val));
+                }
+                idx += 1;
+            }
+        } else if let Some(val) = arg.strip_prefix("--data-dir=") {
+            if !val.trim().is_empty() {
+                data_dir_override = Some(PathBuf::from(val));
+            }
+        } else if arg == "--force-cpu" {
+            force_cpu = true;
+        } else if arg == "--force-cuda" {
+            force_cuda = true;
+        }
+        idx += 1;
+    }
+
+    let root_dir = data_dir_override.unwrap_or_else(storage::default_installed_root_dir);
+    let paths = match storage::resolve_storage_paths_from_root(
+        &root_dir,
+        crate::models::StorageMode::Installed,
+        None,
+    ) {
+        Ok(p) => p,
+        Err(err) => {
+            eprintln!("[EasySRT Setup] Failed to initialize storage directories: {err:#}");
+            return 1;
+        }
+    };
+
+    let log_path = Path::new(&paths.data_dir).join("setup-bootstrap.log");
+    let mut log_file = OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&log_path)
+        .ok();
+
+    let mut write_log = |line: &str| {
+        println!("{line}");
+        let _ = std::io::stdout().flush();
+        if let Some(ref mut f) = log_file {
+            let _ = writeln!(f, "{line}");
+            let _ = f.flush();
+        }
+    };
+
+    write_log(&format!(
+        "[EasySRT Setup] Starting core runtime bootstrap in {}",
+        paths.root_dir
+    ));
+
+    let catalog = match load_catalog_from_dirs(None) {
+        Ok(c) => c,
+        Err(err) => {
+            write_log(&format!("[EasySRT Setup] Failed to load catalog: {err:#}"));
+            return 1;
+        }
+    };
+
+    let mut gpu = if force_cpu {
+        GpuInfo {
+            has_nvidia: false,
+            gpu_name: None,
+            vram_mb: 0,
+            recommended_tier: VramTier::CpuOnly,
+        }
+    } else if force_cuda {
+        GpuInfo {
+            has_nvidia: true,
+            gpu_name: Some("Simulated NVIDIA CUDA GPU".to_string()),
+            vram_mb: 8192,
+            recommended_tier: VramTier::Vram8Gb,
+        }
+    } else {
+        hardware::detect_gpu()
+    };
+
+    if gpu.has_nvidia && gpu.recommended_tier == VramTier::CpuOnly {
+        write_log("[EasySRT Setup] NVIDIA GPU detected with < 3500 MB VRAM; using CPU runtime.");
+        gpu.recommended_tier = VramTier::CpuOnly;
+    } else if gpu.has_nvidia {
+        write_log(&format!(
+            "[EasySRT Setup] Detected GPU: {} ({} MB VRAM) -> CUDA 12.4 bundle",
+            gpu.gpu_name.as_deref().unwrap_or("NVIDIA GPU"),
+            gpu.vram_mb
+        ));
+    } else {
+        write_log("[EasySRT Setup] No NVIDIA GPU detected -> CPU runtime bundle");
+    }
+
+    let rt = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(err) => {
+            write_log(&format!(
+                "[EasySRT Setup] Failed to create async runtime: {err:#}"
+            ));
+            return 1;
+        }
+    };
+
+    let platform = current_platform_tag();
+    let mut last_item = String::new();
+    let mut last_stage = String::new();
+    let mut last_bucket = i32::MIN;
+
+    let result = rt.block_on(install_core_runtime_to_paths(
+        &catalog,
+        gpu,
+        &paths,
+        Path::new(&paths.config_path),
+        None,
+        platform,
+        |evt| {
+            let bucket = (evt.percent / 10.0).floor() as i32;
+            let stage_changed = evt.item_id != last_item || evt.stage != last_stage;
+            if stage_changed || (evt.stage == "downloading" && bucket > last_bucket) {
+                last_item = evt.item_id.clone();
+                last_stage = evt.stage.clone();
+                last_bucket = bucket;
+                write_log(&format!(
+                    "[EasySRT Setup] [{}] {} ({:.0}%)",
+                    evt.item_id, evt.stage, evt.percent
+                ));
+            }
+        },
+    ));
+
+    match result {
+        Ok(status) if status.core_runtime_ready => {
+            write_log("[EasySRT Setup] Core AI runtime ready (FFmpeg, Whisper, llama.cpp, VAD).");
+            0
+        }
+        Ok(status) => {
+            write_log(&format!(
+                "[EasySRT Setup] Core runtime incomplete. Missing: {:?}",
+                status.missing_required
+            ));
+            1
+        }
+        Err(err) => {
+            write_log(&format!("[EasySRT Setup] ERROR: {err:#}"));
+            1
+        }
+    }
 }
 
 /// Import a user-supplied `.bin` or `.gguf` model file into `AppConfig.custom_models`.
@@ -1380,7 +1880,7 @@ mod tests {
     fn custom_model_import_and_active_model_resolution() {
         let dir = make_temp_dir("custom_model");
         let paths =
-            storage::resolve_storage_paths_from_root(&dir, StorageMode::Portable, None).unwrap();
+            storage::resolve_storage_paths_from_root(&dir, StorageMode::Installed, None).unwrap();
         let catalog = load_embedded_catalog().unwrap();
         let mut config = AppConfig::default();
 
@@ -1407,6 +1907,125 @@ mod tests {
         )
         .unwrap();
         assert_eq!(resolved, fs::canonicalize(&fake_gguf).unwrap());
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn core_runtime_bundle_excludes_llm_and_includes_cuda_on_nvidia() {
+        let catalog = load_embedded_catalog().unwrap();
+        let gpu_4gb = GpuInfo {
+            has_nvidia: true,
+            gpu_name: Some("NVIDIA GeForce RTX 3050 Laptop GPU".to_string()),
+            vram_mb: 4096,
+            recommended_tier: VramTier::Vram4Gb,
+        };
+        let core_ids = select_core_runtime_bundle_ids(&gpu_4gb, "windows-x64");
+        assert_eq!(
+            core_ids,
+            vec![
+                "ffmpeg-win-x64",
+                "whisper-win-cuda",
+                "cudart-win-cuda12.4",
+                "llama-win-cuda",
+                "vad-silero-v6.2.0",
+                "whisper-large-v3-turbo-q5_0",
+            ]
+        );
+        assert!(!core_ids.iter().any(|id| id.starts_with("llm-")));
+
+        let cpu_only = GpuInfo {
+            has_nvidia: false,
+            gpu_name: None,
+            vram_mb: 0,
+            recommended_tier: VramTier::CpuOnly,
+        };
+        let win_cpu_core = select_core_runtime_bundle_ids(&cpu_only, "windows-x64");
+        assert_eq!(
+            win_cpu_core,
+            vec![
+                "ffmpeg-win-x64",
+                "whisper-win-cpu",
+                "llama-win-cpu",
+                "vad-silero-v6.2.0",
+                "whisper-medium-q5_0",
+            ]
+        );
+
+        let dir = make_temp_dir("core_status");
+        let paths =
+            storage::resolve_storage_paths_from_root(&dir, StorageMode::Installed, None).unwrap();
+        for core_id in &win_cpu_core {
+            let item = catalog.items.iter().find(|i| i.id == *core_id).unwrap();
+            let target = expected_item_path(item, &paths);
+            if let Some(parent) = target.parent() {
+                fs::create_dir_all(parent).unwrap();
+            }
+            let payload = if item.size_bytes > 0 && !is_binary_kind(item.kind) {
+                // Sparse/sized dummy model check isn't needed if we set len on file
+                let f = File::create(&target).unwrap();
+                f.set_len(item.size_bytes).unwrap();
+                continue;
+            } else {
+                b"bin".as_slice()
+            };
+            fs::write(&target, payload).unwrap();
+            if is_binary_kind(item.kind) {
+                let subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
+                fs::write(marker_file_path(&subdir, &item.id), b"1").unwrap();
+            }
+        }
+
+        let status = compute_setup_status(&catalog, cpu_only, paths, &[], "windows-x64");
+        assert_eq!(status.platform, "windows-x64");
+        assert!(status.core_runtime_ready);
+        assert!(!status.has_llm_model);
+        assert!(!status.ready_for_offline);
+        assert_eq!(status.missing_required, vec!["llm-gemma3-4b-q4km"]);
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn reuses_cuda_runtime_dlls_from_whisper_dir_when_present() {
+        let dir = make_temp_dir("reuse_cuda");
+        let paths =
+            storage::resolve_storage_paths_from_root(&dir, StorageMode::Installed, None).unwrap();
+        assert!(!try_reuse_cuda_dlls_from_whisper(&paths).unwrap());
+
+        let whisper_release = Path::new(&paths.bin_dir).join("whisper").join("Release");
+        fs::create_dir_all(&whisper_release).unwrap();
+        for dll in CUDA_RUNTIME_DLLS {
+            fs::write(whisper_release.join(dll), b"cuda-dll-bytes").unwrap();
+        }
+
+        assert!(try_reuse_cuda_dlls_from_whisper(&paths).unwrap());
+        let llama_dir = Path::new(&paths.bin_dir).join("llama");
+        for dll in CUDA_RUNTIME_DLLS {
+            assert_eq!(fs::read(llama_dir.join(dll)).unwrap(), b"cuda-dll-bytes");
+        }
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn copies_vcruntime_dlls_into_target_directory() {
+        let dir = make_temp_dir("vcruntime_copy");
+        let src = dir.join("vcruntime");
+        let dst = dir.join("target_bin");
+        fs::create_dir_all(&src).unwrap();
+        fs::write(src.join("vcruntime140.dll"), b"vcrt140").unwrap();
+        fs::write(src.join("msvcp140.dll"), b"msvcp140").unwrap();
+        fs::write(src.join("README.txt"), b"ignore-non-dll").unwrap();
+
+        let copied = copy_vcruntime_dlls_from_dir(&src, &dst).unwrap();
+        assert_eq!(copied, 2);
+        assert!(dst.join("vcruntime140.dll").is_file());
+        assert!(dst.join("msvcp140.dll").is_file());
+        assert!(!dst.join("README.txt").exists());
+
+        // Second pass skips unchanged DLLs cleanly
+        assert_eq!(copy_vcruntime_dlls_from_dir(&src, &dst).unwrap(), 0);
 
         let _ = fs::remove_dir_all(&dir);
     }

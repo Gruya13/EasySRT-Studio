@@ -10,8 +10,9 @@ target/
 src-tauri/target/
 src-tauri/gen/
 
-# Local runtime / portable test data
+# Local runtime / test data
 portable.flag
+src-tauri/resources/vcruntime/*.dll
 mockup/
 *.log
 npm-debug.log*

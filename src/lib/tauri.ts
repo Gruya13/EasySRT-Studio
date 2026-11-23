@@ -54,6 +54,13 @@ export function installComponent(
   return invoke<InstalledComponentStatus>("install_component", { itemId });
 }
 
+export function installCoreRuntime(): Promise<SetupStatus> {
+  if (!isTauriRuntime()) {
+    return browserFallback.installCoreRuntime();
+  }
+  return invoke<SetupStatus>("install_core_runtime");
+}
+
 export function installRecommendedBundle(): Promise<SetupStatus> {
   if (!isTauriRuntime()) {
     return browserFallback.installRecommendedBundle();
