@@ -930,13 +930,21 @@ where
         ))
     })?;
 
-    let mut stderr_pipe = child.stderr.take();
+    let stderr_pipe = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
     let mut tick_count: u64 = 0;
 
     let status = loop {
         if cancel_flag.load(Ordering::SeqCst) {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            stderr_task.abort();
             let _ = fs::remove_file(&expected_json_path);
             return Err(WhisperExecError::Other(anyhow!("Job cancelled")));
         }
@@ -952,6 +960,7 @@ where
                 tokio::time::sleep(Duration::from_millis(50)).await;
             }
             Err(err) => {
+                stderr_task.abort();
                 return Err(WhisperExecError::Other(anyhow!(
                     "Failed polling whisper-cli process: {err}"
                 )));
@@ -959,10 +968,7 @@ where
         }
     };
 
-    let mut stderr_buf = String::new();
-    if let Some(mut pipe) = stderr_pipe.take() {
-        let _ = pipe.read_to_string(&mut stderr_buf).await;
-    }
+    let stderr_buf = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
         let _ = fs::remove_file(&expected_json_path);
@@ -1499,6 +1505,70 @@ EOF
         .to_string();
         assert!(err.contains("missing shared libraries"));
         assert!(err.contains("libvulkan.so.1"));
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn drains_large_stderr_above_os_pipe_buffer_without_deadlocking() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_whisper_pipe_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let bin_path = temp_dir.join("whisper-large-stderr");
+        let model = temp_dir.join("model.bin");
+        let wav = temp_dir.join("audio.wav");
+        fs::write(&model, b"model").unwrap();
+        fs::write(&wav, b"RIFF0000WAVE").unwrap();
+
+        {
+            let mut f = fs::File::create(&bin_path).unwrap();
+            f.write_all(
+                br#"#!/usr/bin/env sh
+OUT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-of" ]; then OUT="$2"; shift 2; else shift 1; fi
+done
+i=0
+while [ "$i" -lt 4000 ]; do
+  echo "Speech segment $i: start = 1.00, end = 2.00" >&2
+  i=$((i + 1))
+done
+printf '{"result":{"language":"en"},"transcription":[{"offsets":{"from":1000,"to":2000},"text":" Done.","tokens":[{"text":" Done.","offsets":{"from":1000,"to":2000},"p":0.99}]}]}' > "${OUT}.json"
+"#,
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = tokio::time::timeout(
+            Duration::from_secs(10),
+            run_whisper_cli(
+                &bin_path,
+                &model,
+                None,
+                &wav,
+                "en",
+                &BTreeMap::new(),
+                &cancel,
+                |_, _| {},
+            ),
+        )
+        .await
+        .expect("run_whisper_cli deadlocked while draining large stderr")
+        .unwrap();
+
+        assert_eq!(out.words.len(), 1);
+        assert_eq!(out.words[0].text, "Done.");
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

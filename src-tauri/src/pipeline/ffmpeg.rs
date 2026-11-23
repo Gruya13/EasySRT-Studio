@@ -118,26 +118,35 @@ pub async fn convert_to_16khz_mono_wav(
         )
     })?;
 
-    let mut stderr_pipe = child.stderr.take();
+    let stderr_pipe = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
 
     let status = loop {
         if cancel_flag.load(Ordering::SeqCst) {
             let _ = child.kill().await;
             let _ = child.wait().await;
+            stderr_task.abort();
             let _ = fs::remove_file(output_wav);
             return Err(anyhow!("Job cancelled"));
         }
 
-        match child.try_wait().context("Failed polling ffmpeg process")? {
-            Some(status) => break status,
-            None => tokio::time::sleep(Duration::from_millis(40)).await,
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => tokio::time::sleep(Duration::from_millis(40)).await,
+            Err(err) => {
+                stderr_task.abort();
+                return Err(err).context("Failed polling ffmpeg process");
+            }
         }
     };
 
-    let mut stderr_buf = String::new();
-    if let Some(mut pipe) = stderr_pipe.take() {
-        let _ = pipe.read_to_string(&mut stderr_buf).await;
-    }
+    let stderr_buf = stderr_task.await.unwrap_or_default();
 
     if !status.success() {
         let _ = fs::remove_file(output_wav);
