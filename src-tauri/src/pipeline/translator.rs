@@ -293,7 +293,7 @@ fn build_system_prompt(
     let mut prompt = match operation {
         BatchOperation::Translate => {
             let target_instructions = if target_language.eq_ignore_ascii_case("sr") {
-                "Translate into natural, idiomatic Serbian (strict Ekavian standard: 'mleko', 'devojka', 'vreme', 'gde', 'lepo' — never Ijekavian/Croatian forms like 'mlijeko', 'vrijeme', 'tko', 'krajolik'). Use accurate Serbian grammar and cases, never invent non-existent words, and keep subtitle phrasing concise for comfortable reading speed."
+                "Translate into natural, idiomatic Serbian (strict Ekavian standard: 'mleko', 'devojka', 'vreme', 'gde', 'lepo' — never Ijekavian/Croatian forms like 'mlijeko', 'vrijeme', 'tko', 'krajolik'). If any cue is already in Serbian (e.g., a Serbian host intro before a foreign-language interview), keep it in Serbian and polish any minor ASR errors into natural Ekavian Serbian. Use accurate Serbian grammar and cases, never invent non-existent words, and keep subtitle phrasing concise for comfortable reading speed."
             } else {
                 "Translate accurately, idiomatically, and concisely into the target language for subtitles."
             };
