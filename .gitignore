@@ -12,6 +12,7 @@ src-tauri/gen/
 
 # Local runtime / portable test data
 portable.flag
+mockup/
 *.log
 npm-debug.log*
 yarn-debug.log*

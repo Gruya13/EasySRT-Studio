@@ -44,7 +44,7 @@
   },
   "plugins": {
     "updater": {
-      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDAwMDAwMDAwMDAwMDAwMDAKUldRQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUFBQUEK",
+      "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJBNTJEMDNFQjRFQjAzREUKUldUZUErdTBQdEJTdW02aXhrMFRONUNBWnhKOC9WV2pmbFJYNENieTBNREFKRFQrcGpqdEU0eloK",
       "endpoints": [
         "https://github.com/Gruya13/EasySRT-Studio/releases/latest/download/latest.json"
       ]

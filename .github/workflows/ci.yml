@@ -5,6 +5,7 @@ on:
     branches:
       - main
   pull_request:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -58,4 +59,4 @@ jobs:
 
       - name: Check, test, and lint Rust Tauri backend
         run: |
-          cd src-tauri && cargo check --all-targets && cargo test && cargo clippy --all-targets
+          cd src-tauri && cargo check --all-targets && cargo test && cargo clippy --all-targets -- -D warnings

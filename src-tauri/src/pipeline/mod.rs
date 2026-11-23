@@ -905,6 +905,7 @@ mod tests {
         assert_eq!(latin_cues[0].source_text, "Ljubav i pažnja.");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn full_pipeline_end_to_end_ffmpeg_whisper_segment_translate_polish_export() {
         let ffmpeg_path = Path::new("/usr/bin/ffmpeg");
