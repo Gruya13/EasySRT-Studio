@@ -252,6 +252,19 @@ export function importSubtitleFile(
   });
 }
 
+export async function tryLoadCompanionSubtitles(
+  audioPath: string,
+  options: JobOptions,
+): Promise<SubtitleProject | null> {
+  if (!isTauriRuntime()) {
+    return null;
+  }
+  return invoke<SubtitleProject | null>("try_load_companion_subtitles", {
+    audioPath,
+    options,
+  });
+}
+
 // ---------------------------------------------------------------------------
 // Script Conversion & Export Commands
 // ---------------------------------------------------------------------------

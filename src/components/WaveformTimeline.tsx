@@ -4,7 +4,16 @@ import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
 import { readAudioPreviewBase64 } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
-import type { SubtitleCue } from "../types/models";
+import type { JobPhase, SubtitleCue } from "../types/models";
+
+const PROCESSING_PHASES = new Set<JobPhase>([
+  "queued",
+  "convertingAudio",
+  "transcribing",
+  "segmenting",
+  "translating",
+  "polishing",
+]);
 
 interface TrackState {
   mp3: { muted: boolean; locked: boolean };
@@ -255,6 +264,9 @@ export function WaveformTimeline() {
   const scrubbingRef = useRef(false);
   const rafIdRef = useRef<number | null>(null);
   const lastRafTickRef = useRef<number>(0);
+  const lastResetJobIdRef = useRef<string | null>(null);
+  const lastResetPhaseRef = useRef<JobPhase | null>(null);
+  const lastResetCueCountRef = useRef<number>(0);
 
   const cues = activeProject?.cues ?? [];
   const cuesRef = useRef(cues);
@@ -287,11 +299,8 @@ export function WaveformTimeline() {
   audioEndMsRef.current = audioEndMs;
 
   const activeCue = useMemo(() => {
-    if (cues.length === 0) return null;
-    if (activeCueId !== null) {
-      return cues.find((c) => c.id === activeCueId) ?? cues[0];
-    }
-    return cues[0];
+    if (cues.length === 0 || activeCueId === null) return null;
+    return cues.find((c) => c.id === activeCueId) ?? null;
   }, [cues, activeCueId]);
 
   const stopWebAudio = useCallback(() => {
@@ -410,10 +419,12 @@ export function WaveformTimeline() {
       playheadRef.current = clamped;
       setPlayheadMs(clamped);
 
-      if (syncCue && cuesRef.current.length > 0) {
-        const matched = findCueForTime(cuesRef.current, clamped, true);
-        if (matched && matched.id !== activeCueIdRef.current) {
-          setActiveCueId(matched.id);
+      if (syncCue) {
+        const matched = findCueForTime(cuesRef.current, clamped, false);
+        const nextId = matched ? matched.id : null;
+        if (nextId !== activeCueIdRef.current) {
+          activeCueIdRef.current = nextId;
+          setActiveCueId(nextId);
         }
       }
 
@@ -458,31 +469,82 @@ export function WaveformTimeline() {
 
   // When switching projects, stop playback and position playhead on active/first cue start
   useEffect(() => {
-    setIsPlaying(false);
-    segmentEndMsRef.current = null;
-    stopWebAudio();
-    if (audioRef.current) {
-      audioRef.current.pause();
+    const currentJobId = activeProject?.jobId ?? null;
+    const currentPhase = activeProject?.phase ?? null;
+    const prevJobId = lastResetJobIdRef.current;
+    const prevPhase = lastResetPhaseRef.current;
+    const prevCueCount = lastResetCueCountRef.current;
+
+    const jobChanged = currentJobId !== prevJobId;
+    const completedNow =
+      !jobChanged &&
+      currentPhase === "completed" &&
+      prevPhase !== null &&
+      PROCESSING_PHASES.has(prevPhase);
+    const cuesArrivedAtZero =
+      !jobChanged &&
+      prevCueCount === 0 &&
+      cues.length > 0 &&
+      playheadRef.current === 0;
+
+    lastResetJobIdRef.current = currentJobId;
+    lastResetPhaseRef.current = currentPhase;
+    lastResetCueCountRef.current = cues.length;
+
+    if (jobChanged || completedNow) {
+      setIsPlaying(false);
+      segmentEndMsRef.current = null;
+      stopWebAudio();
+      if (audioRef.current) {
+        audioRef.current.pause();
+        try {
+          if (
+            !Number.isFinite(audioRef.current.duration) ||
+            audioRef.current.duration > 0
+          ) {
+            audioRef.current.currentTime = 0;
+          }
+        } catch {
+          // Ignore seek errors before metadata is loaded
+        }
+      }
+      playheadRef.current = 0;
+      setPlayheadMs(0);
+      if (viewportRef.current) {
+        viewportRef.current.scrollLeft = 0;
+      }
+      const zeroCue = findCueForTime(cuesRef.current, 0, false);
+      const nextCueId = zeroCue ? zeroCue.id : null;
+      activeCueIdRef.current = nextCueId;
+      setActiveCueId(nextCueId);
+      return;
     }
-    const targetCue =
-      activeCueId !== null
-        ? cues.find((c) => c.id === activeCueId) ?? cues[0]
-        : cues[0];
-    const start = targetCue ? targetCue.startMs : 0;
-    const clamped = Math.max(0, Math.min(audioEndMs, start));
-    playheadRef.current = clamped;
-    setPlayheadMs(clamped);
-    // Only reset on job change
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeProject?.jobId]);
+
+    if (cuesArrivedAtZero) {
+      const zeroCue = findCueForTime(cuesRef.current, 0, false);
+      const nextCueId = zeroCue ? zeroCue.id : null;
+      if (nextCueId !== activeCueIdRef.current) {
+        activeCueIdRef.current = nextCueId;
+        setActiveCueId(nextCueId);
+      }
+    }
+  }, [
+    activeProject?.jobId,
+    activeProject?.phase,
+    cues.length,
+    setActiveCueId,
+    stopWebAudio,
+  ]);
 
   // Handle external playbackRequest (e.g. playCueSegment)
   useEffect(() => {
     if (!playbackRequest) return;
     segmentEndMsRef.current = playbackRequest.endMs;
-    seekPlayhead(playbackRequest.startMs, true);
+    activeCueIdRef.current = playbackRequest.cueId;
+    setActiveCueId(playbackRequest.cueId);
+    seekPlayhead(playbackRequest.startMs, false);
     setIsPlaying(true);
-  }, [playbackRequest, seekPlayhead]);
+  }, [playbackRequest, seekPlayhead, setActiveCueId]);
 
   // Playback loop (<audio> blob primary + Web Audio API fallback + rAF clock)
   useEffect(() => {
@@ -503,7 +565,8 @@ export function WaveformTimeline() {
 
     const syncEditorToPlayhead = (ms: number) => {
       const matched = findCueForTime(cuesRef.current, ms, false);
-      if (!matched || matched.id === activeCueIdRef.current) {
+      const nextId = matched ? matched.id : null;
+      if (nextId === activeCueIdRef.current) {
         return;
       }
       const activeElId = document.activeElement?.id;
@@ -513,7 +576,8 @@ export function WaveformTimeline() {
       ) {
         return;
       }
-      setActiveCueId(matched.id);
+      activeCueIdRef.current = nextId;
+      setActiveCueId(nextId);
     };
 
     const startClock = () => {
@@ -546,6 +610,7 @@ export function WaveformTimeline() {
         if (nextMs >= limit) {
           playheadRef.current = limit;
           setPlayheadMs(limit);
+          syncEditorToPlayhead(limit);
           segmentEndMsRef.current = null;
           stopWebAudio();
           if (audioRef.current && !audioRef.current.paused) {

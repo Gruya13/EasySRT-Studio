@@ -331,6 +331,269 @@ pub fn import_subtitle_path(path: &Path, options: &JobOptions) -> Result<Subtitl
     })
 }
 
+#[derive(Debug, Clone)]
+struct CompanionSubtitleCandidate {
+    path: std::path::PathBuf,
+    is_vtt: bool,
+    tag: Option<String>,
+}
+
+fn parse_companion_file(
+    candidate: &CompanionSubtitleCandidate,
+    rules: &SegmentRules,
+) -> Result<Vec<SubtitleCue>> {
+    let raw = fs::read_to_string(&candidate.path).with_context(|| {
+        format!(
+            "Failed to read companion subtitle file at {}",
+            candidate.path.to_string_lossy()
+        )
+    })?;
+    parse_subtitle_content_internal(&raw, rules, candidate.is_vtt)
+}
+
+fn pick_preferred_candidate<'a>(
+    candidates: &[&'a CompanionSubtitleCandidate],
+) -> Option<&'a CompanionSubtitleCandidate> {
+    candidates
+        .iter()
+        .copied()
+        .min_by_key(|c| (c.is_vtt, c.path.as_os_str().to_os_string()))
+}
+
+fn pick_source_tag_language(tag: Option<&str>, options: &JobOptions) -> Option<String> {
+    if let Some(t) = tag {
+        let base = t.strip_suffix(".source").unwrap_or(t).trim();
+        if !base.is_empty() && !base.eq_ignore_ascii_case("src") {
+            return Some(base.to_string());
+        }
+    }
+    let src = options.source_language.trim();
+    if src.is_empty() || src.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        Some(src.to_string())
+    }
+}
+
+/// Searches the directory of `audio_path` for companion `.srt`/`.vtt` files sharing its stem
+/// (`{stem}.srt`, `{stem}.{src}.srt`, `{stem}.{dst}.srt`, etc.) and returns a populated
+/// `SubtitleProject` bound to `audio_path` if found.
+pub fn try_load_companion_subtitles(
+    audio_path: &Path,
+    options: &JobOptions,
+) -> Result<Option<SubtitleProject>> {
+    if !audio_path.exists() || !audio_path.is_file() {
+        return Ok(None);
+    }
+
+    let ext_lower = audio_path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if matches!(ext_lower.as_str(), "srt" | "vtt") {
+        return Ok(None);
+    }
+
+    let parent_dir = match audio_path.parent() {
+        Some(dir) if !dir.as_os_str().is_empty() => dir,
+        _ => return Ok(None),
+    };
+    let stem = match audio_path.file_stem().and_then(|s| s.to_str()) {
+        Some(s) if !s.trim().is_empty() => s,
+        _ => return Ok(None),
+    };
+
+    let stem_lower = stem.to_lowercase();
+    let entries = match fs::read_dir(parent_dir) {
+        Ok(rd) => rd,
+        Err(_) => return Ok(None),
+    };
+
+    let mut candidates: Vec<CompanionSubtitleCandidate> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(sub_ext) = path.extension().and_then(|e| e.to_str()) else {
+            continue;
+        };
+        let is_vtt = if sub_ext.eq_ignore_ascii_case("srt") {
+            false
+        } else if sub_ext.eq_ignore_ascii_case("vtt") {
+            true
+        } else {
+            continue;
+        };
+
+        let Some(sub_stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        let sub_stem_lower = sub_stem.to_lowercase();
+        let tag = if sub_stem_lower == stem_lower {
+            None
+        } else if let Some(after) = sub_stem_lower.strip_prefix(&stem_lower) {
+            let Some(rest) = after.strip_prefix('.') else {
+                continue;
+            };
+            if rest.trim().is_empty() {
+                continue;
+            }
+            Some(rest.to_string())
+        } else {
+            continue;
+        };
+
+        candidates.push(CompanionSubtitleCandidate { path, is_vtt, tag });
+    }
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let target_lang = {
+        let t = options.target_language.trim().to_ascii_lowercase();
+        if t.is_empty() {
+            "sr".to_string()
+        } else {
+            t
+        }
+    };
+    let source_lang_opt = {
+        let s = options.source_language.trim().to_ascii_lowercase();
+        if s.is_empty() || s == "auto" {
+            None
+        } else {
+            Some(s)
+        }
+    };
+
+    let target_matches: Vec<&CompanionSubtitleCandidate> = candidates
+        .iter()
+        .filter(|c| c.tag.as_deref() == Some(target_lang.as_str()))
+        .collect();
+    let target_cand = pick_preferred_candidate(&target_matches);
+
+    let explicitly_sourced: Vec<&CompanionSubtitleCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            c.tag
+                .as_deref()
+                .map(|t| t.ends_with(".source"))
+                .unwrap_or(false)
+        })
+        .collect();
+    let matching_src_lang: Vec<&CompanionSubtitleCandidate> = candidates
+        .iter()
+        .filter(|c| {
+            source_lang_opt
+                .as_deref()
+                .map(|src| src != target_lang && c.tag.as_deref() == Some(src))
+                .unwrap_or(false)
+        })
+        .collect();
+    let other_tagged: Vec<&CompanionSubtitleCandidate> = candidates
+        .iter()
+        .filter(|c| match c.tag.as_deref() {
+            Some(t) => t != target_lang && !t.ends_with(".source"),
+            None => false,
+        })
+        .collect();
+    let untagged: Vec<&CompanionSubtitleCandidate> =
+        candidates.iter().filter(|c| c.tag.is_none()).collect();
+
+    let source_cand = pick_preferred_candidate(&explicitly_sourced)
+        .or_else(|| pick_preferred_candidate(&matching_src_lang))
+        .or_else(|| pick_preferred_candidate(&other_tagged))
+        .or_else(|| pick_preferred_candidate(&untagged));
+
+    let normalized_rules = segmenter::normalize_rules(&options.segment_rules);
+    let (cues, detected_language): (Vec<SubtitleCue>, Option<String>) =
+        match (source_cand, target_cand) {
+            (Some(src), Some(tgt)) => {
+                let mut cues = parse_companion_file(src, &normalized_rules)?;
+                let target_cues = parse_companion_file(tgt, &normalized_rules)?;
+
+                if cues.len() == target_cues.len() {
+                    for (cue, tgt_cue) in cues.iter_mut().zip(target_cues.iter()) {
+                        cue.translated_text =
+                            sr_script::convert_script(&tgt_cue.source_text, options.script);
+                        segmenter::compute_cue_metrics(cue, &normalized_rules);
+                    }
+                } else {
+                    for cue in &mut cues {
+                        let overlapping: Vec<String> = target_cues
+                            .iter()
+                            .filter(|tc| {
+                                let overlap_start = cue.start_ms.max(tc.start_ms);
+                                let overlap_end = cue.end_ms.min(tc.end_ms);
+                                overlap_end > overlap_start
+                            })
+                            .map(|tc| sr_script::convert_script(&tc.source_text, options.script))
+                            .collect();
+                        if !overlapping.is_empty() {
+                            cue.translated_text = overlapping.join("\n");
+                        }
+                        segmenter::compute_cue_metrics(cue, &normalized_rules);
+                    }
+                }
+
+                (
+                    cues,
+                    pick_source_tag_language(src.tag.as_deref(), options),
+                )
+            }
+            (Some(src), None) => {
+                let mut cues = parse_companion_file(src, &normalized_rules)?;
+                if options.source_language.trim().eq_ignore_ascii_case("sr") {
+                    for cue in &mut cues {
+                        cue.source_text = sr_script::convert_script(&cue.source_text, options.script);
+                        segmenter::compute_cue_metrics(cue, &normalized_rules);
+                    }
+                }
+                (
+                    cues,
+                    pick_source_tag_language(src.tag.as_deref(), options),
+                )
+            }
+            (None, Some(tgt)) => {
+                let mut cues = parse_companion_file(tgt, &normalized_rules)?;
+                for cue in &mut cues {
+                    cue.translated_text = sr_script::convert_script(&cue.source_text, options.script);
+                    segmenter::compute_cue_metrics(cue, &normalized_rules);
+                }
+                (cues, pick_source_tag_language(None, options))
+            }
+            (None, None) => return Ok(None),
+        };
+
+    let duration_ms = cues.iter().map(|c| c.end_ms).max().unwrap_or(0);
+    let audio_file_name = audio_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("audio-input")
+        .to_string();
+
+    Ok(Some(SubtitleProject {
+        job_id: uuid::Uuid::new_v4().to_string(),
+        audio_path: audio_path.to_string_lossy().to_string(),
+        audio_file_name,
+        duration_ms,
+        detected_language,
+        options: JobOptions {
+            segment_rules: normalized_rules,
+            ..options.clone()
+        },
+        words: Vec::new(),
+        cues,
+        phase: JobPhase::Completed,
+        completed_translation_batches: 0,
+        error_message: None,
+        updated_at: chrono::Utc::now().to_rfc3339(),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -451,5 +714,105 @@ mod tests {
 
         // Cue block missing text lines
         assert!(parse_subtitle_content("1\n00:00:01,000 --> 00:00:02,000\n", &rules).is_err());
+    }
+
+    #[test]
+    fn companion_subtitles_loads_paired_source_and_translated_srts() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_companion_pair_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let audio_path = temp_dir.join("interview.mp3");
+        let en_srt = temp_dir.join("interview.en.srt");
+        let sr_srt = temp_dir.join("interview.sr.srt");
+        let unrelated_srt = temp_dir.join("interview_draft.srt");
+
+        fs::write(&audio_path, b"dummy audio").unwrap();
+        fs::write(
+            &en_srt,
+            "1\n00:00:00,500 --> 00:00:02,000\nHello everyone.\n\n2\n00:00:02,500 --> 00:00:04,500\nWelcome back.\n",
+        )
+        .unwrap();
+        fs::write(
+            &sr_srt,
+            "1\n00:00:00,500 --> 00:00:02,000\nZdravo svima.\n\n2\n00:00:02,500 --> 00:00:04,500\nDobro došli nazad.\n",
+        )
+        .unwrap();
+        fs::write(&unrelated_srt, "1\n00:00:00,000 --> 00:00:01,000\nUnrelated\n").unwrap();
+
+        let opts = JobOptions {
+            target_language: "sr".to_string(),
+            script: SerbianScript::Latin,
+            ..JobOptions::default()
+        };
+
+        let loaded = try_load_companion_subtitles(&audio_path, &opts)
+            .unwrap()
+            .expect("Expected companion subtitles project");
+
+        assert_eq!(loaded.audio_path, audio_path.to_string_lossy());
+        assert_eq!(loaded.audio_file_name, "interview.mp3");
+        assert_eq!(loaded.phase, JobPhase::Completed);
+        assert_eq!(loaded.detected_language.as_deref(), Some("en"));
+        assert_eq!(loaded.cues.len(), 2);
+        assert_eq!(loaded.cues[0].source_text, "Hello everyone.");
+        assert_eq!(loaded.cues[0].translated_text, "Zdravo svima.");
+        assert_eq!(loaded.cues[1].source_text, "Welcome back.");
+        assert_eq!(loaded.cues[1].translated_text, "Dobro došli nazad.");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn companion_subtitles_loads_single_untagged_srt_beside_video() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_companion_single_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let video_path = temp_dir.join("clip.mp4");
+        let srt_path = temp_dir.join("clip.srt");
+
+        fs::write(&video_path, b"dummy video").unwrap();
+        fs::write(
+            &srt_path,
+            "1\n00:00:01,000 --> 00:00:03,000\nSingle companion cue.\n",
+        )
+        .unwrap();
+
+        let opts = JobOptions::default();
+        let loaded = try_load_companion_subtitles(&video_path, &opts)
+            .unwrap()
+            .expect("Expected single companion project");
+
+        assert_eq!(loaded.audio_path, video_path.to_string_lossy());
+        assert_eq!(loaded.phase, JobPhase::Completed);
+        assert_eq!(loaded.cues.len(), 1);
+        assert_eq!(loaded.cues[0].source_text, "Single companion cue.");
+        assert!(loaded.cues[0].translated_text.is_empty());
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn companion_subtitles_returns_none_when_no_matching_subtitles_exist() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_companion_none_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let audio_path = temp_dir.join("speech.wav");
+        let other_srt = temp_dir.join("speech_other.srt");
+        fs::write(&audio_path, b"dummy wav").unwrap();
+        fs::write(&other_srt, "1\n00:00:00,500 --> 00:00:01,500\nOther.\n").unwrap();
+
+        let loaded = try_load_companion_subtitles(&audio_path, &JobOptions::default()).unwrap();
+        assert!(loaded.is_none());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }

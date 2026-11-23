@@ -1,6 +1,5 @@
 import { create } from "zustand";
 import { normalizeUiLanguage, type UiLanguage } from "../i18n";
-import { createDemoProject } from "../lib/browserFallback";
 import {
   calculateCueMetrics,
   convertSerbianScriptText,
@@ -39,6 +38,7 @@ import {
   setApiKey,
   transcribeAudio,
   translateProject,
+  tryLoadCompanionSubtitles,
 } from "../lib/tauri";
 import type {
   ApiKeyStatus,
@@ -286,6 +286,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     void action();
   };
 
+  const findCueIdAtPlayheadZero = (cues: SubtitleCue[]): number | null => {
+    const match = cues.find((c) => c.startMs <= 0 && c.endMs >= 0);
+    return match ? match.id : null;
+  };
+
   const syncProjectIntoQueueAndState = (
     project: SubtitleProject,
     options?: { forceActivate?: boolean },
@@ -330,10 +335,15 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         project.jobId,
         options?.forceActivate,
       );
+      const isSwitchingActiveJob =
+        shouldUpdateActive && state.activeJobId !== project.jobId;
 
       return {
         activeProject: shouldUpdateActive ? project : state.activeProject,
         activeJobId: shouldUpdateActive ? project.jobId : state.activeJobId,
+        activeCueId: isSwitchingActiveJob
+          ? findCueIdAtPlayheadZero(project.cues)
+          : state.activeCueId,
         batchQueue: updatedQueue,
         checkpoints: updatedCheckpoints,
       };
@@ -478,60 +488,6 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           !config.hasCompletedSetup && !setupStatus.readyForOffline;
 
         const stateBeforeInit = get();
-        let nextActiveProject = stateBeforeInit.activeProject;
-        let nextActiveJobId = stateBeforeInit.activeJobId;
-        let nextActiveCueId = stateBeforeInit.activeCueId;
-        let nextBatchQueue = stateBeforeInit.batchQueue;
-
-        if (nextActiveProject === null) {
-          const seededProject =
-            checkpoints.length > 0
-              ? checkpoints[0]
-              : createDemoProject("C:/Media/Podcast_Ep14_AI_Production.mp3", {
-                  ...jobOptions,
-                  sourceLanguage: "en",
-                  targetLanguage: "sr",
-                  glossary: {
-                    "EasySRT Studio": "EasySRT Studio",
-                    "whisper.cpp": "whisper.cpp",
-                    "NVIDIA RTX": "NVIDIA RTX",
-                  },
-                });
-          nextActiveProject = seededProject;
-          nextActiveJobId = seededProject.jobId;
-          nextActiveCueId = seededProject.cues.some((c) => c.id === 2)
-            ? 2
-            : (seededProject.cues[0]?.id ?? null);
-        }
-
-        if (nextBatchQueue.length === 0 && checkpoints.length > 0) {
-          nextBatchQueue = checkpoints.map((cp) => ({
-            jobId: cp.jobId,
-            audioPath: cp.audioPath,
-            audioFileName: cp.audioFileName,
-            phase: cp.phase,
-            percent: cp.phase === "completed" ? 100 : 50,
-            detail: cp.phase,
-            project: cp,
-            errorMessage: cp.errorMessage,
-          }));
-        } else if (
-          nextBatchQueue.length === 0 &&
-          nextActiveProject !== null
-        ) {
-          nextBatchQueue = [
-            {
-              jobId: nextActiveProject.jobId,
-              audioPath: nextActiveProject.audioPath,
-              audioFileName: nextActiveProject.audioFileName,
-              phase: nextActiveProject.phase,
-              percent: nextActiveProject.phase === "completed" ? 100 : 0,
-              detail: nextActiveProject.phase,
-              project: nextActiveProject,
-              errorMessage: nextActiveProject.errorMessage,
-            },
-          ];
-        }
 
         set({
           initialized: true,
@@ -542,10 +498,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           checkpoints,
           jobOptions,
           isSetupOpen: shouldShowSetup,
-          activeProject: nextActiveProject,
-          activeJobId: nextActiveJobId,
-          activeCueId: nextActiveCueId,
-          batchQueue: nextBatchQueue,
+          activeProject: stateBeforeInit.activeProject,
+          activeJobId: stateBeforeInit.activeJobId,
+          activeCueId: stateBeforeInit.activeCueId,
+          batchQueue: stateBeforeInit.batchQueue,
         });
       } catch (err) {
         set({
@@ -897,7 +853,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         resetUndoHistory();
         syncProjectIntoQueueAndState(project, { forceActivate: true });
         set({
-          activeCueId: project.cues[0]?.id ?? null,
+          activeCueId: findCueIdAtPlayheadZero(project.cues),
           banner: {
             type: "success",
             message:
@@ -974,7 +930,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       resetUndoHistory();
       syncProjectIntoQueueAndState(project, { forceActivate: true });
       set({
-        activeCueId: cues[0]?.id ?? null,
+        activeCueId: findCueIdAtPlayheadZero(cues),
         banner: {
           type: "success",
           message:
@@ -986,16 +942,23 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     },
 
     enqueueAudioFiles: (paths) => {
-      if (paths.length === 0) {
+      const cleanedPaths = Array.from(
+        new Set(paths.map((p) => p.trim()).filter((p) => p.length > 0)),
+      );
+      if (cleanedPaths.length === 0) {
         return;
       }
+
+      const newlyAddedItems: BatchQueueItem[] = [];
+      let existingToInspect: BatchQueueItem | null = null;
+
       set((state) => {
-        const existingPaths = new Set(
-          state.batchQueue.map((item) => item.audioPath),
+        const existingByPath = new Map(
+          state.batchQueue.map((item) => [item.audioPath, item]),
         );
         const newItems: BatchQueueItem[] = [];
-        for (const audioPath of paths) {
-          if (existingPaths.has(audioPath)) {
+        for (const audioPath of cleanedPaths) {
+          if (existingByPath.has(audioPath)) {
             continue;
           }
           const audioFileName =
@@ -1003,7 +966,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           const jobId = `job-${Date.now()}-${Math.random()
             .toString(36)
             .slice(2, 7)}`;
-          newItems.push({
+          const newItem: BatchQueueItem = {
             jobId,
             audioPath,
             audioFileName,
@@ -1012,16 +975,144 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             detail: "",
             project: null,
             errorMessage: null,
-          });
+          };
+          newItems.push(newItem);
+          existingByPath.set(audioPath, newItem);
         }
+
+        newlyAddedItems.push(...newItems);
+
+        if (newItems.length === 0) {
+          const firstExisting = existingByPath.get(cleanedPaths[0]);
+          if (!firstExisting) {
+            return state;
+          }
+          if (firstExisting.project === null) {
+            existingToInspect = firstExisting;
+          }
+          const targetProject: SubtitleProject =
+            firstExisting.project ?? {
+              jobId: firstExisting.jobId,
+              audioPath: firstExisting.audioPath,
+              audioFileName: firstExisting.audioFileName,
+              durationMs: 0,
+              detectedLanguage: null,
+              options: { ...state.jobOptions },
+              words: [],
+              cues: [],
+              phase: firstExisting.phase,
+              completedTranslationBatches: 0,
+              errorMessage: firstExisting.errorMessage,
+              updatedAt: new Date().toISOString(),
+            };
+          return {
+            activeJobId: firstExisting.jobId,
+            activeProject: targetProject,
+            activeCueId: findCueIdAtPlayheadZero(targetProject.cues),
+          };
+        }
+
         const combined = [...state.batchQueue, ...newItems];
-        const nextActiveId =
-          state.activeJobId ?? combined[0]?.jobId ?? null;
+        const shouldActivateFirst =
+          state.activeJobId === null || state.activeProject === null;
+        const firstAdded = newItems[0];
+        const nextActiveId = shouldActivateFirst
+          ? firstAdded.jobId
+          : state.activeJobId;
+        const nextActiveProject: SubtitleProject | null = shouldActivateFirst
+          ? {
+              jobId: firstAdded.jobId,
+              audioPath: firstAdded.audioPath,
+              audioFileName: firstAdded.audioFileName,
+              durationMs: 0,
+              detectedLanguage: null,
+              options: { ...state.jobOptions },
+              words: [],
+              cues: [],
+              phase: firstAdded.phase,
+              completedTranslationBatches: 0,
+              errorMessage: null,
+              updatedAt: new Date().toISOString(),
+            }
+          : state.activeProject;
+
         return {
           batchQueue: combined,
           activeJobId: nextActiveId,
+          activeProject: nextActiveProject,
+          activeCueId: shouldActivateFirst ? null : state.activeCueId,
         };
       });
+
+      const itemsToCheck =
+        newlyAddedItems.length > 0
+          ? newlyAddedItems
+          : existingToInspect
+            ? [existingToInspect]
+            : [];
+      if (itemsToCheck.length === 0) {
+        return;
+      }
+
+      const optionsSnapshot = { ...get().jobOptions };
+      const uiLang = get().config.uiLanguage;
+      for (const item of itemsToCheck) {
+        void tryLoadCompanionSubtitles(item.audioPath, optionsSnapshot)
+          .then((companionProject) => {
+            if (!companionProject) {
+              return;
+            }
+            const mergedProject: SubtitleProject = {
+              ...companionProject,
+              jobId: item.jobId,
+              audioPath: item.audioPath,
+              audioFileName: item.audioFileName,
+              phase: "completed",
+            };
+            set((state) => {
+              const currentItem = state.batchQueue.find(
+                (q) => q.jobId === item.jobId,
+              );
+              if (!currentItem) {
+                return state;
+              }
+              if (
+                currentItem.phase !== "queued" &&
+                currentItem.phase !== "completed"
+              ) {
+                return state;
+              }
+              const updatedQueue = state.batchQueue.map((q) =>
+                q.jobId === item.jobId
+                  ? {
+                      ...q,
+                      phase: "completed" as const,
+                      percent: 100,
+                      detail:
+                        uiLang === "en"
+                          ? `Loaded ${mergedProject.cues.length} cues from companion SRT`
+                          : `Učitano ${mergedProject.cues.length} titlova iz pratećeg SRT fajla`,
+                      project: mergedProject,
+                      errorMessage: null,
+                    }
+                  : q,
+              );
+              const isCurrentlyActive = state.activeJobId === item.jobId;
+              return {
+                batchQueue: updatedQueue,
+                activeProject: isCurrentlyActive
+                  ? mergedProject
+                  : state.activeProject,
+                activeCueId: isCurrentlyActive
+                  ? findCueIdAtPlayheadZero(mergedProject.cues)
+                  : state.activeCueId,
+              };
+            });
+          })
+          .catch(() => {
+            // Keep file queued cleanly if companion subtitle fails to parse
+          });
+      }
     },
 
     removeQueueItem: (jobId) => {
@@ -1039,6 +1130,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           activeProject: isRemovingActive
             ? (fallbackItem?.project ?? null)
             : state.activeProject,
+          activeCueId: isRemovingActive
+            ? findCueIdAtPlayheadZero(fallbackItem?.project?.cues ?? [])
+            : state.activeCueId,
         };
       });
     },
@@ -1084,7 +1178,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         activeProject: placeholderProject ?? get().activeProject,
         activeCueId: isSameJob
           ? get().activeCueId
-          : (placeholderProject.cues[0]?.id ?? null),
+          : findCueIdAtPlayheadZero(placeholderProject.cues),
       });
     },
 
@@ -1100,7 +1194,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             correctSourceAsr: Boolean(project.options.correctSourceAsr),
           },
           isCheckpointsOpen: false,
-          activeCueId: project.cues[0]?.id ?? null,
+          activeCueId: findCueIdAtPlayheadZero(project.cues),
         });
       } catch (err) {
         set({

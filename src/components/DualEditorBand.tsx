@@ -20,16 +20,14 @@ export function DualEditorBand() {
   const lang = normalizeUiLanguage(config.uiLanguage);
 
   const activeCue = useMemo(() => {
-    if (!activeProject || activeProject.cues.length === 0) {
+    if (
+      !activeProject ||
+      activeProject.cues.length === 0 ||
+      activeCueId === null
+    ) {
       return null;
     }
-    if (activeCueId !== null) {
-      return (
-        activeProject.cues.find((c) => c.id === activeCueId) ??
-        activeProject.cues[0]
-      );
-    }
-    return activeProject.cues[0];
+    return activeProject.cues.find((c) => c.id === activeCueId) ?? null;
   }, [activeProject, activeCueId]);
 
   const cueKey = `${activeProject?.jobId ?? ""}:${activeCue?.id ?? ""}`;
@@ -225,7 +223,7 @@ export function DualEditorBand() {
               lang === "en" ? "Source transcript" : "Izvorni transkript"
             }
             placeholder={
-              activeCue
+              activeCue || hasCues
                 ? ""
                 : lang === "en"
                   ? "Select or add a subtitle cue..."
@@ -336,7 +334,7 @@ export function DualEditorBand() {
               lang === "en" ? "Subtitle translation" : "Prevod titla"
             }
             placeholder={
-              activeCue
+              activeCue || hasCues
                 ? ""
                 : lang === "en"
                   ? "Select or add a subtitle cue..."

@@ -129,6 +129,15 @@ pub async fn import_subtitle_file(
 }
 
 #[tauri::command]
+pub async fn try_load_companion_subtitles(
+    audio_path: String,
+    options: JobOptions,
+) -> Result<Option<SubtitleProject>, String> {
+    pipeline::importer::try_load_companion_subtitles(std::path::Path::new(&audio_path), &options)
+        .map_err(map_err)
+}
+
+#[tauri::command]
 pub async fn transcribe_audio(
     app: AppHandle,
     state: State<'_, PipelineState>,
