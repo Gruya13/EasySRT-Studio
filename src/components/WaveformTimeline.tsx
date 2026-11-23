@@ -257,6 +257,7 @@ export function WaveformTimeline() {
   const webAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const webAudioGainRef = useRef<GainNode | null>(null);
   const webAudioBufferRef = useRef<AudioBuffer | null>(null);
+  const loadDecodePromiseRef = useRef<Promise<AudioBuffer | null> | null>(null);
   const webAudioStartCtxTimeRef = useRef(0);
   const webAudioStartOffsetSecRef = useRef(0);
 
@@ -286,6 +287,13 @@ export function WaveformTimeline() {
   const maxCueEndMs = useMemo(
     () => cues.reduce((max, c) => Math.max(max, c.endMs), 0),
     [cues],
+  );
+  const actualAudioDurationMs = useMemo(
+    () =>
+      liveAudioDurationMs > 0
+        ? liveAudioDurationMs
+        : Math.max(activeProject?.durationMs ?? 0, maxCueEndMs, 1000),
+    [liveAudioDurationMs, activeProject?.durationMs, maxCueEndMs],
   );
   const audioEndMs = useMemo(
     () =>
@@ -322,7 +330,7 @@ export function WaveformTimeline() {
     }
   }, []);
 
-  // Load real audio bytes into a blob: ObjectURL (works natively in Linux WebKitGTK & Windows WebView2)
+  // Load real audio bytes and decode PCM AudioBuffer for sample-accurate playback & waveform
   useEffect(() => {
     let active = true;
     let createdUrl = "";
@@ -331,6 +339,7 @@ export function WaveformTimeline() {
     webAudioBufferRef.current = null;
     audioRawBytesRef.current = null;
     audioPeaksRef.current = null;
+    loadDecodePromiseRef.current = null;
     setLiveAudioDurationMs(0);
     setAudioBlobUrl("");
     setWaveformVersion((v) => v + 1);
@@ -343,35 +352,13 @@ export function WaveformTimeline() {
     const isDemoProject =
       !isTauriRuntime() || activeProject?.jobId === "demo-session-01";
 
-    const decodePeaksFromBuffer = async (rawBuf: ArrayBuffer) => {
-      if (typeof AudioContext === "undefined") {
-        return;
-      }
-      try {
-        if (!webAudioCtxRef.current) {
-          webAudioCtxRef.current = new AudioContext();
-        }
-        const decoded = await webAudioCtxRef.current.decodeAudioData(
-          rawBuf.slice(0),
-        );
-        if (!active) return;
-        webAudioBufferRef.current = decoded;
-        if (decoded.duration > 0 && !activeProject?.durationMs) {
-          setLiveAudioDurationMs(Math.round(decoded.duration * 1000));
-        }
-        audioPeaksRef.current = extractAudioPeaks(decoded, 2400);
-        setWaveformVersion((v) => v + 1);
-      } catch {
-        // Ignore decode failures for unsupported codecs; fallback rendering remains active
-      }
-    };
-
-    const loadPreview = async () => {
+    const loadPromise = (async (): Promise<AudioBuffer | null> => {
+      let rawBuf: ArrayBuffer | null = null;
       try {
         const preview = await readAudioPreviewBase64(path);
-        if (!active) return;
+        if (!active) return null;
         const bytes = decodeBase64ToBytes(preview.base64Data);
-        const rawBuf = bytes.buffer.slice(
+        rawBuf = bytes.buffer.slice(
           bytes.byteOffset,
           bytes.byteOffset + bytes.byteLength,
         ) as ArrayBuffer;
@@ -379,27 +366,49 @@ export function WaveformTimeline() {
         const blob = new Blob([rawBuf], { type: preview.mimeType });
         createdUrl = URL.createObjectURL(blob);
         setAudioBlobUrl(createdUrl);
-        void decodePeaksFromBuffer(rawBuf);
       } catch {
-        if (!active) return;
+        if (!active) return null;
         if (isDemoProject) {
-          const demoBuf = buildDemoWavBuffer(
+          rawBuf = buildDemoWavBuffer(
             audioEndMsRef.current,
             cuesRef.current,
           );
-          audioRawBytesRef.current = demoBuf;
-          const blob = new Blob([demoBuf], { type: "audio/wav" });
+          audioRawBytesRef.current = rawBuf;
+          const blob = new Blob([rawBuf], { type: "audio/wav" });
           createdUrl = URL.createObjectURL(blob);
           setAudioBlobUrl(createdUrl);
-          void decodePeaksFromBuffer(demoBuf);
         }
       }
-    };
 
-    void loadPreview();
+      if (!active || !rawBuf || typeof AudioContext === "undefined") {
+        return null;
+      }
+
+      try {
+        if (!webAudioCtxRef.current) {
+          webAudioCtxRef.current = new AudioContext();
+        }
+        const decoded = await webAudioCtxRef.current.decodeAudioData(
+          rawBuf.slice(0),
+        );
+        if (!active) return null;
+        webAudioBufferRef.current = decoded;
+        if (decoded.duration > 0) {
+          setLiveAudioDurationMs(Math.round(decoded.duration * 1000));
+        }
+        audioPeaksRef.current = extractAudioPeaks(decoded, 2400);
+        setWaveformVersion((v) => v + 1);
+        return decoded;
+      } catch {
+        return null;
+      }
+    })();
+
+    loadDecodePromiseRef.current = loadPromise;
 
     return () => {
       active = false;
+      loadDecodePromiseRef.current = null;
       stopWebAudio();
       if (createdUrl) {
         URL.revokeObjectURL(createdUrl);
@@ -636,9 +645,8 @@ export function WaveformTimeline() {
       rafIdRef.current = window.requestAnimationFrame(tick);
     };
 
-    const startWebAudioFallback = async (): Promise<boolean> => {
-      const rawBuf = audioRawBytesRef.current;
-      if (!rawBuf || typeof AudioContext === "undefined") {
+    const startWebAudioPrimary = async (): Promise<boolean> => {
+      if (typeof AudioContext === "undefined") {
         return false;
       }
       try {
@@ -658,27 +666,36 @@ export function WaveformTimeline() {
           tracksRef.current.mp3.muted ? 0 : 1,
           ctx.currentTime,
         );
-        if (!webAudioBufferRef.current) {
-          webAudioBufferRef.current = await ctx.decodeAudioData(
-            rawBuf.slice(0),
-          );
-          if (!activeProject?.durationMs && webAudioBufferRef.current.duration) {
-            setLiveAudioDurationMs(
-              Math.round(webAudioBufferRef.current.duration * 1000),
-            );
+
+        let buffer = webAudioBufferRef.current;
+        if (!buffer && loadDecodePromiseRef.current) {
+          buffer = await loadDecodePromiseRef.current;
+        }
+        if (cancelled) return false;
+        if (!buffer && audioRawBytesRef.current) {
+          buffer = await ctx.decodeAudioData(audioRawBytesRef.current.slice(0));
+          if (cancelled) return false;
+          webAudioBufferRef.current = buffer;
+          if (buffer.duration > 0) {
+            setLiveAudioDurationMs(Math.round(buffer.duration * 1000));
+          }
+          if (!audioPeaksRef.current) {
+            audioPeaksRef.current = extractAudioPeaks(buffer, 2400);
+            setWaveformVersion((v) => v + 1);
           }
         }
-        if (cancelled || !webAudioBufferRef.current) return false;
+        if (!buffer || cancelled) return false;
+
         stopWebAudio();
         const offsetSec = Math.max(
           0,
           Math.min(
-            Math.max(0, webAudioBufferRef.current.duration - 0.02),
+            Math.max(0, buffer.duration - 0.02),
             playheadRef.current / 1000,
           ),
         );
         const src = ctx.createBufferSource();
-        src.buffer = webAudioBufferRef.current;
+        src.buffer = buffer;
         src.connect(webAudioGainRef.current);
         webAudioStartCtxTimeRef.current = ctx.currentTime;
         webAudioStartOffsetSecRef.current = offsetSec;
@@ -690,58 +707,49 @@ export function WaveformTimeline() {
       }
     };
 
-    const audioEl = audioRef.current;
-    if (audioBlobUrl && audioEl && !audioEl.error) {
-      try {
-        if (
-          Number.isFinite(audioEl.duration) &&
-          audioEl.duration > 0 &&
-          Math.abs(audioEl.currentTime * 1000 - playheadRef.current) > 80
-        ) {
-          audioEl.currentTime = Math.min(
-            audioEl.duration,
-            playheadRef.current / 1000,
-          );
-        }
-        audioEl.muted = tracksRef.current.mp3.muted;
-        const playPromise = audioEl.play();
-        if (playPromise && typeof playPromise.then === "function") {
-          playPromise
-            .then(() => {
-              if (!cancelled) {
-                clockSource = "audio";
-                startClock();
-              }
-            })
-            .catch(async () => {
-              const ok = await startWebAudioFallback();
-              if (!cancelled) {
-                clockSource = ok ? "webaudio" : "raf";
-                startClock();
-              }
-            });
-        } else {
+    const runAudioFallback = () => {
+      const audioEl = audioRef.current;
+      if (audioBlobUrl && audioEl && !audioEl.error) {
+        try {
+          audioEl.currentTime = playheadRef.current / 1000;
+          audioEl.muted = tracksRef.current.mp3.muted;
+          const playPromise = audioEl.play();
+          if (playPromise && typeof playPromise.then === "function") {
+            playPromise
+              .then(() => {
+                if (!cancelled) {
+                  clockSource = "audio";
+                  startClock();
+                }
+              })
+              .catch(() => {
+                if (!cancelled) {
+                  clockSource = "raf";
+                  startClock();
+                }
+              });
+            return;
+          }
           clockSource = "audio";
           startClock();
+          return;
+        } catch {
+          // Fall through to rAF clock
         }
-      } catch {
-        void startWebAudioFallback().then((ok) => {
-          if (!cancelled) {
-            clockSource = ok ? "webaudio" : "raf";
-            startClock();
-          }
-        });
       }
-    } else if (audioRawBytesRef.current) {
-      void startWebAudioFallback().then((ok) => {
-        if (!cancelled) {
-          clockSource = ok ? "webaudio" : "raf";
-          startClock();
-        }
-      });
-    } else {
+      clockSource = "raf";
       startClock();
-    }
+    };
+
+    void startWebAudioPrimary().then((ok) => {
+      if (cancelled) return;
+      if (ok) {
+        clockSource = "webaudio";
+        startClock();
+      } else {
+        runAudioFallback();
+      }
+    });
 
     return () => {
       cancelled = true;
@@ -860,7 +868,7 @@ export function WaveformTimeline() {
           }
         }
 
-        const tMs = frac0 * audioEndMs;
+        const tMs = frac0 * actualAudioDurationMs;
         const inCue = cues.some((c) => tMs >= c.startMs && tMs <= c.endMs);
         ctx.fillStyle = inCue
           ? "rgba(56, 189, 248, 0.85)"
@@ -873,7 +881,7 @@ export function WaveformTimeline() {
     }
 
     for (let x = 2; x < width - 2; x += stepX) {
-      const tMs = (x / width) * audioEndMs;
+      const tMs = (x / width) * actualAudioDurationMs;
       const activeWord =
         words.length > 0
           ? words.find((w) => tMs >= w.startMs && tMs <= w.endMs)
@@ -907,7 +915,7 @@ export function WaveformTimeline() {
       const barH = Math.max(2, amp * maxHalf * 2);
       ctx.fillRect(x, midY - barH / 2, barW, barH);
     }
-  }, [activeProject?.words, cues, audioEndMs, waveformVersion]);
+  }, [activeProject?.words, cues, actualAudioDurationMs, waveformVersion]);
 
   useEffect(() => {
     const id = window.requestAnimationFrame(drawWaveform);
@@ -1295,7 +1303,7 @@ export function WaveformTimeline() {
   );
   const mp3ClipPct = Math.max(
     1,
-    Math.min(100, (audioEndMs / Math.max(1, totalMs)) * 100),
+    Math.min(100, (actualAudioDurationMs / Math.max(1, totalMs)) * 100),
   );
 
   const srcLangSub = (
