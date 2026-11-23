@@ -3,16 +3,20 @@ import type {
   ApiKeyStatus,
   AppConfig,
   AudioPreviewData,
+  BugReportRequest,
   CatalogItem,
   CatalogItemKind,
   CatalogManifest,
+  CrashReportRequest,
   CustomModelEntry,
+  DiagnosticsPreview,
   DownloadProgressEvent,
   ExportOptions,
   ExportResult,
   InstalledComponentStatus,
   JobOptions,
   JobProgressEvent,
+  ReportSubmitResult,
   SegmentRules,
   SerbianScript,
   SetupStatus,
@@ -267,6 +271,7 @@ let mockConfig: AppConfig = {
     utf8Bom: true,
   },
   hasCompletedSetup: true,
+  autoSendCrashReports: true,
 };
 
 let mockApiKeyStatus: ApiKeyStatus = {
@@ -437,6 +442,9 @@ function buildSetupStatus(): SetupStatus {
       gpuName: "NVIDIA GeForce RTX 3060",
       vramMb: 8192,
       recommendedTier: "vram8Gb",
+      driverVersion: "560.94",
+      cudaSupported: true,
+      cudaStatusNote: null,
     },
     storage: {
       mode: "installed",
@@ -1050,6 +1058,61 @@ export const browserFallback = {
       mimeType: "audio/wav",
       base64Data: btoa(binary),
     };
+  },
+
+  async collectDiagnosticsPreview(): Promise<DiagnosticsPreview> {
+    const installedComponents = Array.from(mockInstalledIds);
+    return {
+      appVersion: "0.3.0",
+      platform: "windows-x64",
+      osInfo: "Windows 11 x86_64 (Browser Preview Mode)",
+      gpuSummary: "NVIDIA GeForce RTX 3060 (8192 MB VRAM, Driver 560.94, CUDA supported)",
+      installedComponents,
+      logExcerpt:
+        "[INFO] EasySRT Studio v0.3.0 initialized\n[INFO] Browser preview fallback active — diagnostics sanitized (<user> masked, no API keys or subtitle text).",
+      telemetryEndpoint: null,
+    };
+  },
+
+  async submitBugReport(request: BugReportRequest): Promise<ReportSubmitResult> {
+    await new Promise((r) => setTimeout(r, 180));
+    const safeSlug =
+      request.title
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, "-")
+        .replace(/^-|-$/g, "")
+        .slice(0, 32) || "report";
+    return {
+      sent: false,
+      deduplicated: false,
+      issueNumber: null,
+      issueUrl: null,
+      savedLocalPath: `C:/Users/<user>/AppData/Local/com.easysrt.studio/reports/bug-${safeSlug}.json`,
+      error: "Browser preview mode — report saved locally instead of sending online.",
+    };
+  },
+
+  async submitCrashReport(
+    _request: CrashReportRequest,
+  ): Promise<ReportSubmitResult> {
+    return {
+      sent: false,
+      deduplicated: false,
+      issueNumber: null,
+      issueUrl: null,
+      savedLocalPath:
+        "C:/Users/<user>/AppData/Local/com.easysrt.studio/reports/crash-preview.json",
+      error: "Browser preview mode — crash report stored locally.",
+    };
+  },
+
+  async flushPendingCrashReports(): Promise<number> {
+    return 0;
+  },
+
+  async saveDiagnosticsLocal(): Promise<string> {
+    await new Promise((r) => setTimeout(r, 120));
+    return "C:/Users/<user>/AppData/Local/com.easysrt.studio/reports/diagnostics-0.3.0.txt";
   },
 
   async onDownloadProgress(

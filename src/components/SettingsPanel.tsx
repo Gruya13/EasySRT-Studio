@@ -129,6 +129,7 @@ export function SettingsPanel() {
   const setUiLanguage = useAppStore((s) => s.setUiLanguage);
   const setSetupOpen = useAppStore((s) => s.setSetupOpen);
   const setUpdaterOpen = useAppStore((s) => s.setUpdaterOpen);
+  const setBugReportOpen = useAppStore((s) => s.setBugReportOpen);
   const appVersion = useAppStore((s) => s.appVersion);
   const availableUpdateVersion = useAppStore(
     (s) => s.availableUpdateVersion,
@@ -1578,6 +1579,43 @@ export function SettingsPanel() {
                 </div>
               </div>
             )}
+
+            <label className="s-toggle-card">
+              <span className="s-toggle-meta">
+                <span className="s-toggle-title">
+                  {t.settings.autoSendCrashReports}
+                </span>
+                <span className="s-toggle-hint">
+                  {t.settings.autoSendCrashReportsHint}
+                </span>
+              </span>
+              <input
+                id="s-auto-crash-reports"
+                type="checkbox"
+                checked={config.autoSendCrashReports !== false}
+                onChange={(e) =>
+                  void updateConfig({
+                    autoSendCrashReports: e.target.checked,
+                  })
+                }
+                hidden
+              />
+              <span className="s-switch" aria-hidden="true" />
+            </label>
+
+            <div className="s-action-row">
+              <span id="s-bug-report-status" className="s-note">
+                {t.settings.bugReportRowLabel}
+              </span>
+              <button
+                id="s-btn-report-bug"
+                className="s-mini-btn info"
+                type="button"
+                onClick={() => setBugReportOpen(true)}
+              >
+                {t.settings.bugReportRowBtn}
+              </button>
+            </div>
 
             <div className="s-action-row">
               <span id="s-update-status" className="s-note">

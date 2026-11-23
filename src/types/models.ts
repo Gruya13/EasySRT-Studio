@@ -21,6 +21,9 @@ export interface GpuInfo {
   gpuName: string | null;
   vramMb: number;
   recommendedTier: VramTier;
+  driverVersion?: string | null;
+  cudaSupported?: boolean;
+  cudaStatusNote?: string | null;
 }
 
 export type CatalogItemKind =
@@ -140,6 +143,7 @@ export interface AppConfig {
   defaultScript: SerbianScript;
   export: ExportOptions;
   hasCompletedSetup: boolean;
+  autoSendCrashReports?: boolean;
 }
 
 export interface TimedWord {
@@ -216,4 +220,38 @@ export interface ApiKeyStatus {
 export interface AudioPreviewData {
   mimeType: string;
   base64Data: string;
+}
+
+export interface BugReportRequest {
+  title: string;
+  description: string;
+  steps: string | null;
+  contact: string | null;
+  includeDiagnostics: boolean;
+}
+
+export interface CrashReportRequest {
+  crashKind: string;
+  message: string;
+  stackTrace: string | null;
+  source: string | null;
+}
+
+export interface ReportSubmitResult {
+  sent: boolean;
+  deduplicated: boolean;
+  issueNumber: number | null;
+  issueUrl: string | null;
+  savedLocalPath: string | null;
+  error: string | null;
+}
+
+export interface DiagnosticsPreview {
+  appVersion: string;
+  platform: string;
+  osInfo: string;
+  gpuSummary: string;
+  installedComponents: string[];
+  logExcerpt: string;
+  telemetryEndpoint: string | null;
 }

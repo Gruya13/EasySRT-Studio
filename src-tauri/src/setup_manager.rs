@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter, Manager};
 use uuid::Uuid;
@@ -367,7 +368,8 @@ pub fn check_component_installed(
 /// and default Whisper ASR model) without downloading a heavy local LLM translation model.
 pub fn select_core_runtime_bundle_ids(gpu: &GpuInfo, platform: &str) -> Vec<String> {
     let mut ids = Vec::new();
-    let use_gpu_binaries = gpu.has_nvidia && gpu.recommended_tier != VramTier::CpuOnly;
+    let use_gpu_binaries =
+        gpu.has_nvidia && gpu.cuda_supported && gpu.recommended_tier != VramTier::CpuOnly;
 
     if platform == "windows-x64" {
         ids.push("ffmpeg-win-x64".to_string());
@@ -390,13 +392,7 @@ pub fn select_core_runtime_bundle_ids(gpu: &GpuInfo, platform: &str) -> Vec<Stri
     }
 
     ids.push("vad-silero-v6.2.0".to_string());
-
-    let whisper_model = match gpu.recommended_tier {
-        VramTier::Vram12GbPlus => "whisper-large-v3-turbo",
-        VramTier::Vram8Gb | VramTier::Vram4Gb => "whisper-large-v3-turbo-q5_0",
-        VramTier::CpuOnly => "whisper-medium-q5_0",
-    };
-    ids.push(whisper_model.to_string());
+    ids.push("whisper-large-v3-turbo-q5_0".to_string());
 
     ids
 }
@@ -826,7 +822,7 @@ where
 
     if item.size_bytes == 0 || existing_len < item.size_bytes {
         let client = reqwest::Client::builder()
-            .user_agent("EasySRT-Studio/0.2.0")
+            .user_agent("EasySRT-Studio/0.3.0")
             .connect_timeout(Duration::from_secs(30))
             .build()
             .context("Failed to initialize HTTP download client")?;
@@ -1043,6 +1039,156 @@ pub async fn install_component(
     .await
 }
 
+fn check_cuda_probe_output(
+    label: &str,
+    code: Option<i32>,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> std::result::Result<(), String> {
+    const STATUS_DLL_NOT_FOUND: i32 = -1_073_741_515; // 0xC0000135
+    const STATUS_ENTRYPOINT_NOT_FOUND: i32 = -1_073_741_511; // 0xC0000139
+    const STATUS_INVALID_IMAGE_FORMAT: i32 = -1_073_741_701; // 0xC000007B
+
+    let stderr_trim = stderr.trim();
+    let stdout_trim = stdout.trim();
+    let combined_lower = format!("{stdout_trim}\n{stderr_trim}").to_ascii_lowercase();
+    let stderr_lower = stderr_trim.to_ascii_lowercase();
+
+    let missing_dll_code = matches!(
+        code,
+        Some(STATUS_DLL_NOT_FOUND)
+            | Some(STATUS_ENTRYPOINT_NOT_FOUND)
+            | Some(STATUS_INVALID_IMAGE_FORMAT)
+    );
+    let missing_dll_text = stderr_lower.contains("0xc0000135")
+        || combined_lower.contains("0xc0000135")
+        || ((stderr_lower.contains("nvcuda.dll") || stderr_lower.contains("cublas"))
+            && (stderr_lower.contains("not found")
+                || stderr_lower.contains("missing")
+                || stderr_lower.contains("cannot load")
+                || stderr_lower.contains("could not")
+                || stderr_lower.contains("failed")
+                || !success));
+
+    if !success || missing_dll_code || missing_dll_text {
+        let code_desc = match code {
+            Some(c) if c < 0 => format!("exit code {} (0x{:08X})", c, c as u32),
+            Some(c) => format!("exit code {}", c),
+            None => "terminated by signal".to_string(),
+        };
+        let detail = if !stderr_trim.is_empty() {
+            stderr_trim
+        } else if !stdout_trim.is_empty() {
+            stdout_trim
+        } else {
+            "missing CUDA/DLL dependency or runtime load failure"
+        };
+        return Err(format!("{label} --help failed ({code_desc}): {detail}"));
+    }
+
+    Ok(())
+}
+
+/// Smoke-test extracted Windows CUDA binaries (`whisper-cli.exe --help` and `llama-server.exe --help`)
+/// using the same binary PATH/working-directory environment used at runtime, detecting missing
+/// DLL errors (`0xC0000135` / `nvcuda.dll` / `cublas`) before leaving CUDA binaries active.
+pub fn probe_windows_cuda_runtime(paths: &StoragePaths) -> std::result::Result<(), String> {
+    let whisper_exe = Path::new(&paths.bin_dir)
+        .join("whisper")
+        .join("Release")
+        .join("whisper-cli.exe");
+    let llama_exe = Path::new(&paths.bin_dir)
+        .join("llama")
+        .join("llama-server.exe");
+
+    for (label, exe) in [
+        ("whisper-cli.exe", whisper_exe),
+        ("llama-server.exe", llama_exe),
+    ] {
+        if !exe.is_file() {
+            return Err(format!("{label} not found at {}", exe.display()));
+        }
+
+        let mut cmd = Command::new(&exe);
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::CommandExt;
+            const CREATE_NO_WINDOW: u32 = 0x08000000;
+            cmd.creation_flags(CREATE_NO_WINDOW);
+        }
+
+        let (dir, path_val, ld_val) = crate::pipeline::ffmpeg::build_binary_env_strings(&exe);
+        if let Some(parent) = dir {
+            cmd.current_dir(parent);
+        }
+        if let Some(path) = path_val {
+            cmd.env("PATH", path);
+        }
+        if let Some(ld) = ld_val {
+            cmd.env("LD_LIBRARY_PATH", ld);
+        }
+
+        cmd.arg("--help")
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+
+        let output = cmd
+            .output()
+            .map_err(|err| format!("Failed to launch {label} at {}: {err}", exe.display()))?;
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        check_cuda_probe_output(label, output.status.code(), output.status.success(), &stdout, &stderr)?;
+    }
+
+    Ok(())
+}
+
+async fn install_windows_cpu_fallback<F>(
+    catalog: &CatalogManifest,
+    paths: &StoragePaths,
+    config_path: &Path,
+    resource_dir: Option<&Path>,
+    probe_err: &str,
+    on_progress: &mut F,
+) -> Result<()>
+where
+    F: FnMut(DownloadProgressEvent),
+{
+    tracing::warn!(
+        "Windows CUDA runtime probe failed ({probe_err}); automatically installing CPU fallback binaries"
+    );
+    on_progress(make_progress_event(
+        "cuda-probe",
+        0,
+        0,
+        "warning",
+        format!(
+            "CUDA runtime provera nije uspela ({probe_err}). Automatska instalacija CPU binarnih fajlova..."
+        ),
+    ));
+
+    // Remove stale CUDA runtime marker so status cleanly reflects CPU fallback
+    let llama_dir = Path::new(&paths.bin_dir).join("llama");
+    let _ = fs::remove_file(marker_file_path(&llama_dir, "cudart-win-cuda12.4"));
+
+    for fallback_id in ["whisper-win-cpu", "llama-win-cpu"] {
+        install_component_to_paths(
+            catalog,
+            paths,
+            config_path,
+            resource_dir,
+            fallback_id,
+            &mut *on_progress,
+        )
+        .await?;
+    }
+
+    Ok(())
+}
+
 /// Install the core AI runtime bundle (FFmpeg, CUDA/CPU, Whisper, llama.cpp, VAD, default Whisper
 /// model) into explicit storage paths without installing large translation LLMs.
 pub async fn install_core_runtime_to_paths<F>(
@@ -1052,11 +1198,42 @@ pub async fn install_core_runtime_to_paths<F>(
     config_path: &Path,
     resource_dir: Option<&Path>,
     platform: &str,
+    on_progress: F,
+) -> Result<SetupStatus>
+where
+    F: FnMut(DownloadProgressEvent),
+{
+    install_core_runtime_to_paths_with_options(
+        catalog,
+        gpu,
+        paths,
+        config_path,
+        resource_dir,
+        platform,
+        true,
+        on_progress,
+    )
+    .await
+}
+
+/// Same as `install_core_runtime_to_paths`, allowing CLI bootstrap tests to disable automatic
+/// Windows CUDA->CPU fallback when inspecting raw CUDA binary layout.
+#[allow(clippy::too_many_arguments)]
+pub async fn install_core_runtime_to_paths_with_options<F>(
+    catalog: &CatalogManifest,
+    mut gpu: GpuInfo,
+    paths: &StoragePaths,
+    config_path: &Path,
+    resource_dir: Option<&Path>,
+    platform: &str,
+    allow_cuda_fallback: bool,
     mut on_progress: F,
 ) -> Result<SetupStatus>
 where
     F: FnMut(DownloadProgressEvent),
 {
+    let use_gpu_binaries =
+        gpu.has_nvidia && gpu.cuda_supported && gpu.recommended_tier != VramTier::CpuOnly;
     let bundle_ids = select_core_runtime_bundle_ids(&gpu, platform);
     let mut installed_whisper_id: Option<String> = None;
 
@@ -1083,6 +1260,29 @@ where
         } else {
             // Repair bundled MSVC runtime DLLs beside already-extracted Windows binaries
             ensure_vcruntime_for_item_dir(item, paths, resource_dir);
+        }
+
+        if platform == "windows-x64"
+            && use_gpu_binaries
+            && allow_cuda_fallback
+            && item_id == "llama-win-cuda"
+        {
+            if let Err(probe_err) = probe_windows_cuda_runtime(paths) {
+                install_windows_cpu_fallback(
+                    catalog,
+                    paths,
+                    config_path,
+                    resource_dir,
+                    &probe_err,
+                    &mut on_progress,
+                )
+                .await?;
+                gpu.cuda_supported = false;
+                gpu.recommended_tier = VramTier::CpuOnly;
+                gpu.cuda_status_note = Some(format!(
+                    "CUDA runtime smoke-test failed ({probe_err}); switched automatically to CPU mode."
+                ));
+            }
         }
     }
 
@@ -1130,8 +1330,10 @@ pub async fn install_core_runtime(app: &AppHandle) -> Result<SetupStatus> {
 /// Install the complete recommended offline bundle for the detected GPU tier and platform,
 /// update active model selections in `AppConfig`, and return the resulting `SetupStatus`.
 pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> {
-    let gpu = hardware::detect_gpu();
+    let mut gpu = hardware::detect_gpu();
     let platform = current_platform_tag();
+    let use_gpu_binaries =
+        gpu.has_nvidia && gpu.cuda_supported && gpu.recommended_tier != VramTier::CpuOnly;
     let bundle_ids = select_recommended_bundle_ids(&gpu, platform);
 
     let config = storage::load_config(app)?;
@@ -1170,6 +1372,28 @@ pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> 
         } else {
             ensure_vcruntime_for_item_dir(item, &paths, resource_dir.as_deref());
         }
+
+        if platform == "windows-x64" && use_gpu_binaries && item_id == "llama-win-cuda" {
+            if let Err(probe_err) = probe_windows_cuda_runtime(&paths) {
+                let mut emit_progress = |evt: DownloadProgressEvent| {
+                    let _ = app_handle.emit(EVENT_DOWNLOAD_PROGRESS, evt);
+                };
+                install_windows_cpu_fallback(
+                    &catalog,
+                    &paths,
+                    Path::new(&paths.config_path),
+                    resource_dir.as_deref(),
+                    &probe_err,
+                    &mut emit_progress,
+                )
+                .await?;
+                gpu.cuda_supported = false;
+                gpu.recommended_tier = VramTier::CpuOnly;
+                gpu.cuda_status_note = Some(format!(
+                    "CUDA runtime smoke-test failed ({probe_err}); switched automatically to CPU mode."
+                ));
+            }
+        }
     }
 
     let mut updated_config = storage::load_config(app)?;
@@ -1182,7 +1406,13 @@ pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> 
     updated_config.has_completed_setup = true;
     storage::save_config(app, &updated_config)?;
 
-    get_setup_status(app)
+    Ok(compute_setup_status(
+        &catalog,
+        gpu,
+        paths,
+        &updated_config.custom_models,
+        platform,
+    ))
 }
 
 /// Run headless core runtime bootstrap (`--install-runtime`) invoked by NSIS `NSIS_HOOK_POSTINSTALL`.
@@ -1191,6 +1421,7 @@ pub fn run_cli_bootstrap(args: &[String]) -> i32 {
     let mut data_dir_override: Option<PathBuf> = None;
     let mut force_cpu = false;
     let mut force_cuda = false;
+    let mut no_cuda_fallback = false;
 
     let mut idx = 0usize;
     while idx < args.len() {
@@ -1210,6 +1441,8 @@ pub fn run_cli_bootstrap(args: &[String]) -> i32 {
             force_cpu = true;
         } else if arg == "--force-cuda" {
             force_cuda = true;
+        } else if arg == "--no-cuda-fallback" {
+            no_cuda_fallback = true;
         }
         idx += 1;
     }
@@ -1263,6 +1496,9 @@ pub fn run_cli_bootstrap(args: &[String]) -> i32 {
             gpu_name: None,
             vram_mb: 0,
             recommended_tier: VramTier::CpuOnly,
+            driver_version: None,
+            cuda_supported: false,
+            cuda_status_note: None,
         }
     } else if force_cuda {
         GpuInfo {
@@ -1270,19 +1506,28 @@ pub fn run_cli_bootstrap(args: &[String]) -> i32 {
             gpu_name: Some("Simulated NVIDIA CUDA GPU".to_string()),
             vram_mb: 8192,
             recommended_tier: VramTier::Vram8Gb,
+            driver_version: Some("555.00".to_string()),
+            cuda_supported: true,
+            cuda_status_note: None,
         }
     } else {
         hardware::detect_gpu()
     };
 
-    if gpu.has_nvidia && gpu.recommended_tier == VramTier::CpuOnly {
-        write_log("[EasySRT Setup] NVIDIA GPU detected with < 3500 MB VRAM; using CPU runtime.");
+    if gpu.has_nvidia && (!gpu.cuda_supported || gpu.recommended_tier == VramTier::CpuOnly) {
+        let reason = gpu
+            .cuda_status_note
+            .as_deref()
+            .unwrap_or("NVIDIA GPU does not meet CUDA 12.4 requirements; using CPU runtime.");
+        write_log(&format!("[EasySRT Setup] {reason}"));
+        gpu.cuda_supported = false;
         gpu.recommended_tier = VramTier::CpuOnly;
     } else if gpu.has_nvidia {
         write_log(&format!(
-            "[EasySRT Setup] Detected GPU: {} ({} MB VRAM) -> CUDA 12.4 bundle",
+            "[EasySRT Setup] Detected GPU: {} ({} MB VRAM, driver {}) -> CUDA 12.4 bundle",
             gpu.gpu_name.as_deref().unwrap_or("NVIDIA GPU"),
-            gpu.vram_mb
+            gpu.vram_mb,
+            gpu.driver_version.as_deref().unwrap_or("unknown"),
         ));
     } else {
         write_log("[EasySRT Setup] No NVIDIA GPU detected -> CPU runtime bundle");
@@ -1306,14 +1551,19 @@ pub fn run_cli_bootstrap(args: &[String]) -> i32 {
     let mut last_stage = String::new();
     let mut last_bucket = i32::MIN;
 
-    let result = rt.block_on(install_core_runtime_to_paths(
+    let result = rt.block_on(install_core_runtime_to_paths_with_options(
         &catalog,
         gpu,
         &paths,
         Path::new(&paths.config_path),
         None,
         platform,
+        !no_cuda_fallback,
         |evt| {
+            if evt.stage == "warning" {
+                write_log(&format!("[EasySRT Setup] WARNING: {}", evt.message));
+                return;
+            }
             let bucket = (evt.percent / 10.0).floor() as i32;
             let stage_changed = evt.item_id != last_item || evt.stage != last_stage;
             if stage_changed || (evt.stage == "downloading" && bucket > last_bucket) {
@@ -1809,6 +2059,9 @@ mod tests {
             gpu_name: Some("NVIDIA GeForce RTX 3050 Laptop GPU".to_string()),
             vram_mb: 4096,
             recommended_tier: VramTier::Vram4Gb,
+            driver_version: Some("551.86".to_string()),
+            cuda_supported: true,
+            cuda_status_note: None,
         };
         let win_4gb = select_recommended_bundle_ids(&gpu_4gb, "windows-x64");
         assert_eq!(
@@ -1830,17 +2083,23 @@ mod tests {
             gpu_name: Some("NVIDIA GeForce RTX 4060".to_string()),
             vram_mb: 8188,
             recommended_tier: VramTier::Vram8Gb,
+            driver_version: Some("555.85".to_string()),
+            cuda_supported: true,
+            cuda_status_note: None,
         };
         let win_8gb = select_recommended_bundle_ids(&gpu_8gb, "windows-x64");
         assert!(win_8gb.contains(&"whisper-large-v3-turbo-q5_0".to_string()));
         assert!(win_8gb.contains(&"llm-gemma4-e4b-qat".to_string()));
 
-        // 3. Linux 12GB+ NVIDIA (e.g. RTX 4070 Ti / 3090)
+        // 3. Linux 12GB+ NVIDIA (e.g. RTX 4070 Ti / 3090) — still defaults to Large V3 Turbo Q5_0
         let gpu_12gb = GpuInfo {
             has_nvidia: true,
             gpu_name: Some("NVIDIA GeForce RTX 3090".to_string()),
             vram_mb: 24576,
             recommended_tier: VramTier::Vram12GbPlus,
+            driver_version: Some("560.35.03".to_string()),
+            cuda_supported: true,
+            cuda_status_note: None,
         };
         let linux_12gb = select_recommended_bundle_ids(&gpu_12gb, "linux-x64");
         assert_eq!(
@@ -1850,17 +2109,20 @@ mod tests {
                 "whisper-linux-x64",
                 "llama-linux-vulkan",
                 "vad-silero-v6.2.0",
-                "whisper-large-v3-turbo",
+                "whisper-large-v3-turbo-q5_0",
                 "llm-gemma4-12b-qat",
             ]
         );
 
-        // 4. Windows CPU-only fallback
+        // 4. Windows CPU-only fallback — also defaults to Large V3 Turbo Q5_0
         let cpu_only = GpuInfo {
             has_nvidia: false,
             gpu_name: None,
             vram_mb: 0,
             recommended_tier: VramTier::CpuOnly,
+            driver_version: None,
+            cuda_supported: false,
+            cuda_status_note: None,
         };
         let win_cpu = select_recommended_bundle_ids(&cpu_only, "windows-x64");
         assert_eq!(
@@ -1870,8 +2132,30 @@ mod tests {
                 "whisper-win-cpu",
                 "llama-win-cpu",
                 "vad-silero-v6.2.0",
-                "whisper-medium-q5_0",
+                "whisper-large-v3-turbo-q5_0",
                 "llm-gemma3-4b-q4km",
+            ]
+        );
+
+        // 5. NVIDIA GPU with unsupported driver (cuda_supported = false) uses CPU binaries
+        let old_driver_gpu = GpuInfo {
+            has_nvidia: true,
+            gpu_name: Some("NVIDIA GeForce RTX 3060".to_string()),
+            vram_mb: 12288,
+            recommended_tier: VramTier::Vram12GbPlus,
+            driver_version: Some("535.98".to_string()),
+            cuda_supported: false,
+            cuda_status_note: Some("Old driver".to_string()),
+        };
+        let win_old_drv = select_core_runtime_bundle_ids(&old_driver_gpu, "windows-x64");
+        assert_eq!(
+            win_old_drv,
+            vec![
+                "ffmpeg-win-x64",
+                "whisper-win-cpu",
+                "llama-win-cpu",
+                "vad-silero-v6.2.0",
+                "whisper-large-v3-turbo-q5_0",
             ]
         );
     }
@@ -1919,6 +2203,9 @@ mod tests {
             gpu_name: Some("NVIDIA GeForce RTX 3050 Laptop GPU".to_string()),
             vram_mb: 4096,
             recommended_tier: VramTier::Vram4Gb,
+            driver_version: Some("551.86".to_string()),
+            cuda_supported: true,
+            cuda_status_note: None,
         };
         let core_ids = select_core_runtime_bundle_ids(&gpu_4gb, "windows-x64");
         assert_eq!(
@@ -1939,6 +2226,9 @@ mod tests {
             gpu_name: None,
             vram_mb: 0,
             recommended_tier: VramTier::CpuOnly,
+            driver_version: None,
+            cuda_supported: false,
+            cuda_status_note: None,
         };
         let win_cpu_core = select_core_runtime_bundle_ids(&cpu_only, "windows-x64");
         assert_eq!(
@@ -1948,7 +2238,7 @@ mod tests {
                 "whisper-win-cpu",
                 "llama-win-cpu",
                 "vad-silero-v6.2.0",
-                "whisper-medium-q5_0",
+                "whisper-large-v3-turbo-q5_0",
             ]
         );
 
@@ -2027,6 +2317,43 @@ mod tests {
         // Second pass skips unchanged DLLs cleanly
         assert_eq!(copy_vcruntime_dlls_from_dir(&src, &dst).unwrap(), 0);
 
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn cuda_probe_detects_missing_dll_exit_codes_and_error_text() {
+        assert!(check_cuda_probe_output("whisper-cli.exe", Some(0), true, "usage: whisper-cli", "").is_ok());
+
+        let ntstatus_err =
+            check_cuda_probe_output("whisper-cli.exe", Some(-1_073_741_515), false, "", "")
+                .unwrap_err();
+        assert!(ntstatus_err.contains("0xC0000135"));
+
+        let nvcuda_err = check_cuda_probe_output(
+            "llama-server.exe",
+            Some(0),
+            true,
+            "",
+            "Failed to load nvcuda.dll",
+        )
+        .unwrap_err();
+        assert!(nvcuda_err.contains("nvcuda.dll"));
+
+        let cublas_err = check_cuda_probe_output(
+            "llama-server.exe",
+            Some(1),
+            false,
+            "",
+            "cublas64_12.dll was not found",
+        )
+        .unwrap_err();
+        assert!(cublas_err.contains("cublas64_12.dll"));
+
+        // Missing binaries in a fresh directory should fail probe cleanly
+        let dir = make_temp_dir("cuda_probe_missing");
+        let paths =
+            storage::resolve_storage_paths_from_root(&dir, StorageMode::Installed, None).unwrap();
+        assert!(probe_windows_cuda_runtime(&paths).is_err());
         let _ = fs::remove_dir_all(&dir);
     }
 }

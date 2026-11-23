@@ -1,12 +1,13 @@
 //! Tauri IPC command surface matching `src/lib/tauri.ts`.
 
 use crate::models::{
-    ApiKeyStatus, AppConfig, AudioPreviewData, CatalogItemKind, CatalogManifest, CustomModelEntry,
-    ExportOptions, ExportResult, InstalledComponentStatus, JobOptions, SegmentRules,
-    SerbianScript, SetupStatus, SubtitleCue, SubtitleProject, TranslationProviderKind,
+    ApiKeyStatus, AppConfig, AudioPreviewData, BugReportRequest, CatalogItemKind, CatalogManifest,
+    CrashReportRequest, CustomModelEntry, DiagnosticsPreview, ExportOptions, ExportResult,
+    InstalledComponentStatus, JobOptions, ReportSubmitResult, SegmentRules, SerbianScript,
+    SetupStatus, SubtitleCue, SubtitleProject, TranslationProviderKind,
 };
 use crate::pipeline::{self, PipelineState};
-use crate::{setup_manager, storage};
+use crate::{diagnostics, setup_manager, storage};
 use std::path::Path;
 use tauri::{AppHandle, State};
 
@@ -393,6 +394,49 @@ pub async fn set_window_maximized(
         window.unmaximize().map_err(|e| e.to_string())?;
     }
     Ok(target)
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics, Crash Reporting, & Bug Report Commands
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub async fn collect_diagnostics_preview(app: AppHandle) -> Result<DiagnosticsPreview, String> {
+    diagnostics::collect_diagnostics_preview(&app)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn submit_bug_report(
+    app: AppHandle,
+    request: BugReportRequest,
+) -> Result<ReportSubmitResult, String> {
+    diagnostics::submit_bug_report(&app, request)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn submit_crash_report(
+    app: AppHandle,
+    request: CrashReportRequest,
+) -> Result<ReportSubmitResult, String> {
+    diagnostics::submit_crash_report(&app, request)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn flush_pending_crash_reports(app: AppHandle) -> Result<u32, String> {
+    diagnostics::flush_pending_crash_reports(&app)
+        .await
+        .map_err(map_err)
+}
+
+#[tauri::command]
+pub async fn save_diagnostics_local(app: AppHandle) -> Result<String, String> {
+    diagnostics::save_diagnostics_local(&app).map_err(map_err)
 }
 
 #[cfg(test)]

@@ -5,15 +5,19 @@ import type {
   ApiKeyStatus,
   AppConfig,
   AudioPreviewData,
+  BugReportRequest,
   CatalogItemKind,
   CatalogManifest,
+  CrashReportRequest,
   CustomModelEntry,
+  DiagnosticsPreview,
   DownloadProgressEvent,
   ExportOptions,
   ExportResult,
   InstalledComponentStatus,
   JobOptions,
   JobProgressEvent,
+  ReportSubmitResult,
   SegmentRules,
   SerbianScript,
   SetupStatus,
@@ -329,6 +333,49 @@ export async function openDialogPreservingMaximize(
       }, 120);
     }
   }
+}
+
+// ---------------------------------------------------------------------------
+// Diagnostics, Bug Reports & Crash Telemetry Commands
+// ---------------------------------------------------------------------------
+
+export function collectDiagnosticsPreview(): Promise<DiagnosticsPreview> {
+  if (!isTauriRuntime()) {
+    return browserFallback.collectDiagnosticsPreview();
+  }
+  return invoke<DiagnosticsPreview>("collect_diagnostics_preview");
+}
+
+export function submitBugReport(
+  request: BugReportRequest,
+): Promise<ReportSubmitResult> {
+  if (!isTauriRuntime()) {
+    return browserFallback.submitBugReport(request);
+  }
+  return invoke<ReportSubmitResult>("submit_bug_report", { request });
+}
+
+export function submitCrashReport(
+  request: CrashReportRequest,
+): Promise<ReportSubmitResult> {
+  if (!isTauriRuntime()) {
+    return browserFallback.submitCrashReport(request);
+  }
+  return invoke<ReportSubmitResult>("submit_crash_report", { request });
+}
+
+export function flushPendingCrashReports(): Promise<number> {
+  if (!isTauriRuntime()) {
+    return browserFallback.flushPendingCrashReports();
+  }
+  return invoke<number>("flush_pending_crash_reports");
+}
+
+export function saveDiagnosticsLocal(): Promise<string> {
+  if (!isTauriRuntime()) {
+    return browserFallback.saveDiagnosticsLocal();
+  }
+  return invoke<string>("save_diagnostics_local");
 }
 
 // ---------------------------------------------------------------------------

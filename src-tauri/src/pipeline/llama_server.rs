@@ -267,7 +267,13 @@ impl LlamaServerGuard {
                 )
                 .await
                 .map_err(|cpu_err| {
-                    anyhow!("llama-server GPU startup failed ({gpu_err}); CPU fallback also failed ({cpu_err})")
+                    let msg = format!(
+                        "llama-server GPU startup failed ({gpu_err}); CPU fallback also failed ({cpu_err})"
+                    );
+                    if !cancel_flag.load(Ordering::SeqCst) {
+                        crate::diagnostics::record_subprocess_failure_async("llama-server", &msg);
+                    }
+                    anyhow!(msg)
                 })
             }
         }

@@ -20,6 +20,7 @@ import {
   deleteCheckpoint,
   deleteModel,
   exportSubtitles,
+  flushPendingCrashReports,
   getApiKeyStatus,
   getCatalog,
   getConfig,
@@ -131,6 +132,7 @@ const DEFAULT_CONFIG: AppConfig = {
     utf8Bom: true,
   },
   hasCompletedSetup: false,
+  autoSendCrashReports: true,
 };
 
 const DEFAULT_JOB_OPTIONS: JobOptions = {
@@ -175,6 +177,7 @@ interface AppStoreState {
   isExportOpen: boolean;
   isUpdaterOpen: boolean;
   isCheckpointsOpen: boolean;
+  isBugReportOpen: boolean;
   appVersion: string;
   availableUpdateVersion: string | null;
   onlineConfirm: OnlineConfirmState;
@@ -194,6 +197,7 @@ interface AppStoreState {
   setExportOpen: (open: boolean) => void;
   setUpdaterOpen: (open: boolean) => void;
   setCheckpointsOpen: (open: boolean) => void;
+  setBugReportOpen: (open: boolean) => void;
 
   runInstallComponent: (itemId: string) => Promise<void>;
   runInstallCoreRuntime: () => Promise<void>;
@@ -419,7 +423,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     isExportOpen: false,
     isUpdaterOpen: false,
     isCheckpointsOpen: false,
-    appVersion: "0.2.0",
+    isBugReportOpen: false,
+    appVersion: "0.3.0",
     availableUpdateVersion: null,
     onlineConfirm: {
       open: false,
@@ -485,13 +490,14 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getApiKeyStatus(),
           listCheckpoints(),
           isTauriRuntime()
-            ? getVersion().catch(() => "0.2.0")
-            : Promise.resolve("0.2.0"),
+            ? getVersion().catch(() => "0.3.0")
+            : Promise.resolve("0.3.0"),
         ]);
 
         const config: AppConfig = {
           ...DEFAULT_CONFIG,
           ...loadedConfig,
+          autoSendCrashReports: loadedConfig.autoSendCrashReports ?? true,
           uiLanguage: normalizeUiLanguage(loadedConfig.uiLanguage),
         };
 
@@ -528,6 +534,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           activeCueId: stateBeforeInit.activeCueId,
           batchQueue: stateBeforeInit.batchQueue,
         });
+
+        // Flush pending Rust panic / crash reports queued on disk (silent, non-blocking)
+        if (config.autoSendCrashReports !== false) {
+          void flushPendingCrashReports().catch(() => {});
+        }
 
         // Background GitHub latest-release version check (silent, non-blocking)
         void fetch(
@@ -617,6 +628,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     setExportOpen: (open) => set({ isExportOpen: open }),
     setUpdaterOpen: (open) => set({ isUpdaterOpen: open }),
     setCheckpointsOpen: (open) => set({ isCheckpointsOpen: open }),
+    setBugReportOpen: (open) => set({ isBugReportOpen: open }),
 
     runInstallComponent: async (itemId) => {
       set((state) => ({

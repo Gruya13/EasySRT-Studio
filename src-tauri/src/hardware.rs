@@ -1,4 +1,5 @@
-//! GPU & VRAM detection (NVIDIA nvidia-smi probing and tier classification).
+//! GPU & VRAM detection (NVIDIA nvidia-smi probing, CUDA 12.4 driver validation,
+//! and VRAM tier classification).
 
 use crate::models::{GpuInfo, VramTier};
 use std::process::Command;
@@ -8,6 +9,10 @@ use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Minimum NVIDIA driver version required for CUDA 12.4 (`550.54`).
+pub const MIN_CUDA_12_4_DRIVER_MAJOR: u32 = 550;
+pub const MIN_CUDA_12_4_DRIVER_MINOR: u32 = 54;
 
 /// Classify a VRAM capacity in MiB into the recommended hardware tier.
 pub fn classify_vram_tier(vram_mb: u64) -> VramTier {
@@ -22,10 +27,70 @@ pub fn classify_vram_tier(vram_mb: u64) -> VramTier {
     }
 }
 
-/// Pure parser for `nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits` output.
-/// When multiple NVIDIA GPUs are listed, selects the GPU with the highest VRAM capacity.
-pub fn parse_nvidia_smi_output(raw: &str) -> GpuInfo {
-    let mut best_gpu: Option<(String, u64)> = None;
+/// Parse an NVIDIA driver version string such as `"550.54"`, `"551.86"`, or `"560.35.03"`
+/// into `(major, minor)`.
+pub fn parse_driver_version(raw: &str) -> Option<(u32, u32)> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let mut parts = trimmed.split('.');
+    let major = parts.next()?.trim().parse::<u32>().ok()?;
+    let minor = parts.next()?.trim().parse::<u32>().ok()?;
+    Some((major, minor))
+}
+
+/// Return `true` when `driver_version` meets or exceeds the CUDA 12.4 minimum (`550.54`).
+pub fn is_cuda_12_4_driver_supported(driver_version: &str) -> bool {
+    matches!(
+        parse_driver_version(driver_version),
+        Some((major, minor))
+            if major > MIN_CUDA_12_4_DRIVER_MAJOR
+                || (major == MIN_CUDA_12_4_DRIVER_MAJOR && minor >= MIN_CUDA_12_4_DRIVER_MINOR)
+    )
+}
+
+fn parse_vram_mb(raw: &str) -> Option<u64> {
+    let first_token = raw.split_whitespace().next()?;
+    let parsed = first_token
+        .parse::<u64>()
+        .ok()
+        .or_else(|| first_token.parse::<f64>().ok().map(|v| v.round() as u64))?;
+    if parsed == 0 {
+        None
+    } else {
+        Some(parsed)
+    }
+}
+
+fn normalize_driver_field(raw: &str) -> Option<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower == "n/a" || lower == "[n/a]" || lower.contains("not supported") {
+        return None;
+    }
+    Some(trimmed.to_string())
+}
+
+fn windows_nvcuda_dll_exists() -> bool {
+    #[cfg(windows)]
+    {
+        std::path::Path::new(r"C:\Windows\System32\nvcuda.dll").is_file()
+    }
+    #[cfg(not(windows))]
+    {
+        true
+    }
+}
+
+/// Pure parser for `nvidia-smi --query-gpu=name,memory.total[,driver_version] --format=csv,noheader,nounits`
+/// with an explicit `nvcuda_present` flag (allowing deterministic testing of the Windows `nvcuda.dll` check).
+pub fn parse_nvidia_smi_output_with_nvcuda(raw: &str, nvcuda_present: bool) -> GpuInfo {
+    let mut best_gpu: Option<(String, u64, Option<String>)> = None;
 
     for line in raw.lines() {
         let trimmed = line.trim();
@@ -33,62 +98,135 @@ pub fn parse_nvidia_smi_output(raw: &str) -> GpuInfo {
             continue;
         }
 
-        let Some((name_part, mem_part)) = trimmed.rsplit_once(',') else {
-            continue;
-        };
-
-        let gpu_name = name_part.trim();
-        if gpu_name.is_empty() {
+        let parts: Vec<&str> = trimmed.split(',').collect();
+        if parts.len() < 2 {
             continue;
         }
 
-        let Some(first_token) = mem_part.split_whitespace().next() else {
-            continue;
+        // Try 3-column format (`name, memory.total, driver_version`) first when >= 3 comma-separated
+        // fields exist and the second-to-last column parses cleanly as VRAM MiB.
+        let parsed_row: Option<(String, u64, Option<String>)> = if parts.len() >= 3 {
+            if let Some(vram_mb) = parse_vram_mb(parts[parts.len() - 2]) {
+                let gpu_name = parts[..parts.len() - 2].join(",").trim().to_string();
+                let driver = normalize_driver_field(parts[parts.len() - 1]);
+                if gpu_name.is_empty() {
+                    None
+                } else {
+                    Some((gpu_name, vram_mb, driver))
+                }
+            } else if let Some(vram_mb) = parse_vram_mb(parts[parts.len() - 1]) {
+                // Legacy 2-column fallback where GPU name itself contained a comma
+                let gpu_name = parts[..parts.len() - 1].join(",").trim().to_string();
+                if gpu_name.is_empty() {
+                    None
+                } else {
+                    Some((gpu_name, vram_mb, None))
+                }
+            } else {
+                None
+            }
+        } else if let Some(vram_mb) = parse_vram_mb(parts[1]) {
+            let gpu_name = parts[0].trim().to_string();
+            if gpu_name.is_empty() {
+                None
+            } else {
+                Some((gpu_name, vram_mb, None))
+            }
+        } else {
+            None
         };
 
-        let parsed_vram = first_token
-            .parse::<u64>()
-            .ok()
-            .or_else(|| first_token.parse::<f64>().ok().map(|v| v.round() as u64));
-
-        let Some(vram_mb) = parsed_vram else {
+        let Some((gpu_name, vram_mb, driver_version)) = parsed_row else {
             continue;
         };
-
-        if vram_mb == 0 {
-            continue;
-        }
 
         match &best_gpu {
-            Some((_, best_vram)) if *best_vram >= vram_mb => {}
+            Some((_, best_vram, _)) if *best_vram >= vram_mb => {}
             _ => {
-                best_gpu = Some((gpu_name.to_string(), vram_mb));
+                best_gpu = Some((gpu_name, vram_mb, driver_version));
             }
         }
     }
 
-    match best_gpu {
-        Some((name, vram_mb)) => GpuInfo {
-            has_nvidia: true,
-            gpu_name: Some(name),
-            vram_mb,
-            recommended_tier: classify_vram_tier(vram_mb),
-        },
-        None => GpuInfo {
+    let Some((name, vram_mb, driver_version)) = best_gpu else {
+        return GpuInfo {
             has_nvidia: false,
             gpu_name: None,
             vram_mb: 0,
             recommended_tier: VramTier::CpuOnly,
-        },
+            driver_version: None,
+            cuda_supported: false,
+            cuda_status_note: None,
+        };
+    };
+
+    if vram_mb < 3500 {
+        return GpuInfo {
+            has_nvidia: true,
+            gpu_name: Some(name),
+            vram_mb,
+            recommended_tier: VramTier::CpuOnly,
+            driver_version,
+            cuda_supported: false,
+            cuda_status_note: Some(format!(
+                "NVIDIA GPU has {} MB VRAM (< 3500 MB required for CUDA 12.4); using CPU mode.",
+                vram_mb
+            )),
+        };
+    }
+
+    if let Some(ref drv) = driver_version {
+        if !is_cuda_12_4_driver_supported(drv) {
+            return GpuInfo {
+                has_nvidia: true,
+                gpu_name: Some(name),
+                vram_mb,
+                recommended_tier: VramTier::CpuOnly,
+                driver_version: Some(drv.clone()),
+                cuda_supported: false,
+                cuda_status_note: Some(format!(
+                    "NVIDIA driver {} is older than 550.54 required for CUDA 12.4; using CPU mode.",
+                    drv
+                )),
+            };
+        }
+    }
+
+    if !nvcuda_present {
+        return GpuInfo {
+            has_nvidia: true,
+            gpu_name: Some(name),
+            vram_mb,
+            recommended_tier: VramTier::CpuOnly,
+            driver_version,
+            cuda_supported: false,
+            cuda_status_note: Some(
+                "NVIDIA CUDA driver library (C:\\Windows\\System32\\nvcuda.dll) was not found; using CPU mode."
+                    .to_string(),
+            ),
+        };
+    }
+
+    GpuInfo {
+        has_nvidia: true,
+        gpu_name: Some(name),
+        vram_mb,
+        recommended_tier: classify_vram_tier(vram_mb),
+        driver_version,
+        cuda_supported: true,
+        cuda_status_note: None,
     }
 }
 
-fn run_nvidia_smi_command(binary: &str) -> Option<String> {
+/// Pure parser for `nvidia-smi --query-gpu=name,memory.total[,driver_version] --format=csv,noheader,nounits` output.
+/// When multiple NVIDIA GPUs are listed, selects the GPU with the highest VRAM capacity.
+pub fn parse_nvidia_smi_output(raw: &str) -> GpuInfo {
+    parse_nvidia_smi_output_with_nvcuda(raw, true)
+}
+
+fn run_nvidia_smi_query(binary: &str, query: &str) -> Option<String> {
     let mut cmd = Command::new(binary);
-    cmd.args([
-        "--query-gpu=name,memory.total",
-        "--format=csv,noheader,nounits",
-    ]);
+    cmd.args([query, "--format=csv,noheader,nounits"]);
 
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
@@ -101,7 +239,14 @@ fn run_nvidia_smi_command(binary: &str) -> Option<String> {
     String::from_utf8(output.stdout).ok()
 }
 
-/// Probe the system for an NVIDIA GPU using `nvidia-smi` and classify its VRAM tier.
+fn run_nvidia_smi_command(binary: &str) -> Option<String> {
+    run_nvidia_smi_query(binary, "--query-gpu=name,memory.total,driver_version")
+        .filter(|out| !out.trim().is_empty())
+        .or_else(|| run_nvidia_smi_query(binary, "--query-gpu=name,memory.total"))
+}
+
+/// Probe the system for an NVIDIA GPU using `nvidia-smi`, validate CUDA 12.4 driver support
+/// (and `C:\Windows\System32\nvcuda.dll` on Windows), and classify its VRAM tier.
 pub fn detect_gpu() -> GpuInfo {
     let candidates: &[&str] = &[
         "nvidia-smi",
@@ -111,9 +256,11 @@ pub fn detect_gpu() -> GpuInfo {
         r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
     ];
 
+    let nvcuda_present = windows_nvcuda_dll_exists();
+
     for bin in candidates {
         if let Some(stdout) = run_nvidia_smi_command(bin) {
-            let info = parse_nvidia_smi_output(&stdout);
+            let info = parse_nvidia_smi_output_with_nvcuda(&stdout, nvcuda_present);
             if info.has_nvidia {
                 return info;
             }
@@ -125,6 +272,9 @@ pub fn detect_gpu() -> GpuInfo {
         gpu_name: None,
         vram_mb: 0,
         recommended_tier: VramTier::CpuOnly,
+        driver_version: None,
+        cuda_supported: false,
+        cuda_status_note: None,
     }
 }
 
@@ -133,7 +283,78 @@ mod tests {
     use super::*;
 
     #[test]
-    fn parses_4gb_rtx_3050_laptop_gpu() {
+    fn parses_driver_versions_and_validates_cuda_12_4_threshold() {
+        assert_eq!(parse_driver_version("550.54"), Some((550, 54)));
+        assert_eq!(parse_driver_version("560.35.03"), Some((560, 35)));
+        assert_eq!(parse_driver_version("535.98"), Some((535, 98)));
+        assert_eq!(parse_driver_version("invalid"), None);
+        assert_eq!(parse_driver_version(""), None);
+
+        assert!(is_cuda_12_4_driver_supported("550.54"));
+        assert!(is_cuda_12_4_driver_supported("550.90.07"));
+        assert!(is_cuda_12_4_driver_supported("551.86"));
+        assert!(is_cuda_12_4_driver_supported("560.35.03"));
+
+        assert!(!is_cuda_12_4_driver_supported("550.53"));
+        assert!(!is_cuda_12_4_driver_supported("535.98"));
+        assert!(!is_cuda_12_4_driver_supported("512.15"));
+        assert!(!is_cuda_12_4_driver_supported("not-a-version"));
+    }
+
+    #[test]
+    fn accepts_cuda_12_4_supported_driver_550_54_plus() {
+        let raw = "NVIDIA GeForce RTX 4060, 8188, 550.54\r\n";
+        let info = parse_nvidia_smi_output(raw);
+        assert!(info.has_nvidia);
+        assert_eq!(info.gpu_name.as_deref(), Some("NVIDIA GeForce RTX 4060"));
+        assert_eq!(info.vram_mb, 8188);
+        assert_eq!(info.driver_version.as_deref(), Some("550.54"));
+        assert!(info.cuda_supported);
+        assert_eq!(info.recommended_tier, VramTier::Vram8Gb);
+        assert_eq!(info.cuda_status_note, None);
+
+        let raw_newer = "NVIDIA GeForce RTX 4090, 24564, 560.35.03\n";
+        let info_newer = parse_nvidia_smi_output(raw_newer);
+        assert!(info_newer.cuda_supported);
+        assert_eq!(info_newer.driver_version.as_deref(), Some("560.35.03"));
+        assert_eq!(info_newer.recommended_tier, VramTier::Vram12GbPlus);
+        assert_eq!(info_newer.cuda_status_note, None);
+    }
+
+    #[test]
+    fn downgrades_old_driver_535_98_to_cpu_only_with_note() {
+        let raw = "NVIDIA GeForce RTX 3060, 12288, 535.98\n";
+        let info = parse_nvidia_smi_output(raw);
+        assert!(info.has_nvidia);
+        assert_eq!(info.gpu_name.as_deref(), Some("NVIDIA GeForce RTX 3060"));
+        assert_eq!(info.vram_mb, 12288);
+        assert_eq!(info.driver_version.as_deref(), Some("535.98"));
+        assert!(!info.cuda_supported);
+        assert_eq!(info.recommended_tier, VramTier::CpuOnly);
+        let note = info
+            .cuda_status_note
+            .as_deref()
+            .expect("Expected cuda_status_note for old driver");
+        assert!(note.contains("535.98"));
+        assert!(note.contains("550.54"));
+    }
+
+    #[test]
+    fn downgrades_when_windows_nvcuda_dll_is_missing() {
+        let raw = "NVIDIA GeForce RTX 4070, 12282, 555.85\n";
+        let info = parse_nvidia_smi_output_with_nvcuda(raw, false);
+        assert!(info.has_nvidia);
+        assert!(!info.cuda_supported);
+        assert_eq!(info.recommended_tier, VramTier::CpuOnly);
+        assert!(info
+            .cuda_status_note
+            .as_deref()
+            .unwrap_or("")
+            .contains("nvcuda.dll"));
+    }
+
+    #[test]
+    fn parses_4gb_rtx_3050_laptop_gpu_legacy_two_column() {
         let raw = "NVIDIA GeForce RTX 3050 Laptop GPU, 4096\n";
         let info = parse_nvidia_smi_output(raw);
         assert!(info.has_nvidia);
@@ -142,7 +363,10 @@ mod tests {
             Some("NVIDIA GeForce RTX 3050 Laptop GPU")
         );
         assert_eq!(info.vram_mb, 4096);
+        assert_eq!(info.driver_version, None);
+        assert!(info.cuda_supported);
         assert_eq!(info.recommended_tier, VramTier::Vram4Gb);
+        assert_eq!(info.cuda_status_note, None);
     }
 
     #[test]
@@ -152,6 +376,7 @@ mod tests {
         assert!(info.has_nvidia);
         assert_eq!(info.gpu_name.as_deref(), Some("NVIDIA GeForce RTX 4060"));
         assert_eq!(info.vram_mb, 8188);
+        assert!(info.cuda_supported);
         assert_eq!(info.recommended_tier, VramTier::Vram8Gb);
     }
 
@@ -165,37 +390,43 @@ mod tests {
             Some("NVIDIA GeForce RTX 4070 Ti")
         );
         assert_eq!(info_4070.vram_mb, 12282);
+        assert!(info_4070.cuda_supported);
         assert_eq!(info_4070.recommended_tier, VramTier::Vram12GbPlus);
 
         let raw_3090 = "NVIDIA GeForce RTX 3090, 24576";
         let info_3090 = parse_nvidia_smi_output(raw_3090);
         assert!(info_3090.has_nvidia);
         assert_eq!(info_3090.vram_mb, 24576);
+        assert!(info_3090.cuda_supported);
         assert_eq!(info_3090.recommended_tier, VramTier::Vram12GbPlus);
     }
 
     #[test]
     fn selects_max_vram_gpu_on_multi_gpu_output() {
         let raw = "\
-NVIDIA GeForce GTX 1650, 4096
-NVIDIA GeForce RTX 3080, 10240
-NVIDIA GeForce RTX 3090, 24576
+NVIDIA GeForce GTX 1650, 4096, 551.86
+NVIDIA GeForce RTX 3080, 10240, 551.86
+NVIDIA GeForce RTX 3090, 24576, 551.86
 ";
         let info = parse_nvidia_smi_output(raw);
         assert!(info.has_nvidia);
         assert_eq!(info.gpu_name.as_deref(), Some("NVIDIA GeForce RTX 3090"));
         assert_eq!(info.vram_mb, 24576);
+        assert_eq!(info.driver_version.as_deref(), Some("551.86"));
+        assert!(info.cuda_supported);
         assert_eq!(info.recommended_tier, VramTier::Vram12GbPlus);
     }
 
     #[test]
     fn handles_low_vram_nvidia_as_cpu_only_tier() {
-        let raw = "NVIDIA GeForce MX150, 2048\n";
+        let raw = "NVIDIA GeForce MX150, 2048, 551.86\n";
         let info = parse_nvidia_smi_output(raw);
         assert!(info.has_nvidia);
         assert_eq!(info.gpu_name.as_deref(), Some("NVIDIA GeForce MX150"));
         assert_eq!(info.vram_mb, 2048);
+        assert!(!info.cuda_supported);
         assert_eq!(info.recommended_tier, VramTier::CpuOnly);
+        assert!(info.cuda_status_note.is_some());
     }
 
     #[test]
@@ -204,6 +435,7 @@ NVIDIA GeForce RTX 3090, 24576
         assert!(!empty.has_nvidia);
         assert_eq!(empty.gpu_name, None);
         assert_eq!(empty.vram_mb, 0);
+        assert!(!empty.cuda_supported);
         assert_eq!(empty.recommended_tier, VramTier::CpuOnly);
 
         let err = parse_nvidia_smi_output(
@@ -212,6 +444,7 @@ NVIDIA GeForce RTX 3090, 24576
         assert!(!err.has_nvidia);
         assert_eq!(err.gpu_name, None);
         assert_eq!(err.vram_mb, 0);
+        assert!(!err.cuda_supported);
         assert_eq!(err.recommended_tier, VramTier::CpuOnly);
     }
 }

@@ -19,6 +19,7 @@ export function TopBar() {
   const setSetupOpen = useAppStore((s) => s.setSetupOpen);
   const setExportOpen = useAppStore((s) => s.setExportOpen);
   const setUpdaterOpen = useAppStore((s) => s.setUpdaterOpen);
+  const setBugReportOpen = useAppStore((s) => s.setBugReportOpen);
 
   const [maximized, setMaximized] = useState(false);
 
@@ -107,6 +108,15 @@ export function TopBar() {
           title={t.topBar.export}
         >
           <span>{lang === "en" ? "Export" : "Izvoz"}</span>
+        </button>
+
+        <button
+          type="button"
+          className="tb-quick-btn"
+          onClick={() => setBugReportOpen(true)}
+          title={t.topBar.reportBug}
+        >
+          <span>{t.topBar.reportBug}</span>
         </button>
 
         {banner && (

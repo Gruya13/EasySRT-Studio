@@ -1507,10 +1507,12 @@ where
                 effective_bin = fallback;
                 used_fallback = true;
             } else {
-                return Err(anyhow!(
+                let msg = format!(
                     "Whisper binary at {} cannot run due to missing shared libraries or runtime error ({diag}). Install Vulkan/CUDA runtime libraries (e.g., libvulkan1 on Linux) or switch to the CPU whisper-cli build in Setup.",
                     whisper_bin.display()
-                ));
+                );
+                crate::diagnostics::record_subprocess_failure_async("whisper-cli", &msg);
+                return Err(anyhow!(msg));
             }
         }
         WhisperProbeResult::NonFatalProbeExit(diag) => {
@@ -1561,19 +1563,41 @@ where
                     .await
                     {
                         Ok(out) => Ok(out),
-                        Err(WhisperExecError::MissingSharedLibrary(d)) => Err(anyhow!(
-                            "Whisper fallback binary also failed due to missing shared libraries: {d}"
-                        )),
-                        Err(WhisperExecError::Other(err)) => Err(err),
+                        Err(WhisperExecError::MissingSharedLibrary(d)) => {
+                            let msg = format!(
+                                "Whisper fallback binary also failed due to missing shared libraries: {d}"
+                            );
+                            crate::diagnostics::record_subprocess_failure_async("whisper-cli", &msg);
+                            Err(anyhow!(msg))
+                        }
+                        Err(WhisperExecError::Other(err)) => {
+                            if !cancel_flag.load(Ordering::SeqCst) {
+                                crate::diagnostics::record_subprocess_failure_async(
+                                    "whisper-cli",
+                                    &err.to_string(),
+                                );
+                            }
+                            Err(err)
+                        }
                     };
                 }
             }
-            Err(anyhow!(
+            let msg = format!(
                 "Whisper binary at {} failed due to missing shared libraries ({diag}). Install Vulkan/CUDA runtime libraries (e.g., libvulkan1 on Linux) or switch to the CPU whisper-cli build in Setup.",
                 effective_bin.display()
-            ))
+            );
+            crate::diagnostics::record_subprocess_failure_async("whisper-cli", &msg);
+            Err(anyhow!(msg))
         }
-        Err(WhisperExecError::Other(err)) => Err(err),
+        Err(WhisperExecError::Other(err)) => {
+            if !cancel_flag.load(Ordering::SeqCst) {
+                crate::diagnostics::record_subprocess_failure_async(
+                    "whisper-cli",
+                    &err.to_string(),
+                );
+            }
+            Err(err)
+        }
     }
 }
 

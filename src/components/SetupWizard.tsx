@@ -334,6 +334,15 @@ export function SetupWizard() {
                 </span>
               </div>
 
+              {gpu?.hasNvidia &&
+                gpu.cudaSupported === false &&
+                gpu.cudaStatusNote && (
+                  <div className="mt-1.5 flex items-start gap-2 rounded-xl border border-amber-500/40 bg-amber-950/35 px-3 py-2 text-xs leading-relaxed text-amber-200">
+                    <AlertTriangle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                    <span>{gpu.cudaStatusNote}</span>
+                  </div>
+                )}
+
               <div className="pt-1">
                 {coreReady ? (
                   <div className="inline-flex items-center gap-1.5 text-xs font-medium text-emerald-400">

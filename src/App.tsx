@@ -1,4 +1,5 @@
 import { useEffect } from "react";
+import { BugReportModal } from "./components/BugReportModal";
 import { DualEditorBand } from "./components/DualEditorBand";
 import { ExportModal } from "./components/ExportModal";
 import { FilesPanel } from "./components/FilesPanel";
@@ -48,6 +49,7 @@ export function App() {
       <ExportModal />
       <OnlineConfirmModal />
       <UpdaterModal />
+      <BugReportModal />
     </div>
   );
 }

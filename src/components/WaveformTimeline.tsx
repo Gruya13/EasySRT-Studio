@@ -942,6 +942,7 @@ export function WaveformTimeline() {
         st.isSetupOpen ||
         st.isUpdaterOpen ||
         st.isCheckpointsOpen ||
+        st.isBugReportOpen ||
         st.onlineConfirm.open
       ) {
         return;

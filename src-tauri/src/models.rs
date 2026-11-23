@@ -40,6 +40,12 @@ pub struct GpuInfo {
     pub gpu_name: Option<String>,
     pub vram_mb: u64,
     pub recommended_tier: VramTier,
+    #[serde(default)]
+    pub driver_version: Option<String>,
+    #[serde(default)]
+    pub cuda_supported: bool,
+    #[serde(default)]
+    pub cuda_status_note: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,6 +252,10 @@ impl Default for ExportOptions {
     }
 }
 
+fn default_auto_send_crash_reports() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -259,6 +269,8 @@ pub struct AppConfig {
     pub default_script: SerbianScript,
     pub export: ExportOptions,
     pub has_completed_setup: bool,
+    #[serde(default = "default_auto_send_crash_reports")]
+    pub auto_send_crash_reports: bool,
 }
 
 impl Default for AppConfig {
@@ -274,6 +286,7 @@ impl Default for AppConfig {
             default_script: SerbianScript::Latin,
             export: ExportOptions::default(),
             has_completed_setup: false,
+            auto_send_crash_reports: default_auto_send_crash_reports(),
         }
     }
 }
@@ -390,6 +403,53 @@ pub struct AudioPreviewData {
     pub base64_data: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BugReportRequest {
+    pub title: String,
+    pub description: String,
+    #[serde(default)]
+    pub steps: Option<String>,
+    #[serde(default)]
+    pub contact: Option<String>,
+    #[serde(default)]
+    pub include_diagnostics: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CrashReportRequest {
+    pub crash_kind: String,
+    pub message: String,
+    #[serde(default)]
+    pub stack_trace: Option<String>,
+    #[serde(default)]
+    pub source: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReportSubmitResult {
+    pub sent: bool,
+    pub deduplicated: bool,
+    pub issue_number: Option<u64>,
+    pub issue_url: Option<String>,
+    pub saved_local_path: Option<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiagnosticsPreview {
+    pub app_version: String,
+    pub platform: String,
+    pub os_info: String,
+    pub gpu_summary: String,
+    pub installed_components: Vec<String>,
+    pub log_excerpt: String,
+    pub telemetry_endpoint: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +536,85 @@ mod tests {
         });
         let deserialized: JobOptions = serde_json::from_value(legacy_json).unwrap();
         assert!(!deserialized.correct_source_asr);
+
+        // Legacy AppConfig JSON without `autoSendCrashReports` must deserialize with true
+        let legacy_cfg_json = json!({
+            "uiLanguage": "sr",
+            "modelsDirOverride": null,
+            "activeWhisperModelId": null,
+            "activeLlmModelId": null,
+            "customModels": [],
+            "translation": TranslationConfig::default(),
+            "defaultSegmentRules": SegmentRules::default(),
+            "defaultScript": "latin",
+            "export": ExportOptions::default(),
+            "hasCompletedSetup": true
+        });
+        let legacy_cfg: AppConfig = serde_json::from_value(legacy_cfg_json).unwrap();
+        assert!(legacy_cfg.auto_send_crash_reports);
+        let cfg_val = serde_json::to_value(&legacy_cfg).unwrap();
+        assert_eq!(cfg_val.get("autoSendCrashReports"), Some(&json!(true)));
+
+        // Legacy GpuInfo JSON without new CUDA fields must deserialize cleanly
+        let legacy_gpu_json = json!({
+            "hasNvidia": true,
+            "gpuName": "NVIDIA GeForce RTX 4060",
+            "vramMb": 8188,
+            "recommendedTier": "vram8Gb"
+        });
+        let legacy_gpu: GpuInfo = serde_json::from_value(legacy_gpu_json).unwrap();
+        assert_eq!(legacy_gpu.driver_version, None);
+        assert!(!legacy_gpu.cuda_supported);
+        assert_eq!(legacy_gpu.cuda_status_note, None);
+
+        let bug_req = serde_json::to_value(BugReportRequest {
+            title: "Crash on export".to_string(),
+            description: "Export failed".to_string(),
+            steps: Some("1. Click export".to_string()),
+            contact: None,
+            include_diagnostics: true,
+        })
+        .unwrap();
+        assert_eq!(bug_req.get("includeDiagnostics"), Some(&json!(true)));
+
+        let crash_req = serde_json::to_value(CrashReportRequest {
+            crash_kind: "react_error".to_string(),
+            message: "Boom".to_string(),
+            stack_trace: Some("at App".to_string()),
+            source: Some("ErrorBoundary".to_string()),
+        })
+        .unwrap();
+        assert_eq!(crash_req.get("crashKind"), Some(&json!("react_error")));
+        assert_eq!(crash_req.get("stackTrace"), Some(&json!("at App")));
+
+        let submit_res = serde_json::to_value(ReportSubmitResult {
+            sent: true,
+            deduplicated: false,
+            issue_number: Some(42),
+            issue_url: Some("https://github.com/Gruya13/EasySRT-Studio/issues/42".to_string()),
+            saved_local_path: None,
+            error: None,
+        })
+        .unwrap();
+        assert_eq!(submit_res.get("issueNumber"), Some(&json!(42)));
+        assert!(submit_res.get("issueUrl").is_some());
+        assert!(submit_res.get("savedLocalPath").is_some());
+
+        let preview = serde_json::to_value(DiagnosticsPreview {
+            app_version: "0.3.0".to_string(),
+            platform: "windows-x64".to_string(),
+            os_info: "windows / x86_64".to_string(),
+            gpu_summary: "RTX 4060".to_string(),
+            installed_components: vec!["ffmpeg-win-x64".to_string()],
+            log_excerpt: "ok".to_string(),
+            telemetry_endpoint: None,
+        })
+        .unwrap();
+        assert_eq!(preview.get("appVersion"), Some(&json!("0.3.0")));
+        assert!(preview.get("osInfo").is_some());
+        assert!(preview.get("gpuSummary").is_some());
+        assert!(preview.get("installedComponents").is_some());
+        assert!(preview.get("logExcerpt").is_some());
+        assert!(preview.get("telemetryEndpoint").is_some());
     }
 }
