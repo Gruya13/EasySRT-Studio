@@ -2,15 +2,159 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      prerelease:
+        description: "Publish as a GitHub Pre-release (does not overwrite production latest.json)"
+        type: boolean
+        default: true
+      tag_suffix:
+        description: "Optional pre-release tag suffix (e.g. rc.1; defaults to staging.<shortsha>)"
+        type: string
+        default: ""
 
 permissions:
   contents: write
 
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
+  prepare-release:
+    name: Prepare Release Metadata & Tag
+    runs-on: ubuntu-22.04
+    outputs:
+      should_release: ${{ steps.meta.outputs.should_release }}
+      tag_name: ${{ steps.meta.outputs.tag_name }}
+      release_name: ${{ steps.meta.outputs.release_name }}
+      is_prerelease: ${{ steps.meta.outputs.is_prerelease }}
+      include_updater_json: ${{ steps.meta.outputs.include_updater_json }}
+      release_body: ${{ steps.meta.outputs.release_body }}
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify manifest versions are in sync
+        run: npm run version:check
+
+      - name: Resolve release target, tag, and changelog notes
+        id: meta
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          FULL_REF: ${{ github.ref }}
+          INPUT_PRERELEASE: ${{ inputs.prerelease }}
+          INPUT_TAG_SUFFIX: ${{ inputs.tag_suffix }}
+        run: |
+          set -euo pipefail
+
+          VERSION="$(node -p "require('./package.json').version")"
+          SHORT_SHA="$(git rev-parse --short=7 HEAD)"
+
+          SHOULD_RELEASE="false"
+          TAG_NAME=""
+          RELEASE_NAME=""
+          IS_PRERELEASE="false"
+          INCLUDE_UPDATER_JSON="true"
+          CREATE_TAG="false"
+
+          if [ "$EVENT_NAME" = "push" ] && [ "$FULL_REF" = "refs/heads/main" ]; then
+            TAG_NAME="v${VERSION}"
+            if git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+              echo "Tag ${TAG_NAME} already exists; skipping automatic release for non-release commit on main."
+              SHOULD_RELEASE="false"
+            else
+              SHOULD_RELEASE="true"
+              IS_PRERELEASE="false"
+              INCLUDE_UPDATER_JSON="true"
+              RELEASE_NAME="EasySRT Studio ${TAG_NAME}"
+              CREATE_TAG="true"
+            fi
+          elif [ "$EVENT_NAME" = "push" ] && [ "$REF_TYPE" = "tag" ]; then
+            TAG_NAME="$REF_NAME"
+            SHOULD_RELEASE="true"
+            if [[ "$TAG_NAME" == *-* ]]; then
+              IS_PRERELEASE="true"
+              INCLUDE_UPDATER_JSON="false"
+              RELEASE_NAME="EasySRT Studio ${TAG_NAME} (Pre-release)"
+            else
+              if [ "$TAG_NAME" != "v${VERSION}" ]; then
+                echo "Tag ${TAG_NAME} does not match package.json version v${VERSION}." >&2
+                exit 1
+              fi
+              IS_PRERELEASE="false"
+              INCLUDE_UPDATER_JSON="true"
+              RELEASE_NAME="EasySRT Studio ${TAG_NAME}"
+            fi
+          elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            SHOULD_RELEASE="true"
+            if [ "$INPUT_PRERELEASE" = "true" ] || [ "$FULL_REF" != "refs/heads/main" ]; then
+              SUFFIX="${INPUT_TAG_SUFFIX:-staging.${SHORT_SHA}}"
+              TAG_NAME="v${VERSION}-${SUFFIX}"
+              IS_PRERELEASE="true"
+              INCLUDE_UPDATER_JSON="false"
+              RELEASE_NAME="EasySRT Studio ${TAG_NAME} (Staging)"
+              CREATE_TAG="true"
+            else
+              TAG_NAME="v${VERSION}"
+              IS_PRERELEASE="false"
+              INCLUDE_UPDATER_JSON="true"
+              RELEASE_NAME="EasySRT Studio ${TAG_NAME}"
+              CREATE_TAG="true"
+            fi
+          fi
+
+          if [ "$SHOULD_RELEASE" = "true" ] && [ "$CREATE_TAG" = "true" ]; then
+            if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
+              git config user.name "github-actions[bot]"
+              git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+              git tag -a "$TAG_NAME" -m "Release ${TAG_NAME}"
+              git push origin "$TAG_NAME"
+            fi
+          fi
+
+          RELEASE_BODY=""
+          if [ "$SHOULD_RELEASE" = "true" ]; then
+            if [ "$IS_PRERELEASE" = "true" ]; then
+              RELEASE_BODY="$(node scripts/release.mjs notes "$VERSION" --prerelease --with-footer)"
+            else
+              RELEASE_BODY="$(node scripts/release.mjs notes "$VERSION" --with-footer)"
+            fi
+          fi
+
+          {
+            echo "should_release=${SHOULD_RELEASE}"
+            echo "tag_name=${TAG_NAME}"
+            echo "release_name=${RELEASE_NAME}"
+            echo "is_prerelease=${IS_PRERELEASE}"
+            echo "include_updater_json=${INCLUDE_UPDATER_JSON}"
+          } >> "$GITHUB_OUTPUT"
+
+          EOF_DELIM="EOF_RELEASE_NOTES_${RANDOM}_${RANDOM}"
+          {
+            echo "release_body<<${EOF_DELIM}"
+            printf '%s\n' "$RELEASE_BODY"
+            echo "${EOF_DELIM}"
+          } >> "$GITHUB_OUTPUT"
+
   publish-tauri:
+    name: Build & Publish (${{ matrix.platform }})
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
     strategy:
       fail-fast: false
       matrix:
@@ -53,6 +197,9 @@ jobs:
 
       - name: Install frontend dependencies
         run: npm ci
+
+      - name: Verify manifest versions are in sync
+        run: npm run version:check
 
       - name: Typecheck frontend
         run: npm run typecheck
@@ -122,12 +269,12 @@ jobs:
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
           TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
-          tagName: v__VERSION__
-          releaseName: "EasySRT Studio v__VERSION__"
-          releaseBody: "Download EasySRT Studio below (Windows Setup Installer with automatic FFmpeg/CUDA/Whisper/llama.cpp setup, or Linux AppImage)."
+          tagName: ${{ needs.prepare-release.outputs.tag_name }}
+          releaseName: ${{ needs.prepare-release.outputs.release_name }}
+          releaseBody: ${{ needs.prepare-release.outputs.release_body }}
           releaseDraft: false
-          prerelease: false
-          includeUpdaterJson: true
+          prerelease: ${{ needs.prepare-release.outputs.is_prerelease == 'true' }}
+          includeUpdaterJson: ${{ needs.prepare-release.outputs.include_updater_json == 'true' }}
           args: ${{ matrix.args }}
 
       - name: Build Linux Vulkan whisper-cli tarball

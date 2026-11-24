@@ -1,6 +1,7 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { create } from "zustand";
 import { normalizeUiLanguage, type UiLanguage } from "../i18n";
+import { APP_VERSION } from "../lib/version";
 import {
   calculateCueMetrics,
   compareSemver,
@@ -424,7 +425,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     isUpdaterOpen: false,
     isCheckpointsOpen: false,
     isBugReportOpen: false,
-    appVersion: "0.3.2",
+    appVersion: APP_VERSION,
     availableUpdateVersion: null,
     onlineConfirm: {
       open: false,
@@ -490,8 +491,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getApiKeyStatus(),
           listCheckpoints(),
           isTauriRuntime()
-            ? getVersion().catch(() => "0.3.2")
-            : Promise.resolve("0.3.2"),
+            ? getVersion().catch(() => APP_VERSION)
+            : Promise.resolve(APP_VERSION),
         ]);
 
         const config: AppConfig = {
