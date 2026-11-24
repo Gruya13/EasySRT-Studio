@@ -76,6 +76,28 @@ fn emit_job_progress(
     let _ = app.emit(EVENT_JOB_PROGRESS, event);
 }
 
+fn annotate_speaker_changes(wav_path: &Path, whisper_out: &mut whisper::WhisperOutput) {
+    match diarizer::detect_speaker_change_boundaries(
+        wav_path,
+        &whisper_out.words,
+        &whisper_out.vad_intervals,
+    ) {
+        Ok(indices) => {
+            for idx in indices {
+                if let Some(word) = whisper_out.words.get_mut(idx) {
+                    word.speaker_change = true;
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                "Acoustic speaker-turn detection failed for {}: {err:#}",
+                wav_path.display()
+            );
+        }
+    }
+}
+
 async fn transcribe_audio_with_flag(
     app: &AppHandle,
     job_id: &str,
@@ -132,6 +154,14 @@ async fn transcribe_audio_with_flag(
         },
     )
     .await;
+
+    let whisper_res = match whisper_res {
+        Ok(mut whisper_out) => {
+            annotate_speaker_changes(&converted.wav_path, &mut whisper_out);
+            Ok(whisper_out)
+        }
+        Err(err) => Err(err),
+    };
 
     // Always clean up temporary 16 kHz WAV file
     let _ = fs::remove_file(&converted.wav_path);
@@ -843,7 +873,7 @@ pub fn export_subtitles(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::models::{ExportFormat, SegmentPreset, TimedWord};
+    use crate::models::{ExportFormat, SegmentPreset, TimedWord, TranslationStyle};
     use std::collections::BTreeMap;
     use std::io::Write;
     use std::sync::atomic::AtomicUsize;
@@ -869,18 +899,21 @@ mod tests {
                     end_ms: 400,
                     text: "Ljubav".to_string(),
                     probability: 0.99,
+                    speaker_change: false,
                 },
                 TimedWord {
                     start_ms: 400,
                     end_ms: 800,
                     text: "i".to_string(),
                     probability: 0.99,
+                    speaker_change: false,
                 },
                 TimedWord {
                     start_ms: 800,
                     end_ms: 1400,
                     text: "pažnja.".to_string(),
                     probability: 0.99,
+                    speaker_change: false,
                 },
             ],
             cues: vec![],
@@ -1207,6 +1240,7 @@ EOF
                 glossary,
                 polish_serbian: true,
                 correct_source_asr: false,
+                translation_style: TranslationStyle::default(),
                 provider_override: Some(TranslationProviderKind::CustomOpenAi),
             },
             words: whisper_out.words,
@@ -1560,5 +1594,93 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert_eq!(p2.cues[0].translated_text, "Ispoliran tekst.");
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn resegment_project_preserves_split_on_speaker_change_and_annotate_is_non_fatal() {
+        let mut whisper_out = whisper::WhisperOutput {
+            detected_language: Some("sr".to_string()),
+            words: vec![
+                TimedWord {
+                    start_ms: 0,
+                    end_ms: 300,
+                    text: "Mislim".to_string(),
+                    probability: 0.99,
+                    speaker_change: false,
+                },
+                TimedWord {
+                    start_ms: 320,
+                    end_ms: 620,
+                    text: "da".to_string(),
+                    probability: 0.99,
+                    speaker_change: false,
+                },
+                TimedWord {
+                    start_ms: 740,
+                    end_ms: 1050,
+                    text: "jeste".to_string(),
+                    probability: 0.99,
+                    speaker_change: true,
+                },
+                TimedWord {
+                    start_ms: 1070,
+                    end_ms: 1400,
+                    text: "tako.".to_string(),
+                    probability: 0.99,
+                    speaker_change: false,
+                },
+            ],
+            vad_intervals: Vec::new(),
+        };
+
+        // Missing WAV must log warning non-fatally and leave words untouched
+        let missing = std::env::temp_dir().join(format!(
+            "easysrt_nonexistent_diarizer_{}.wav",
+            uuid::Uuid::new_v4()
+        ));
+        annotate_speaker_changes(&missing, &mut whisper_out);
+        assert!(whisper_out.words[2].speaker_change);
+
+        let project = SubtitleProject {
+            job_id: "job-speaker-reseg".to_string(),
+            audio_path: "/tmp/interview.wav".to_string(),
+            audio_file_name: "interview.wav".to_string(),
+            duration_ms: 2000,
+            detected_language: Some("sr".to_string()),
+            options: JobOptions::default(),
+            words: whisper_out.words,
+            cues: vec![],
+            phase: JobPhase::Completed,
+            completed_translation_batches: 0,
+            error_message: None,
+            updated_at: "2026-11-24T22:00:00Z".to_string(),
+        };
+
+        let split_project = resegment_project(
+            project,
+            SegmentRules {
+                preset: SegmentPreset::Standard,
+                split_on_speaker_change: true,
+                ..SegmentRules::default()
+            },
+        )
+        .unwrap();
+        assert!(split_project.options.segment_rules.split_on_speaker_change);
+        assert_eq!(split_project.cues.len(), 2);
+        assert_eq!(split_project.cues[0].source_text, "Mislim da");
+        assert_eq!(split_project.cues[1].source_text, "jeste tako.");
+
+        let merged_project = resegment_project(
+            split_project,
+            SegmentRules {
+                preset: SegmentPreset::Standard,
+                split_on_speaker_change: false,
+                ..SegmentRules::default()
+            },
+        )
+        .unwrap();
+        assert!(!merged_project.options.segment_rules.split_on_speaker_change);
+        assert_eq!(merged_project.cues.len(), 1);
+        assert_eq!(merged_project.cues[0].source_text, "Mislim da jeste tako.");
     }
 }

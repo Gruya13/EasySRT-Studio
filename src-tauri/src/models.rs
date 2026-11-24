@@ -147,6 +147,10 @@ pub enum SegmentPreset {
     Custom,
 }
 
+fn default_split_on_speaker_change() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SegmentRules {
@@ -156,6 +160,8 @@ pub struct SegmentRules {
     pub min_duration_ms: u64,
     pub max_duration_ms: u64,
     pub max_cps: f64,
+    #[serde(default = "default_split_on_speaker_change")]
+    pub split_on_speaker_change: bool,
 }
 
 impl Default for SegmentRules {
@@ -167,6 +173,7 @@ impl Default for SegmentRules {
             min_duration_ms: 1000,
             max_duration_ms: 7000,
             max_cps: 17.0,
+            split_on_speaker_change: default_split_on_speaker_change(),
         }
     }
 }
@@ -307,6 +314,8 @@ pub struct TimedWord {
     pub text: String,
     #[serde(default)]
     pub probability: f64,
+    #[serde(default)]
+    pub speaker_change: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -332,6 +341,8 @@ pub struct JobOptions {
     pub polish_serbian: bool,
     #[serde(default)]
     pub correct_source_asr: bool,
+    #[serde(default)]
+    pub translation_style: TranslationStyle,
     pub provider_override: Option<TranslationProviderKind>,
 }
 
@@ -345,6 +356,7 @@ impl Default for JobOptions {
             glossary: BTreeMap::new(),
             polish_serbian: true,
             correct_source_asr: false,
+            translation_style: TranslationStyle::default(),
             provider_override: None,
         }
     }
@@ -543,19 +555,109 @@ mod tests {
 
         let opts = serde_json::to_value(JobOptions::default()).unwrap();
         assert_eq!(opts.get("correctSourceAsr"), Some(&json!(false)));
+        assert_eq!(opts.get("translationStyle"), Some(&json!("natural")));
+        assert_eq!(
+            opts.get("segmentRules")
+                .and_then(|r| r.get("splitOnSpeakerChange")),
+            Some(&json!(true))
+        );
 
-        // Legacy JobOptions JSON without `correctSourceAsr` must deserialize with false
+        // Legacy TimedWord JSON without `speakerChange` must deserialize with false and round-trip camelCase
+        let legacy_word_json = json!({
+            "startMs": 100,
+            "endMs": 450,
+            "text": "Zdravo",
+            "probability": 0.98
+        });
+        let legacy_word: TimedWord = serde_json::from_value(legacy_word_json).unwrap();
+        assert!(!legacy_word.speaker_change);
+        assert_eq!(
+            serde_json::to_value(&legacy_word).unwrap().get("speakerChange"),
+            Some(&json!(false))
+        );
+        let turn_word: TimedWord = serde_json::from_value(json!({
+            "startMs": 700,
+            "endMs": 1050,
+            "text": "Dobro",
+            "probability": 0.97,
+            "speakerChange": true
+        }))
+        .unwrap();
+        assert!(turn_word.speaker_change);
+        assert_eq!(
+            serde_json::to_value(&turn_word).unwrap().get("speakerChange"),
+            Some(&json!(true))
+        );
+
+        // Legacy SegmentRules JSON without `splitOnSpeakerChange` must deserialize with true and round-trip camelCase
+        let legacy_rules_json = json!({
+            "preset": "standard",
+            "maxCharsPerLine": 42,
+            "maxLines": 2,
+            "minDurationMs": 1000,
+            "maxDurationMs": 7000,
+            "maxCps": 17.0
+        });
+        let legacy_rules: SegmentRules = serde_json::from_value(legacy_rules_json.clone()).unwrap();
+        assert!(legacy_rules.split_on_speaker_change);
+        assert_eq!(
+            serde_json::to_value(&legacy_rules)
+                .unwrap()
+                .get("splitOnSpeakerChange"),
+            Some(&json!(true))
+        );
+        let disabled_rules: SegmentRules = serde_json::from_value(json!({
+            "preset": "reels",
+            "maxCharsPerLine": 20,
+            "maxLines": 1,
+            "minDurationMs": 600,
+            "maxDurationMs": 3500,
+            "maxCps": 18.0,
+            "splitOnSpeakerChange": false
+        }))
+        .unwrap();
+        assert!(!disabled_rules.split_on_speaker_change);
+        assert_eq!(
+            serde_json::to_value(&disabled_rules)
+                .unwrap()
+                .get("splitOnSpeakerChange"),
+            Some(&json!(false))
+        );
+
+        // Legacy JobOptions JSON omitting `correctSourceAsr`, `translationStyle`, and `segmentRules.splitOnSpeakerChange`
         let legacy_json = json!({
             "sourceLanguage": "en",
             "targetLanguage": "sr",
             "script": "latin",
-            "segmentRules": SegmentRules::default(),
+            "segmentRules": legacy_rules_json,
             "glossary": {},
             "polishSerbian": true,
             "providerOverride": null
         });
         let deserialized: JobOptions = serde_json::from_value(legacy_json).unwrap();
         assert!(!deserialized.correct_source_asr);
+        assert_eq!(deserialized.translation_style, TranslationStyle::Natural);
+        assert!(deserialized.segment_rules.split_on_speaker_change);
+        let roundtrip_opts = serde_json::to_value(&deserialized).unwrap();
+        assert_eq!(roundtrip_opts.get("translationStyle"), Some(&json!("natural")));
+        assert_eq!(
+            roundtrip_opts
+                .get("segmentRules")
+                .and_then(|r| r.get("splitOnSpeakerChange")),
+            Some(&json!(true))
+        );
+
+        let formal_opts = JobOptions {
+            translation_style: TranslationStyle::Formal,
+            segment_rules: disabled_rules,
+            ..JobOptions::default()
+        };
+        let formal_val = serde_json::to_value(&formal_opts).unwrap();
+        assert_eq!(formal_val.get("translationStyle"), Some(&json!("formal")));
+        assert_eq!(
+            serde_json::from_value::<JobOptions>(formal_val).unwrap(),
+            formal_opts
+        );
 
         // Legacy AppConfig JSON without `autoSendCrashReports` must deserialize with true
         let legacy_cfg_json = json!({

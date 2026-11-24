@@ -1244,6 +1244,7 @@ mod tests {
             end_ms,
             text: text.to_string(),
             probability: 0.96,
+            speaker_change: false,
         }
     }
 

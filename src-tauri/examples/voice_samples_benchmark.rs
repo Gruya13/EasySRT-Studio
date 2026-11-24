@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use easysrt_studio_lib::models::{
     ExportFormat, ExportOptions, JobOptions, JobPhase, SegmentRules, SerbianScript, StorageMode,
-    StoragePaths, SubtitleProject, TranslationProviderKind,
+    StoragePaths, SubtitleProject, TranslationProviderKind, TranslationStyle,
 };
 use easysrt_studio_lib::pipeline::{
     exporter, ffmpeg, llama_server, segmenter, sr_script, translator, whisper,
@@ -231,6 +231,7 @@ async fn main() -> Result<()> {
                 glossary: glossary.clone(),
                 polish_serbian: true,
                 correct_source_asr: false,
+                translation_style: TranslationStyle::default(),
                 provider_override: Some(if use_deepseek {
                     TranslationProviderKind::DeepSeek
                 } else {

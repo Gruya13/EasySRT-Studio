@@ -10,7 +10,7 @@
 //! normalizes Serbian script (Latin/Cyrillic), wraps balanced lines, updates CPS/warnings,
 //! and checkpoints after every batch.
 
-use crate::models::{SegmentRules, SubtitleCue, SubtitleProject};
+use crate::models::{SegmentRules, SubtitleCue, SubtitleProject, TranslationStyle};
 use crate::pipeline::{segmenter, sr_script};
 use anyhow::{anyhow, Context, Result};
 use regex::Regex;
@@ -421,6 +421,7 @@ pub fn build_system_prompt_with_style(
     prompt
 }
 
+#[cfg(test)]
 fn build_system_prompt(
     operation: BatchOperation,
     source_language: &str,
@@ -717,12 +718,13 @@ where
         &project.options.source_language
     };
 
-    let system_prompt = build_system_prompt(
+    let system_prompt = build_system_prompt_with_style(
         operation,
         effective_source_lang,
         &project.options.target_language,
         &project.options.glossary,
         project.options.correct_source_asr,
+        project.options.translation_style == TranslationStyle::Formal,
     );
 
     let client = reqwest::Client::builder()
@@ -1728,5 +1730,136 @@ mod tests {
                 assert!(prompt.contains("- Belgrade => Belgrade"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn run_batch_operation_passes_translation_style_to_system_prompt() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let captured_prompts = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured_clone = Arc::clone(&captured_prompts);
+
+        let server = tokio::spawn(async move {
+            for _ in 0..2 {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = vec![0u8; 32768];
+                let mut total_read = 0usize;
+                let mut header_end = None;
+                let mut content_len = 0usize;
+
+                loop {
+                    let n = socket.read(&mut buf[total_read..]).await.unwrap_or(0);
+                    if n == 0 {
+                        break;
+                    }
+                    total_read += n;
+                    let s = String::from_utf8_lossy(&buf[..total_read]);
+                    if header_end.is_none() {
+                        if let Some(pos) = s.find("\r\n\r\n") {
+                            header_end = Some(pos + 4);
+                            for line in s[..pos].lines() {
+                                if let Some(v) =
+                                    line.to_ascii_lowercase().strip_prefix("content-length:")
+                                {
+                                    content_len = v.trim().parse().unwrap_or(0);
+                                }
+                            }
+                        }
+                    }
+                    if let Some(h_end) = header_end {
+                        if total_read >= h_end + content_len {
+                            break;
+                        }
+                    }
+                }
+
+                let req_str = String::from_utf8_lossy(&buf[..total_read]);
+                let body_part = req_str.split("\r\n\r\n").nth(1).unwrap_or("");
+                let req_json: serde_json::Value =
+                    serde_json::from_str(body_part).unwrap_or_default();
+                let sys_prompt = req_json["messages"][0]["content"]
+                    .as_str()
+                    .unwrap_or("")
+                    .to_string();
+                captured_clone.lock().unwrap().push(sys_prompt);
+
+                let resp_json = serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": "{\"1\": \"Dobro jutro svima.\"}"
+                        }
+                    }]
+                });
+                let resp_body = serde_json::to_string(&resp_json).unwrap();
+                let http_resp = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    resp_body.len(),
+                    resp_body
+                );
+                let _ = socket.write_all(http_resp.as_bytes()).await;
+            }
+        });
+
+        let endpoint = LlmEndpointConfig {
+            base_url: format!("http://127.0.0.1:{}/v1", addr.port()),
+            model: "mock-model".to_string(),
+            api_key: None,
+            batch_size: 10,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        let mut natural_project = sample_project(SerbianScript::Latin);
+        natural_project.cues.truncate(1);
+        natural_project.options.translation_style = TranslationStyle::Natural;
+        run_batch_operation(
+            &mut natural_project,
+            BatchOperation::Translate,
+            &endpoint,
+            &cancel,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        let mut formal_project = sample_project(SerbianScript::Latin);
+        formal_project.cues.truncate(1);
+        formal_project.options.translation_style = TranslationStyle::Formal;
+        run_batch_operation(
+            &mut formal_project,
+            BatchOperation::Translate,
+            &endpoint,
+            &cancel,
+            |_| Ok(()),
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        server.await.unwrap();
+
+        let prompts = captured_prompts.lock().unwrap();
+        assert_eq!(prompts.len(), 2);
+        assert!(
+            prompts[0].contains("prirodan govorni srpski"),
+            "Natural style must send natural Serbian prompt: {}",
+            prompts[0]
+        );
+        assert!(
+            !prompts[0].contains("standardni književni stil"),
+            "Natural style must not send formal prompt: {}",
+            prompts[0]
+        );
+        assert!(
+            prompts[1].contains("standardni književni stil"),
+            "Formal style must send formal Serbian prompt: {}",
+            prompts[1]
+        );
+        assert!(
+            !prompts[1].contains("prirodan govorni srpski"),
+            "Formal style must not send natural prompt: {}",
+            prompts[1]
+        );
     }
 }

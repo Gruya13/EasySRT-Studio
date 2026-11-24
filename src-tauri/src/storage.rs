@@ -778,6 +778,7 @@ mod tests {
                 end_ms: 500,
                 text: "Hello".to_string(),
                 probability: 0.99,
+                speaker_change: false,
             }],
             cues: vec![SubtitleCue {
                 id: 1,

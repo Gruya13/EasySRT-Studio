@@ -47,6 +47,7 @@ pub fn normalize_rules(rules: &SegmentRules) -> SegmentRules {
             } else {
                 rules.max_cps
             },
+            split_on_speaker_change: rules.split_on_speaker_change,
         },
         SegmentPreset::Reels => SegmentRules {
             preset: SegmentPreset::Reels,
@@ -75,6 +76,7 @@ pub fn normalize_rules(rules: &SegmentRules) -> SegmentRules {
             } else {
                 rules.max_cps
             },
+            split_on_speaker_change: rules.split_on_speaker_change,
         },
         SegmentPreset::Custom => SegmentRules {
             preset: SegmentPreset::Custom,
@@ -87,6 +89,7 @@ pub fn normalize_rules(rules: &SegmentRules) -> SegmentRules {
             } else {
                 rules.max_cps
             },
+            split_on_speaker_change: rules.split_on_speaker_change,
         },
     }
 }
@@ -589,7 +592,17 @@ fn merge_isolated_leading_conjunction_cues(
 
 /// Groups `TimedWord`s into readable `SubtitleCue`s according to `rules`.
 pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleCue> {
-    segment_words_with_speaker_changes(words, rules, &[], true)
+    let speaker_change_indices: Vec<usize> = words
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, word)| word.speaker_change.then_some(idx))
+        .collect();
+    segment_words_with_speaker_changes(
+        words,
+        rules,
+        &speaker_change_indices,
+        rules.split_on_speaker_change,
+    )
 }
 
 /// Groups `TimedWord`s into readable `SubtitleCue`s according to `rules`, optionally
@@ -1055,6 +1068,7 @@ mod tests {
             end_ms,
             text: text.to_string(),
             probability: 0.99,
+            speaker_change: false,
         }
     }
 
@@ -1119,6 +1133,7 @@ mod tests {
             min_duration_ms: 500,
             max_duration_ms: 3000,
             max_cps: 18.0,
+            split_on_speaker_change: true,
         };
         let cues = segment_words(&words, &rules);
         assert!(cues.len() >= 2);
@@ -1710,5 +1725,64 @@ mod tests {
         );
         assert_eq!(kept_comma.len(), 1);
         assert_eq!(kept_comma[0].source_text, "Da, idemo sutra.");
+    }
+
+    #[test]
+    fn segment_words_breaks_on_timed_word_speaker_change_and_respects_rule_toggle() {
+        // Verify normalize_rules preserves split_on_speaker_change across all presets
+        for preset in [
+            SegmentPreset::Standard,
+            SegmentPreset::Reels,
+            SegmentPreset::Custom,
+        ] {
+            for flag in [true, false] {
+                let normalized = normalize_rules(&SegmentRules {
+                    preset,
+                    split_on_speaker_change: flag,
+                    ..SegmentRules::default()
+                });
+                assert_eq!(
+                    normalized.split_on_speaker_change, flag,
+                    "normalize_rules must preserve split_on_speaker_change={flag} for {preset:?}"
+                );
+            }
+        }
+
+        // Words with no sentence punctuation and a short 120ms gap (below inter-segment pause
+        // threshold), so splitting occurs solely because of `TimedWord.speaker_change == true`.
+        let mut words = vec![
+            word(0, 300, "Mislim"),
+            word(320, 620, "da"),
+            word(740, 1050, "jeste"),
+            word(1070, 1400, "tako."),
+        ];
+        words[2].speaker_change = true;
+
+        let enabled_rules = SegmentRules {
+            split_on_speaker_change: true,
+            ..SegmentRules::default()
+        };
+        let split_cues = segment_words(&words, &enabled_rules);
+        assert_eq!(
+            split_cues.len(),
+            2,
+            "segment_words must break on TimedWord.speaker_change when enabled: {:?}",
+            split_cues
+        );
+        assert_eq!(split_cues[0].source_text, "Mislim da");
+        assert_eq!(split_cues[1].source_text, "jeste tako.");
+
+        let disabled_rules = SegmentRules {
+            split_on_speaker_change: false,
+            ..SegmentRules::default()
+        };
+        let merged_cues = segment_words(&words, &disabled_rules);
+        assert_eq!(
+            merged_cues.len(),
+            1,
+            "segment_words must ignore TimedWord.speaker_change when disabled: {:?}",
+            merged_cues
+        );
+        assert_eq!(merged_cues[0].source_text, "Mislim da jeste tako.");
     }
 }

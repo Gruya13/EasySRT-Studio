@@ -193,6 +193,7 @@ fn split_text_proportionally(
             end_ms: from_ms,
             text: part.to_string(),
             probability: prob,
+            speaker_change: false,
         })
         .collect();
     distribute_range_proportionally(&mut out, from_ms, to_ms);
@@ -563,6 +564,7 @@ pub fn parse_whisper_ojf_json_with_vad(
                         end_ms: ms1,
                         text: rw.text.clone(),
                         probability: rw.probability,
+                        speaker_change: false,
                     });
                 }
             }
@@ -655,6 +657,7 @@ pub fn parse_whisper_ojf_json_with_vad(
                             end_ms: e.max(s),
                             text: txt,
                             probability: p_sum / (p_cnt.max(1) as f64),
+                            speaker_change: false,
                         });
                     }
                 }
@@ -670,6 +673,7 @@ pub fn parse_whisper_ojf_json_with_vad(
                             end_ms: e.max(s),
                             text: txt,
                             probability: p_sum / (p_cnt.max(1) as f64),
+                            speaker_change: false,
                         });
                     }
                 }
@@ -693,6 +697,7 @@ pub fn parse_whisper_ojf_json_with_vad(
                     end_ms: e.max(s),
                     text: txt,
                     probability: p_sum / (p_cnt.max(1) as f64),
+                    speaker_change: false,
                 });
             }
         }
@@ -2809,6 +2814,7 @@ esac
                     end_ms: (i as u64 + 1) * 500,
                     text: format!("w{i}"),
                     probability: p,
+                    speaker_change: false,
                 })
                 .collect(),
             vad_intervals: Vec::new(),
