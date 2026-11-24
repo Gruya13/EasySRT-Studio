@@ -2,6 +2,7 @@
 //! segmentation, local/cloud translation, Serbian polishing, script conversion,
 //! and export).
 
+pub mod diarizer;
 pub mod exporter;
 pub mod ffmpeg;
 pub mod importer;

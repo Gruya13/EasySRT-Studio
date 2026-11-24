@@ -21,6 +21,7 @@ use tokio::process::Command;
 pub struct WhisperOutput {
     pub detected_language: Option<String>,
     pub words: Vec<TimedWord>,
+    pub vad_intervals: Vec<(u64, u64)>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -718,6 +719,7 @@ pub fn parse_whisper_ojf_json_with_vad(
     Ok(WhisperOutput {
         detected_language,
         words,
+        vad_intervals: vad_intervals.to_vec(),
     })
 }
 
@@ -2176,6 +2178,7 @@ mod tests {
 
         let out = parse_whisper_ojf_json(payload).unwrap();
         assert_eq!(out.detected_language.as_deref(), Some("sr"));
+        assert!(out.vad_intervals.is_empty());
         assert_eq!(out.words.len(), 3);
 
         assert_eq!(out.words[0].text, "Zdravo");
@@ -2377,6 +2380,7 @@ whisper_vad_segments_from_probs: VAD segment 1: start = 2.79, end = 6.94 (durati
         }"#;
 
         let out = parse_whisper_ojf_json_with_vad(payload, &vad_speech).unwrap();
+        assert_eq!(out.vad_intervals, vad_speech);
         assert_eq!(out.words.len(), 6);
         assert_eq!(out.words[0].text, "My");
         assert_eq!(out.words[0].start_ms, 510);
@@ -2722,6 +2726,10 @@ esac
         .await
         .unwrap();
 
+        assert_eq!(
+            out.vad_intervals,
+            vec![(130, 12_030), (12_230, 29_500), (30_460, 34_000)]
+        );
         let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -2803,6 +2811,7 @@ esac
                     probability: p,
                 })
                 .collect(),
+            vad_intervals: Vec::new(),
         };
 
         let strong_en = make_out("en", &[0.94, 0.91, 0.95]);
@@ -2912,6 +2921,7 @@ fi
         .unwrap();
 
         assert_eq!(out.detected_language.as_deref(), Some("en"));
+        assert!(out.vad_intervals.is_empty());
         let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(texts, vec!["Hello", "friends."]);
 
@@ -3168,6 +3178,10 @@ esac
         .await
         .unwrap();
 
+        assert_eq!(
+            out.vad_intervals,
+            vec![(200, 4_000), (5_000, 12_000), (15_000, 20_000)]
+        );
         let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(texts, vec!["Pitanje.", "English", "reply.", "Hvala."]);
 
