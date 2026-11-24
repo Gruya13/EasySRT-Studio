@@ -117,7 +117,7 @@
     "deleteCheckpoint": "Delete"
   },
   "languages": {
-    "auto": "Auto-detect",
+    "auto": "Auto-detect (EN / SR)",
     "sr": "Serbian (sr)",
     "en": "English (en)",
     "de": "German (de)",
@@ -125,6 +125,7 @@
     "fr": "French (fr)",
     "ru": "Russian (ru)",
     "it": "Italian (it)",
+    "el": "Greek (el)",
     "none": "No translation (transcript only)"
   },
   "queue": {
@@ -286,12 +287,12 @@
     "close": "Close"
   },
   "bugReport": {
-    "title": "Bug Report & Diagnostics",
-    "subtitle": "Send a problem report to the development team or save diagnostics locally.",
-    "titleLabel": "Issue Title",
+    "title": "Bug Report & Suggestions",
+    "subtitle": "Describe an issue or suggest a change/improvement — or save diagnostics locally.",
+    "titleLabel": "Issue / Suggestion Title",
     "titlePlaceholder": "e.g. Transcription stalls at 50% on an M4A file",
-    "descriptionLabel": "Description",
-    "descriptionPlaceholder": "Describe what happened and what you expected...",
+    "descriptionLabel": "Description or Requested Change",
+    "descriptionPlaceholder": "Describe what happened or what you would like us to change / add...",
     "stepsLabel": "Steps to Reproduce (optional)",
     "stepsPlaceholder": "1. Import audio file\n2. Click Run\n3. Error occurs...",
     "contactLabel": "Contact / Email or GitHub handle (optional)",

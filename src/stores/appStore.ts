@@ -424,7 +424,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     isUpdaterOpen: false,
     isCheckpointsOpen: false,
     isBugReportOpen: false,
-    appVersion: "0.3.0",
+    appVersion: "0.3.1",
     availableUpdateVersion: null,
     onlineConfirm: {
       open: false,
@@ -490,8 +490,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getApiKeyStatus(),
           listCheckpoints(),
           isTauriRuntime()
-            ? getVersion().catch(() => "0.3.0")
-            : Promise.resolve("0.3.0"),
+            ? getVersion().catch(() => "0.3.1")
+            : Promise.resolve("0.3.1"),
         ]);
 
         const config: AppConfig = {

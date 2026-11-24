@@ -468,6 +468,7 @@ export function JobWorkspace() {
                 <option value="fr">{t.languages.fr}</option>
                 <option value="ru">{t.languages.ru}</option>
                 <option value="it">{t.languages.it}</option>
+                <option value="el">{t.languages.el}</option>
               </select>
             </div>
 

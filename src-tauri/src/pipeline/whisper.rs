@@ -1120,17 +1120,454 @@ async fn transcribe_wav_slice(
             WhisperExecError::Other(err) => err,
         })?;
 
-        let mut parsed = parse_whisper_ojf_json_with_vad(&raw_json, &[])?;
-        for w in &mut parsed.words {
-            w.start_ms = w.start_ms.saturating_add(start_ms);
-            w.end_ms = w.end_ms.saturating_add(start_ms);
-        }
-        Ok(parsed)
+    let mut parsed = parse_whisper_ojf_json_with_vad(&raw_json, &[])?;
+    for w in &mut parsed.words {
+        w.start_ms = w.start_ms.saturating_add(start_ms);
+        w.end_ms = w.end_ms.saturating_add(start_ms);
+    }
+    Ok(parsed)
     })
     .await;
 
     let _ = fs::remove_file(&slice_wav);
     let _ = fs::remove_file(format!("{}.json", slice_out_prefix.to_string_lossy()));
+    res
+}
+
+fn normalize_auto_candidate_lang(raw: &str) -> Option<&'static str> {
+    match raw.trim().to_ascii_lowercase().as_str() {
+        "en" | "english" => Some("en"),
+        "sr" | "hr" | "bs" | "serbian" | "croatian" | "bosnian" => Some("sr"),
+        _ => None,
+    }
+}
+
+fn parse_detected_language_from_stderr(stderr: &str) -> Option<String> {
+    const NEEDLE: &str = "auto-detected language:";
+    for line in stderr.lines() {
+        let lower = line.to_ascii_lowercase();
+        if let Some(pos) = lower.find(NEEDLE) {
+            let rest = line[pos + NEEDLE.len()..].trim();
+            let token = rest
+                .split(|c: char| c.is_whitespace() || c == '(' || c == ',' || c == ';')
+                .find(|s| !s.is_empty())
+                .map(|s| s.trim_matches(|c: char| !c.is_ascii_alphanumeric()))
+                .unwrap_or("");
+            if !token.is_empty() {
+                return Some(token.to_ascii_lowercase());
+            }
+        }
+    }
+    None
+}
+
+fn read_pcm16_wav_duration_ms(wav_path: &Path) -> Option<u64> {
+    let bytes = fs::read(wav_path).ok()?;
+    if bytes.len() < 44 || &bytes[0..4] != b"RIFF" || &bytes[8..12] != b"WAVE" {
+        return None;
+    }
+    let mut pos = 12usize;
+    while pos + 8 <= bytes.len() {
+        let chunk_id = &bytes[pos..pos + 4];
+        let chunk_size = u32::from_le_bytes([
+            bytes[pos + 4],
+            bytes[pos + 5],
+            bytes[pos + 6],
+            bytes[pos + 7],
+        ]) as usize;
+        let payload_start = pos + 8;
+        let payload_end = payload_start.saturating_add(chunk_size).min(bytes.len());
+        if chunk_id == b"data" {
+            let pcm_len = payload_end.saturating_sub(payload_start);
+            if pcm_len == 0 {
+                return None;
+            }
+            return Some((pcm_len / 32) as u64);
+        }
+        pos = payload_start.saturating_add(chunk_size + (chunk_size & 1));
+    }
+    None
+}
+
+fn slavic_tie_breaker(raw_detected: Option<&str>) -> &'static str {
+    match raw_detected
+        .unwrap_or("")
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "sr" | "hr" | "bs" | "sl" | "mk" | "bg" | "ru" | "uk" | "cs" | "sk" | "pl"
+        | "serbian" | "croatian" | "bosnian" | "slovenian" | "macedonian" | "bulgarian" => "sr",
+        _ => "en",
+    }
+}
+
+fn slice_lang_score(out: Option<&WhisperOutput>) -> (usize, f64) {
+    let Some(o) = out else {
+        return (0, f64::NEG_INFINITY);
+    };
+    if o.words.is_empty() {
+        return (0, f64::NEG_INFINITY);
+    }
+    let (avg_p, low_ratio) = word_slice_prob_stats(&o.words);
+    let word_bonus = 0.04 * (o.words.len().min(20) as f64 / 20.0);
+    (o.words.len(), avg_p - 0.35 * low_ratio + word_bonus)
+}
+
+fn choose_en_or_sr_from_slices(
+    en_out: Option<&WhisperOutput>,
+    sr_out: Option<&WhisperOutput>,
+    raw_detected: Option<&str>,
+) -> &'static str {
+    let (en_words, en_score) = slice_lang_score(en_out);
+    let (sr_words, sr_score) = slice_lang_score(sr_out);
+
+    if en_words > 0 && sr_words == 0 {
+        return "en";
+    }
+    if sr_words > 0 && en_words == 0 {
+        return "sr";
+    }
+    if en_words == 0 && sr_words == 0 {
+        return slavic_tie_breaker(raw_detected);
+    }
+
+    if en_score > sr_score + 0.02 {
+        "en"
+    } else if sr_score > en_score + 0.02 {
+        "sr"
+    } else {
+        slavic_tie_breaker(raw_detected)
+    }
+}
+
+async fn detect_language_via_dl(
+    whisper_bin: &Path,
+    whisper_model_path: &Path,
+    vad_model_path: Option<&Path>,
+    wav_path: &Path,
+    cancel_flag: &Arc<AtomicBool>,
+) -> std::result::Result<(Option<String>, Vec<(u64, u64)>), WhisperExecError> {
+    let threads = std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).clamp(4, 16))
+        .unwrap_or(4);
+
+    let mut cmd = Command::new(whisper_bin);
+    configure_command_env(&mut cmd, whisper_bin);
+
+    cmd.arg("-m")
+        .arg(whisper_model_path)
+        .arg("-f")
+        .arg(wav_path)
+        .arg("-l")
+        .arg("auto")
+        .arg("-dl")
+        .arg("-t")
+        .arg(threads.to_string());
+
+    if let Some(vp) = vad_model_path {
+        if vp.exists() {
+            cmd.arg("--vad").arg("-vm").arg(vp);
+        }
+    }
+
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().map_err(|err| {
+        WhisperExecError::Other(anyhow!(
+            "Failed to spawn whisper-cli (-dl) at {}: {err}",
+            whisper_bin.to_string_lossy()
+        ))
+    })?;
+
+    let stderr_pipe = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let status = loop {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(WhisperExecError::Other(anyhow!("Job cancelled")));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => tokio::time::sleep(Duration::from_millis(50)).await,
+            Err(err) => {
+                stderr_task.abort();
+                return Err(WhisperExecError::Other(anyhow!(
+                    "Failed polling whisper-cli (-dl) process: {err}"
+                )));
+            }
+        }
+    };
+
+    let stderr_buf = stderr_task.await.unwrap_or_default();
+    if !status.success() {
+        let trimmed = stderr_buf.trim();
+        if is_missing_shared_library_error(status.code(), trimmed) {
+            return Err(WhisperExecError::MissingSharedLibrary(trimmed.to_string()));
+        }
+        return Ok((None, Vec::new()));
+    }
+
+    Ok((
+        parse_detected_language_from_stderr(&stderr_buf),
+        parse_vad_segments_from_stderr(&stderr_buf),
+    ))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn pick_constrained_en_or_sr_for_wav(
+    whisper_bin: &Path,
+    whisper_model_path: &Path,
+    wav_path: &Path,
+    vad_intervals: &[(u64, u64)],
+    glossary: &BTreeMap<String, String>,
+    cancel_flag: &Arc<AtomicBool>,
+    raw_detected: Option<&str>,
+) -> &'static str {
+    if let Some(dur_ms) = read_pcm16_wav_duration_ms(wav_path) {
+        if dur_ms >= 500 {
+            let vad_start = vad_intervals
+                .iter()
+                .find(|&&(vs, ve)| ve.saturating_sub(vs) >= 500 && vs.saturating_add(500) <= dur_ms)
+                .map(|&(vs, _)| vs)
+                .unwrap_or(0);
+            let candidate_end = vad_start.saturating_add(25_000).min(dur_ms);
+            let (slice_start, slice_end) = if candidate_end > vad_start.saturating_add(500) {
+                (vad_start, candidate_end)
+            } else {
+                (0, dur_ms.min(25_000))
+            };
+
+            let en_out = transcribe_wav_slice(
+                whisper_bin,
+                whisper_model_path,
+                wav_path,
+                "lang_probe_en",
+                slice_start,
+                slice_end,
+                "en",
+                glossary,
+                cancel_flag,
+            )
+            .await;
+            let sr_out = transcribe_wav_slice(
+                whisper_bin,
+                whisper_model_path,
+                wav_path,
+                "lang_probe_sr",
+                slice_start,
+                slice_end,
+                "sr",
+                glossary,
+                cancel_flag,
+            )
+            .await;
+
+            return choose_en_or_sr_from_slices(
+                en_out.ok().as_ref(),
+                sr_out.ok().as_ref(),
+                raw_detected,
+            );
+        }
+    }
+
+    let en_prefix = PathBuf::from(format!("{}.lang_probe_en.out", wav_path.to_string_lossy()));
+    let sr_prefix = PathBuf::from(format!("{}.lang_probe_sr.out", wav_path.to_string_lossy()));
+    let en_out = decode_wav_silent(
+        whisper_bin,
+        whisper_model_path,
+        wav_path,
+        &en_prefix,
+        "en",
+        glossary,
+        cancel_flag,
+    )
+    .await
+    .ok();
+    let sr_out = decode_wav_silent(
+        whisper_bin,
+        whisper_model_path,
+        wav_path,
+        &sr_prefix,
+        "sr",
+        glossary,
+        cancel_flag,
+    )
+    .await
+    .ok();
+    let _ = fs::remove_file(format!("{}.json", en_prefix.to_string_lossy()));
+    let _ = fs::remove_file(format!("{}.json", sr_prefix.to_string_lossy()));
+    choose_en_or_sr_from_slices(en_out.as_ref(), sr_out.as_ref(), raw_detected)
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn decode_wav_silent(
+    whisper_bin: &Path,
+    whisper_model_path: &Path,
+    wav_path: &Path,
+    output_prefix: &Path,
+    lang: &str,
+    glossary: &BTreeMap<String, String>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<WhisperOutput> {
+    let mut noop = |_p: f64, _d: String| {};
+    let (raw_json, _stderr) = run_whisper_process(
+        WhisperProcessSpec {
+            whisper_bin,
+            whisper_model_path,
+            vad_model_path: None,
+            wav_path,
+            output_prefix,
+            lang,
+            glossary,
+            cancel_flag,
+            tick_base_progress: 89.0,
+            emit_progress: false,
+        },
+        &mut noop,
+    )
+    .await
+    .map_err(|e| match e {
+        WhisperExecError::MissingSharedLibrary(d) => anyhow!(d),
+        WhisperExecError::Other(err) => err,
+    })?;
+    parse_whisper_ojf_json_with_vad(&raw_json, &[])
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn transcribe_wav_slice_en_sr(
+    whisper_bin: &Path,
+    whisper_model_path: &Path,
+    src_wav: &Path,
+    slice_tag: &str,
+    start_ms: u64,
+    end_ms: u64,
+    fallback_lang: &str,
+    glossary: &BTreeMap<String, String>,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<WhisperOutput> {
+    let slice_wav = PathBuf::from(format!("{}.{slice_tag}.wav", src_wav.to_string_lossy()));
+    let slice_out_prefix =
+        PathBuf::from(format!("{}.{slice_tag}.out", src_wav.to_string_lossy()));
+    let en_out_prefix =
+        PathBuf::from(format!("{}.{slice_tag}.en.out", src_wav.to_string_lossy()));
+    let sr_out_prefix =
+        PathBuf::from(format!("{}.{slice_tag}.sr.out", src_wav.to_string_lossy()));
+    let _ = fs::remove_file(&slice_wav);
+
+    let res = {
+        let slice_wav_ref = &slice_wav;
+        async {
+            extract_pcm16_wav_slice(src_wav, slice_wav_ref, start_ms, end_ms)?;
+            let dl_lang = match detect_language_via_dl(
+                whisper_bin,
+                whisper_model_path,
+                None,
+                slice_wav_ref,
+                cancel_flag,
+            )
+            .await
+            {
+                Ok((lang, _)) => lang,
+                Err(WhisperExecError::MissingSharedLibrary(d)) => return Err(anyhow!(d)),
+                Err(WhisperExecError::Other(err)) => return Err(err),
+            };
+
+            let mut parsed = match dl_lang.as_deref() {
+                Some(raw) => {
+                    if let Some(norm) = normalize_auto_candidate_lang(raw) {
+                        let mut out = decode_wav_silent(
+                            whisper_bin,
+                            whisper_model_path,
+                            slice_wav_ref,
+                            &slice_out_prefix,
+                            norm,
+                            glossary,
+                            cancel_flag,
+                        )
+                        .await?;
+                        out.detected_language = Some(norm.to_string());
+                        out
+                    } else {
+                        let en_res = decode_wav_silent(
+                            whisper_bin,
+                            whisper_model_path,
+                            slice_wav_ref,
+                            &en_out_prefix,
+                            "en",
+                            glossary,
+                            cancel_flag,
+                        )
+                        .await
+                        .ok();
+                        let sr_res = decode_wav_silent(
+                            whisper_bin,
+                            whisper_model_path,
+                            slice_wav_ref,
+                            &sr_out_prefix,
+                            "sr",
+                            glossary,
+                            cancel_flag,
+                        )
+                        .await
+                        .ok();
+                        let winner = choose_en_or_sr_from_slices(
+                            en_res.as_ref(),
+                            sr_res.as_ref(),
+                            Some(raw),
+                        );
+                        let mut out = match winner {
+                            "sr" => sr_res.or(en_res),
+                            _ => en_res.or(sr_res),
+                        }
+                        .ok_or_else(|| {
+                            anyhow!("Failed to transcribe constrained EN/SR WAV slice")
+                        })?;
+                        out.detected_language = Some(winner.to_string());
+                        out
+                    }
+                }
+                None => {
+                    let norm_fallback = normalize_auto_candidate_lang(fallback_lang).unwrap_or("en");
+                    let mut out = decode_wav_silent(
+                        whisper_bin,
+                        whisper_model_path,
+                        slice_wav_ref,
+                        &slice_out_prefix,
+                        norm_fallback,
+                        glossary,
+                        cancel_flag,
+                    )
+                    .await?;
+                    out.detected_language = Some(norm_fallback.to_string());
+                    out
+                }
+            };
+
+            for w in &mut parsed.words {
+                w.start_ms = w.start_ms.saturating_add(start_ms);
+                w.end_ms = w.end_ms.saturating_add(start_ms);
+            }
+            Ok(parsed)
+        }
+        .await
+    };
+
+    let _ = fs::remove_file(&slice_wav);
+    let _ = fs::remove_file(format!("{}.json", slice_out_prefix.to_string_lossy()));
+    let _ = fs::remove_file(format!("{}.json", en_out_prefix.to_string_lossy()));
+    let _ = fs::remove_file(format!("{}.json", sr_out_prefix.to_string_lossy()));
     res
 }
 
@@ -1349,14 +1786,15 @@ async fn recover_bilingual_and_dropped_vad_windows<F>(
                 89.0,
                 "Recovering speech gap missed across language switch...".to_string(),
             );
-            if let Ok(gap_out) = transcribe_wav_slice(
+            let gap_fallback_lang = if is_primary_balkan { "sr" } else { "en" };
+            if let Ok(gap_out) = transcribe_wav_slice_en_sr(
                 whisper_bin,
                 whisper_model_path,
                 wav_path,
                 &tag,
                 cursor,
                 chunk_end,
-                "auto",
+                gap_fallback_lang,
                 glossary,
                 cancel_flag,
             )
@@ -1397,13 +1835,64 @@ where
     F: FnMut(f64, String),
 {
     let output_prefix = wav_path.with_extension("whisper_out");
-    let lang = {
-        let trimmed = source_language.trim();
-        if trimmed.is_empty() {
-            "auto"
-        } else {
-            trimmed
-        }
+    let trimmed = source_language.trim();
+    let is_auto = trimmed.is_empty() || trimmed.eq_ignore_ascii_case("auto");
+
+    if !is_auto {
+        let (raw_json, stderr_buf) = run_whisper_process(
+            WhisperProcessSpec {
+                whisper_bin,
+                whisper_model_path,
+                vad_model_path,
+                wav_path,
+                output_prefix: &output_prefix,
+                lang: trimmed,
+                glossary,
+                cancel_flag,
+                tick_base_progress: 15.0,
+                emit_progress: true,
+            },
+            on_progress,
+        )
+        .await?;
+
+        on_progress(90.0, "Parsing Whisper word timestamps...".to_string());
+        let vad_intervals = parse_vad_segments_from_stderr(&stderr_buf);
+        return parse_whisper_ojf_json_with_vad(&raw_json, &vad_intervals)
+            .map_err(WhisperExecError::Other);
+    }
+
+    on_progress(12.0, "Detecting audio language (EN / SR)...".to_string());
+    let (dl_lang, dl_vad) = detect_language_via_dl(
+        whisper_bin,
+        whisper_model_path,
+        vad_model_path,
+        wav_path,
+        cancel_flag,
+    )
+    .await?;
+
+    let mut effective_lang = match dl_lang.as_deref() {
+        Some(raw) => match normalize_auto_candidate_lang(raw) {
+            Some(norm) => norm,
+            None => {
+                on_progress(
+                    14.0,
+                    format!("Detected '{raw}' — constraining auto-detect to EN / SR..."),
+                );
+                pick_constrained_en_or_sr_for_wav(
+                    whisper_bin,
+                    whisper_model_path,
+                    wav_path,
+                    &dl_vad,
+                    glossary,
+                    cancel_flag,
+                    Some(raw),
+                )
+                .await
+            }
+        },
+        None => "auto",
     };
 
     let (raw_json, stderr_buf) = run_whisper_process(
@@ -1413,7 +1902,7 @@ where
             vad_model_path,
             wav_path,
             output_prefix: &output_prefix,
-            lang,
+            lang: effective_lang,
             glossary,
             cancel_flag,
             tick_base_progress: 15.0,
@@ -1424,11 +1913,68 @@ where
     .await?;
 
     on_progress(90.0, "Parsing Whisper word timestamps...".to_string());
-    let vad_intervals = parse_vad_segments_from_stderr(&stderr_buf);
+    let mut vad_intervals = parse_vad_segments_from_stderr(&stderr_buf);
     let mut output = parse_whisper_ojf_json_with_vad(&raw_json, &vad_intervals)
         .map_err(WhisperExecError::Other)?;
 
-    if lang.eq_ignore_ascii_case("auto") && !output.words.is_empty() {
+    if effective_lang == "auto" {
+        if let Some(raw) = output.detected_language.clone() {
+            if normalize_auto_candidate_lang(&raw).is_none() {
+                let vad_hint = if !vad_intervals.is_empty() {
+                    &vad_intervals
+                } else {
+                    &dl_vad
+                };
+                on_progress(
+                    14.0,
+                    format!("Detected '{raw}' — constraining auto-detect to EN / SR..."),
+                );
+                let forced = pick_constrained_en_or_sr_for_wav(
+                    whisper_bin,
+                    whisper_model_path,
+                    wav_path,
+                    vad_hint,
+                    glossary,
+                    cancel_flag,
+                    Some(&raw),
+                )
+                .await;
+                let (r_json, r_stderr) = run_whisper_process(
+                    WhisperProcessSpec {
+                        whisper_bin,
+                        whisper_model_path,
+                        vad_model_path,
+                        wav_path,
+                        output_prefix: &output_prefix,
+                        lang: forced,
+                        glossary,
+                        cancel_flag,
+                        tick_base_progress: 15.0,
+                        emit_progress: true,
+                    },
+                    on_progress,
+                )
+                .await?;
+                on_progress(90.0, "Parsing Whisper word timestamps...".to_string());
+                vad_intervals = parse_vad_segments_from_stderr(&r_stderr);
+                output = parse_whisper_ojf_json_with_vad(&r_json, &vad_intervals)
+                    .map_err(WhisperExecError::Other)?;
+                effective_lang = forced;
+            }
+        }
+    }
+
+    if effective_lang == "en" || effective_lang == "sr" {
+        output.detected_language = Some(effective_lang.to_string());
+    } else if let Some(norm) = output
+        .detected_language
+        .as_deref()
+        .and_then(normalize_auto_candidate_lang)
+    {
+        output.detected_language = Some(norm.to_string());
+    }
+
+    if is_auto && !output.words.is_empty() {
         recover_bilingual_and_dropped_vad_windows(
             whisper_bin,
             whisper_model_path,
@@ -2194,6 +2740,436 @@ esac
         assert!(out.words[0].start_ms <= 500);
         assert!(out.words[2].start_ms >= 12_230 && out.words[4].end_ms <= 30_420);
         assert_eq!(out.words[5].start_ms, 30_460);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn write_test_pcm16_wav(path: &Path, duration_ms: usize) {
+        let total_pcm_bytes = duration_ms * 32;
+        let riff_size = (36 + total_pcm_bytes) as u32;
+        let mut wav_bytes = Vec::with_capacity(44 + total_pcm_bytes);
+        wav_bytes.extend_from_slice(b"RIFF");
+        wav_bytes.extend_from_slice(&riff_size.to_le_bytes());
+        wav_bytes.extend_from_slice(b"WAVE");
+        wav_bytes.extend_from_slice(b"fmt ");
+        wav_bytes.extend_from_slice(&16u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&1u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16_000u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&32_000u32.to_le_bytes());
+        wav_bytes.extend_from_slice(&2u16.to_le_bytes());
+        wav_bytes.extend_from_slice(&16u16.to_le_bytes());
+        wav_bytes.extend_from_slice(b"data");
+        wav_bytes.extend_from_slice(&(total_pcm_bytes as u32).to_le_bytes());
+        wav_bytes.resize(44 + total_pcm_bytes, 0u8);
+        fs::write(path, wav_bytes).unwrap();
+    }
+
+    #[test]
+    fn normalizes_auto_candidate_langs_and_parses_dl_stderr() {
+        assert_eq!(normalize_auto_candidate_lang("en"), Some("en"));
+        assert_eq!(normalize_auto_candidate_lang(" EN "), Some("en"));
+        assert_eq!(normalize_auto_candidate_lang("English"), Some("en"));
+        assert_eq!(normalize_auto_candidate_lang("sr"), Some("sr"));
+        assert_eq!(normalize_auto_candidate_lang("hr"), Some("sr"));
+        assert_eq!(normalize_auto_candidate_lang("bs"), Some("sr"));
+        assert_eq!(normalize_auto_candidate_lang("Serbian"), Some("sr"));
+        assert_eq!(normalize_auto_candidate_lang("el"), None);
+        assert_eq!(normalize_auto_candidate_lang("de"), None);
+
+        let stderr = "whisper_init_from_file: loading model\nwhisper_full_with_state: auto-detected language: el (p = 0.72)\n";
+        assert_eq!(
+            parse_detected_language_from_stderr(stderr).as_deref(),
+            Some("el")
+        );
+        assert_eq!(
+            parse_detected_language_from_stderr("auto-detected language: HR, something").as_deref(),
+            Some("hr")
+        );
+        assert_eq!(parse_detected_language_from_stderr("nothing here"), None);
+    }
+
+    #[test]
+    fn chooses_en_or_sr_from_slice_probability_scores() {
+        let make_out = |lang: &str, probs: &[f64]| WhisperOutput {
+            detected_language: Some(lang.to_string()),
+            words: probs
+                .iter()
+                .enumerate()
+                .map(|(i, &p)| TimedWord {
+                    start_ms: (i as u64) * 500,
+                    end_ms: (i as u64 + 1) * 500,
+                    text: format!("w{i}"),
+                    probability: p,
+                })
+                .collect(),
+        };
+
+        let strong_en = make_out("en", &[0.94, 0.91, 0.95]);
+        let weak_sr = make_out("sr", &[0.32, 0.41, 0.28]);
+        assert_eq!(
+            choose_en_or_sr_from_slices(Some(&strong_en), Some(&weak_sr), Some("el")),
+            "en"
+        );
+
+        let weak_en = make_out("en", &[0.31, 0.25, 0.40]);
+        let strong_sr = make_out("sr", &[0.92, 0.89, 0.90]);
+        assert_eq!(
+            choose_en_or_sr_from_slices(Some(&weak_en), Some(&strong_sr), Some("sl")),
+            "sr"
+        );
+
+        let tied = make_out("en", &[0.80, 0.80]);
+        assert_eq!(
+            choose_en_or_sr_from_slices(Some(&tied), Some(&tied), Some("el")),
+            "en"
+        );
+        assert_eq!(
+            choose_en_or_sr_from_slices(Some(&tied), Some(&tied), Some("sl")),
+            "sr"
+        );
+        assert_eq!(
+            choose_en_or_sr_from_slices(Some(&tied), None, Some("el")),
+            "en"
+        );
+        assert_eq!(
+            choose_en_or_sr_from_slices(None, Some(&tied), Some("el")),
+            "sr"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_mode_constrains_greek_misdetection_to_english() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_auto_constrain_el_en_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let wav = temp_dir.join("greek_accent.16k.wav");
+        let model = temp_dir.join("model.bin");
+        let bin = temp_dir.join("mock-whisper");
+        write_test_pcm16_wav(&wav, 3_000);
+        fs::write(&model, b"model").unwrap();
+
+        {
+            let mut f = fs::File::create(&bin).unwrap();
+            f.write_all(
+                r#"#!/usr/bin/env sh
+LANG=""
+OUT=""
+DL=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) echo "usage: whisper-cli"; exit 0 ;;
+    -dl) DL=1; shift 1 ;;
+    -l) LANG="$2"; shift 2 ;;
+    -of) OUT="$2"; shift 2 ;;
+    *) shift 1 ;;
+  esac
+done
+
+if [ "$DL" = "1" ]; then
+  echo "whisper_full_with_state: auto-detected language: el (p = 0.72)" >&2
+  exit 0
+fi
+
+if [ "$LANG" = "el" ] || [ "$LANG" = "auto" ]; then
+  echo "ERROR: Third language leaked into auto-detect decode: $LANG" >&2
+  exit 2
+fi
+
+if [ "$LANG" = "en" ]; then
+  printf '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":2000},"text":" Hello friends.","tokens":[{"text":" Hello","offsets":{"from":0,"to":900},"p":0.95},{"text":" friends.","offsets":{"from":900,"to":2000},"p":0.94}]}]}' > "${OUT}.json"
+elif [ "$LANG" = "sr" ]; then
+  printf '{"result":{"language":"sr"},"transcription":[{"offsets":{"from":0,"to":2000},"text":" Helo frendz.","tokens":[{"text":" Helo","offsets":{"from":0,"to":900},"p":0.22},{"text":" frendz.","offsets":{"from":900,"to":2000},"p":0.26}]}]}' > "${OUT}.json"
+fi
+"#
+                .as_bytes(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_whisper_cli(
+            &bin,
+            &model,
+            None,
+            &wav,
+            "auto",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.detected_language.as_deref(), Some("en"));
+        let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["Hello", "friends."]);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn auto_mode_maps_croatian_to_serbian_without_rescoring() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_auto_hr_sr_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let wav = temp_dir.join("balkan.16k.wav");
+        let model = temp_dir.join("model.bin");
+        let bin = temp_dir.join("mock-whisper");
+        write_test_pcm16_wav(&wav, 3_000);
+        fs::write(&model, b"model").unwrap();
+
+        {
+            let mut f = fs::File::create(&bin).unwrap();
+            f.write_all(
+                r#"#!/usr/bin/env sh
+LANG=""
+OUT=""
+DL=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) echo "usage: whisper-cli"; exit 0 ;;
+    -dl) DL=1; shift 1 ;;
+    -l) LANG="$2"; shift 2 ;;
+    -of) OUT="$2"; shift 2 ;;
+    *) shift 1 ;;
+  esac
+done
+
+if [ "$DL" = "1" ]; then
+  echo "whisper_full_with_state: auto-detected language: hr (p = 0.88)" >&2
+  exit 0
+fi
+
+if [ "$LANG" != "sr" ]; then
+  echo "Expected -l sr after hr normalization, got -l $LANG" >&2
+  exit 3
+fi
+
+printf '{"result":{"language":"sr"},"transcription":[{"offsets":{"from":0,"to":2000},"text":" Zdravo svima.","tokens":[{"text":" Zdravo","offsets":{"from":0,"to":900},"p":0.97},{"text":" svima.","offsets":{"from":900,"to":2000},"p":0.95}]}]}' > "${OUT}.json"
+"#
+                .as_bytes(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_whisper_cli(
+            &bin,
+            &model,
+            None,
+            &wav,
+            "auto",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.detected_language.as_deref(), Some("sr"));
+        assert_eq!(out.words[0].text, "Zdravo");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn explicit_foreign_language_bypasses_en_sr_restriction() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_explicit_lang_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let wav = temp_dir.join("greek.16k.wav");
+        let model = temp_dir.join("model.bin");
+        let bin = temp_dir.join("mock-whisper");
+        write_test_pcm16_wav(&wav, 2_000);
+        fs::write(&model, b"model").unwrap();
+
+        {
+            let mut f = fs::File::create(&bin).unwrap();
+            f.write_all(
+                r#"#!/usr/bin/env sh
+LANG=""
+OUT=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) echo "usage: whisper-cli"; exit 0 ;;
+    -dl) echo "-dl must not be called for explicit language"; exit 4 ;;
+    -l) LANG="$2"; shift 2 ;;
+    -of) OUT="$2"; shift 2 ;;
+    *) shift 1 ;;
+  esac
+done
+
+printf '{"result":{"language":"%s"},"transcription":[{"offsets":{"from":0,"to":1500},"text":" Kalimera.","tokens":[{"text":" Kalimera.","offsets":{"from":0,"to":1500},"p":0.93}]}]}' "$LANG" > "${OUT}.json"
+"#
+                .as_bytes(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_whisper_cli(
+            &bin,
+            &model,
+            None,
+            &wav,
+            "el",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(out.detected_language.as_deref(), Some("el"));
+        assert_eq!(out.words[0].text, "Kalimera.");
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn gap_recovery_under_auto_constrains_third_language_to_en_or_sr() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_gap_constrain_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let full_wav = temp_dir.join("interview.16k.wav");
+        let vad_model = temp_dir.join("vad.bin");
+        let whisper_model = temp_dir.join("ggml-large-v3-turbo.bin");
+        let bin = temp_dir.join("mock-whisper");
+        write_test_pcm16_wav(&full_wav, 25_000);
+        fs::write(&vad_model, b"vad").unwrap();
+        fs::write(&whisper_model, b"model").unwrap();
+
+        {
+            let mut f = fs::File::create(&bin).unwrap();
+            f.write_all(
+                r#"#!/usr/bin/env sh
+LANG=""
+OUT=""
+WAV=""
+DL=0
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --help) echo "usage: whisper-cli"; exit 0 ;;
+    -dl) DL=1; shift 1 ;;
+    -l) LANG="$2"; shift 2 ;;
+    -of) OUT="$2"; shift 2 ;;
+    -f) WAV="$2"; shift 2 ;;
+    *) shift 1 ;;
+  esac
+done
+
+case "$WAV" in
+  *.gap_0_0.wav)
+    if [ "$DL" = "1" ]; then
+      echo "whisper_full_with_state: auto-detected language: el (p = 0.65)" >&2
+      exit 0
+    fi
+    if [ "$LANG" = "auto" ] || [ "$LANG" = "el" ]; then
+      echo "Gap recovery leaked unrestricted language $LANG" >&2
+      exit 5
+    fi
+    if [ "$LANG" = "en" ]; then
+      printf '{"result":{"language":"en"},"transcription":[{"offsets":{"from":0,"to":3000},"text":" English reply.","tokens":[{"text":" English","offsets":{"from":0,"to":1400},"p":0.95},{"text":" reply.","offsets":{"from":1400,"to":3000},"p":0.94}]}]}' > "${OUT}.json"
+    else
+      printf '{"result":{"language":"sr"},"transcription":[{"offsets":{"from":0,"to":3000},"text":" Noise.","tokens":[{"text":" Noise.","offsets":{"from":0,"to":3000},"p":0.25}]}]}' > "${OUT}.json"
+    fi
+    ;;
+  *)
+    if [ "$DL" = "1" ]; then
+      echo "whisper_full_with_state: auto-detected language: sr (p = 0.90)" >&2
+      exit 0
+    fi
+    cat >&2 << 'VADEOF'
+whisper_vad_segments_from_probs: VAD segment 0: start = 0.20, end = 4.00 (duration: 3.80)
+whisper_vad_segments_from_probs: VAD segment 1: start = 5.00, end = 12.00 (duration: 7.00)
+whisper_vad_segments_from_probs: VAD segment 2: start = 15.00, end = 20.00 (duration: 5.00)
+VADEOF
+    cat << 'JSONEOF' > "${OUT}.json"
+{
+  "result": { "language": "sr" },
+  "transcription": [
+    {
+      "offsets": { "from": 200, "to": 4000 },
+      "text": " Pitanje.",
+      "tokens": [
+        { "text": " Pitanje.", "offsets": { "from": 200, "to": 4000 }, "p": 0.96 }
+      ]
+    },
+    {
+      "offsets": { "from": 15000, "to": 20000 },
+      "text": " Hvala.",
+      "tokens": [
+        { "text": " Hvala.", "offsets": { "from": 15000, "to": 20000 }, "p": 0.96 }
+      ]
+    }
+  ]
+}
+JSONEOF
+    ;;
+esac
+"#
+                .as_bytes(),
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_whisper_cli(
+            &bin,
+            &whisper_model,
+            Some(&vad_model),
+            &full_wav,
+            "auto",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["Pitanje.", "English", "reply.", "Hvala."]);
 
         let _ = fs::remove_dir_all(&temp_dir);
     }

@@ -15,6 +15,13 @@ pub fn run() {
     diagnostics::init_logging(&default_data_dir);
     diagnostics::install_panic_hook();
 
+    tracing::info!(
+        "EasySRT Studio v{} starting on {}/{}",
+        env!("CARGO_PKG_VERSION"),
+        std::env::consts::OS,
+        std::env::consts::ARCH
+    );
+
     tauri::Builder::default()
         .setup(|app| {
             if let Ok(paths) = storage::resolve_storage_paths(app.handle(), None) {

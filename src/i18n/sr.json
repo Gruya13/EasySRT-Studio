@@ -117,7 +117,7 @@
     "deleteCheckpoint": "Obriši"
   },
   "languages": {
-    "auto": "Auto-detekcija",
+    "auto": "Auto-detekcija (EN / SR)",
     "sr": "Srpski (sr)",
     "en": "Engleski (en)",
     "de": "Nemački (de)",
@@ -125,6 +125,7 @@
     "fr": "Francuski (fr)",
     "ru": "Ruski (ru)",
     "it": "Italijanski (it)",
+    "el": "Grčki (el)",
     "none": "Bez prevoda (samo transkript)"
   },
   "queue": {
@@ -286,12 +287,12 @@
     "close": "Zatvori"
   },
   "bugReport": {
-    "title": "Prijava greške i dijagnostika",
-    "subtitle": "Pošaljite opis problema razvojnom timu ili sačuvajte dijagnostiku lokalno.",
-    "titleLabel": "Naslov problema",
+    "title": "Prijava greške ili predlog izmene",
+    "subtitle": "Opišite problem ili napišite šta želite da izmenimo — ili sačuvajte dijagnostiku lokalno.",
+    "titleLabel": "Naslov prijave / predloga",
     "titlePlaceholder": "Npr. Transkripcija se zaustavlja na 50% za M4A fajl",
-    "descriptionLabel": "Opis problema",
-    "descriptionPlaceholder": "Opišite šta se dogodilo i šta ste očekivali...",
+    "descriptionLabel": "Opis problema ili željene izmene",
+    "descriptionPlaceholder": "Opišite šta se dogodilo ili šta biste želeli da promenimo / dodamo...",
     "stepsLabel": "Koraci za reprodukciju (opciono)",
     "stepsPlaceholder": "1. Uvezite audio fajl\n2. Kliknite na Pokreni\n3. Pojavljuje se greška...",
     "contactLabel": "Kontakt / Email ili GitHub nalog (opciono)",

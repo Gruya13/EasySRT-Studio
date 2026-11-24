@@ -17,6 +17,7 @@ pub const KEYRING_USER_CUSTOM_OPENAI: &str = "custom_openai";
 pub const CREDENTIALS_FILE_NAME: &str = ".credentials.json";
 
 const OBFUSCATION_KEY: &[u8] = b"EasySRT-Studio-Credential-Mask-2026";
+const LEGACY_OBFUSCATION_KEY: &[u8] = b"EasySRT-Studio-Portable-Credential-Mask-2026";
 const OBFUSCATION_PREFIX: &str = "obf1:";
 
 /// Determine the canonical installed root directory matching Tauri's `app_local_data_dir()`
@@ -260,16 +261,45 @@ fn obfuscate_secret(plain: &str) -> String {
     format!("{}{}", OBFUSCATION_PREFIX, hex::encode(masked))
 }
 
+fn xor_decode_with_key(bytes: &[u8], key: &[u8]) -> Option<String> {
+    let unmasked: Vec<u8> = bytes
+        .iter()
+        .enumerate()
+        .map(|(i, b)| b ^ key[i % key.len()])
+        .collect();
+    String::from_utf8(unmasked).ok()
+}
+
+fn is_clean_secret_token(s: &str) -> bool {
+    !s.is_empty() && s.bytes().all(|b| b.is_ascii_graphic())
+}
+
+fn looks_strongly_like_key(s: &str) -> bool {
+    is_clean_secret_token(s)
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b':'))
+}
+
 fn deobfuscate_secret(stored: &str) -> String {
     if let Some(hex_part) = stored.strip_prefix(OBFUSCATION_PREFIX) {
         if let Ok(bytes) = hex::decode(hex_part) {
-            let unmasked: Vec<u8> = bytes
-                .iter()
-                .enumerate()
-                .map(|(i, b)| b ^ OBFUSCATION_KEY[i % OBFUSCATION_KEY.len()])
-                .collect();
-            if let Ok(s) = String::from_utf8(unmasked) {
-                return s;
+            let cand_new = xor_decode_with_key(&bytes, OBFUSCATION_KEY);
+            let cand_legacy = xor_decode_with_key(&bytes, LEGACY_OBFUSCATION_KEY);
+
+            match (cand_new, cand_legacy) {
+                (Some(n), Some(l)) => {
+                    let l_strong = looks_strongly_like_key(&l);
+                    let n_strong = looks_strongly_like_key(&n);
+                    let l_clean = is_clean_secret_token(&l);
+                    let n_clean = is_clean_secret_token(&n);
+                    if (l_strong && !n_strong) || (l_clean && !n_clean) {
+                        return l;
+                    }
+                    return n;
+                }
+                (Some(n), None) => return n,
+                (None, Some(l)) => return l,
+                (None, None) => {}
             }
         }
     }
@@ -844,5 +874,23 @@ mod tests {
         );
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn deobfuscates_both_current_and_legacy_v01_credentials() {
+        let secret = "sk-1234567890abcdef1234567890abcdef";
+        let current_obf = obfuscate_secret(secret);
+        assert_eq!(deobfuscate_secret(&current_obf), secret);
+
+        // Encrypt with legacy v0.1.x key and verify deobfuscate_secret recovers it cleanly
+        let legacy_masked: Vec<u8> = secret
+            .as_bytes()
+            .iter()
+            .enumerate()
+            .map(|(i, b)| b ^ LEGACY_OBFUSCATION_KEY[i % LEGACY_OBFUSCATION_KEY.len()])
+            .collect();
+        let legacy_obf = format!("{}{}", OBFUSCATION_PREFIX, hex::encode(legacy_masked));
+        assert_ne!(current_obf, legacy_obf);
+        assert_eq!(deobfuscate_secret(&legacy_obf), secret);
     }
 }

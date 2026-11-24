@@ -1,8 +1,24 @@
 import { Merge, Plus, Redo2, Scissors, Trash2, Undo2 } from "lucide-react";
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Fragment,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+} from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
 import { readAudioPreviewBase64 } from "../lib/tauri";
+import {
+  MAX_TIMELINE_ZOOM_PCT,
+  MIN_TIMELINE_ZOOM_PCT,
+  computeButtonZoomPct,
+  computeSafeCanvasSize,
+  computeWheelZoomPct,
+  formatRulerTimestamp,
+} from "../lib/timelineUtils";
 import { useAppStore } from "../stores/appStore";
 import type { JobPhase, SubtitleCue } from "../types/models";
 
@@ -104,7 +120,7 @@ function decodeBase64ToBytes(base64: string): Uint8Array {
 /** Extracts 99th-percentile normalized acoustic amplitude buckets from an AudioBuffer. */
 function extractAudioPeaks(
   buffer: AudioBuffer,
-  bucketCount = 2400,
+  bucketCount = 4800,
 ): Float32Array {
   const totalSamples = buffer.length;
   if (totalSamples === 0 || bucketCount <= 0 || buffer.numberOfChannels === 0) {
@@ -236,7 +252,14 @@ export function WaveformTimeline() {
   const lang = normalizeUiLanguage(config.uiLanguage);
   const t = getDictionary(lang);
 
-  const [zoomPct, setZoomPct] = useState(100);
+  const [zoomPct, setZoomPct] = useState(MIN_TIMELINE_ZOOM_PCT);
+  const zoomPctRef = useRef(zoomPct);
+  zoomPctRef.current = zoomPct;
+  const renderedZoomPctRef = useRef(zoomPct);
+  const pendingZoomAnchorRef = useRef<{
+    timeRatio: number;
+    cursorX: number;
+  } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
   const [playheadMs, setPlayheadMs] = useState(0);
   const [audioBlobUrl, setAudioBlobUrl] = useState<string>("");
@@ -396,7 +419,7 @@ export function WaveformTimeline() {
         if (decoded.duration > 0) {
           setLiveAudioDurationMs(Math.round(decoded.duration * 1000));
         }
-        audioPeaksRef.current = extractAudioPeaks(decoded, 2400);
+        audioPeaksRef.current = extractAudioPeaks(decoded, 4800);
         setWaveformVersion((v) => v + 1);
         return decoded;
       } catch {
@@ -680,7 +703,7 @@ export function WaveformTimeline() {
             setLiveAudioDurationMs(Math.round(buffer.duration * 1000));
           }
           if (!audioPeaksRef.current) {
-            audioPeaksRef.current = extractAudioPeaks(buffer, 2400);
+            audioPeaksRef.current = extractAudioPeaks(buffer, 4800);
             setWaveformVersion((v) => v + 1);
           }
         }
@@ -822,7 +845,67 @@ export function WaveformTimeline() {
     return () => window.removeEventListener("resize", updateSize);
   }, []);
 
-  // Draw HiDPI MP3 Waveform Canvas
+  // Mouse-wheel zoom (scroll up = zoom in, scroll down = zoom out, up to 1000%, cursor-anchored; Shift+wheel = horizontal pan)
+  useEffect(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    const handleWheel = (e: WheelEvent) => {
+      if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        return;
+      }
+      if (e.shiftKey) {
+        e.preventDefault();
+        vp.scrollLeft += e.deltaY;
+        return;
+      }
+      if (e.deltaY === 0) {
+        return;
+      }
+      e.preventDefault();
+      const prevZoom = zoomPctRef.current;
+      const nextZoom = computeWheelZoomPct(prevZoom, e.deltaY);
+      if (nextZoom === prevZoom) {
+        return;
+      }
+      const rect = vp.getBoundingClientRect();
+      const cursorX = Math.max(0, Math.min(rect.width, e.clientX - rect.left));
+      if (!pendingZoomAnchorRef.current) {
+        const currentContentWidth = Math.max(
+          1,
+          vp.clientWidth * (renderedZoomPctRef.current / 100),
+        );
+        const timeRatio = Math.max(
+          0,
+          Math.min(1, (vp.scrollLeft + cursorX) / currentContentWidth),
+        );
+        pendingZoomAnchorRef.current = { timeRatio, cursorX };
+      } else {
+        pendingZoomAnchorRef.current.cursorX = cursorX;
+      }
+      zoomPctRef.current = nextZoom;
+      setZoomPct(nextZoom);
+    };
+    vp.addEventListener("wheel", handleWheel, { passive: false });
+    return () => vp.removeEventListener("wheel", handleWheel);
+  }, []);
+
+  useLayoutEffect(() => {
+    renderedZoomPctRef.current = zoomPct;
+    const anchor = pendingZoomAnchorRef.current;
+    const vp = viewportRef.current;
+    if (!anchor || !vp) {
+      pendingZoomAnchorRef.current = null;
+      return;
+    }
+    pendingZoomAnchorRef.current = null;
+    const newContentWidth = Math.max(1, vp.clientWidth * (zoomPct / 100));
+    vp.scrollLeft = Math.max(
+      0,
+      anchor.timeRatio * newContentWidth - anchor.cursorX,
+    );
+  }, [zoomPct]);
+
+  // Draw HiDPI MP3 Waveform Canvas (clamped to 16384px WebView backing store limit)
   const drawWaveform = useCallback(() => {
     const canvas = canvasRef.current;
     const parent = mp3ClipRef.current;
@@ -832,13 +915,15 @@ export function WaveformTimeline() {
     const width = Math.max(1, Math.floor(rect.width));
     const height = Math.max(1, Math.floor(rect.height));
     const dpr = window.devicePixelRatio || 1;
+    const { backingWidth, backingHeight, scaleX, scaleY } =
+      computeSafeCanvasSize(width, height, dpr);
 
-    canvas.width = Math.round(width * dpr);
-    canvas.height = Math.round(height * dpr);
+    canvas.width = backingWidth;
+    canvas.height = backingHeight;
 
     const ctx = canvas.getContext("2d");
     if (!ctx) return;
-    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    ctx.setTransform(scaleX, 0, 0, scaleY, 0, 0);
     ctx.clearRect(0, 0, width, height);
 
     const midY = height / 2;
@@ -1135,7 +1220,8 @@ export function WaveformTimeline() {
     const contentWidthPx = viewportWidth * (zoomPct / 100);
     const pxPerSec = contentWidthPx / Math.max(0.1, totalMs / 1000);
     const majorSteps = [
-      500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000, 300000,
+      100, 200, 500, 1000, 2000, 5000, 10000, 15000, 30000, 60000, 120000,
+      300000,
     ];
     const majorStepMs =
       majorSteps.find((step) => (step / 1000) * pxPerSec >= 64) ?? 300000;
@@ -1156,7 +1242,7 @@ export function WaveformTimeline() {
         ms,
         pct,
         isMajor,
-        label: isMajor && ms < totalMs ? formatRulerSec(ms) : null,
+        label: isMajor && ms < totalMs ? formatRulerTimestamp(ms) : null,
       });
     }
     return ticks;
@@ -1503,8 +1589,12 @@ export function WaveformTimeline() {
             id="tl-zoom-out"
             className="tl-zoom-btn"
             type="button"
-            title={lang === "en" ? "Zoom out" : "Umanji zoom"}
-            onClick={() => setZoomPct((z) => Math.max(100, z - 25))}
+            title={
+              lang === "en"
+                ? "Zoom out (Mouse wheel down)"
+                : "Umanji zoom (Točkić miša dole)"
+            }
+            onClick={() => setZoomPct((z) => computeButtonZoomPct(z, "out"))}
           >
             −
           </button>
@@ -1512,8 +1602,8 @@ export function WaveformTimeline() {
             id="tl-zoom-slider"
             className="tl-zoom-slider"
             type="range"
-            min={100}
-            max={500}
+            min={MIN_TIMELINE_ZOOM_PCT}
+            max={MAX_TIMELINE_ZOOM_PCT}
             step={25}
             value={zoomPct}
             onChange={(e) => setZoomPct(Number(e.target.value))}
@@ -1526,8 +1616,12 @@ export function WaveformTimeline() {
             id="tl-zoom-in"
             className="tl-zoom-btn"
             type="button"
-            title={lang === "en" ? "Zoom in" : "Uvećaj zoom"}
-            onClick={() => setZoomPct((z) => Math.min(500, z + 25))}
+            title={
+              lang === "en"
+                ? "Zoom in (Mouse wheel up)"
+                : "Uvećaj zoom (Točkić miša gore)"
+            }
+            onClick={() => setZoomPct((z) => computeButtonZoomPct(z, "in"))}
           >
             +
           </button>

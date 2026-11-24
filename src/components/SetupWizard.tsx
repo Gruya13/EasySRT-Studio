@@ -499,6 +499,15 @@ export function SetupWizard() {
                 {t.setup.cloudActivateBtn}
               </button>
             </div>
+            {cloudProviderDraft === "deepSeek" &&
+              apiKeyDraft.trim().length > 0 &&
+              !apiKeyDraft.trim().startsWith("sk-") && (
+                <p className="text-[11px] text-amber-400" role="note">
+                  {lang === "en"
+                    ? "DeepSeek API keys normally start with sk- — verify you copied the secret key."
+                    : "DeepSeek API ključevi obično počinju sa sk- — proverite da ste kopirali pravi API ključ."}
+                </p>
+              )}
           </section>
 
           {/* Collapsible Advanced Section: Platform Core Binaries & Whisper ASR Models */}

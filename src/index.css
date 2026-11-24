@@ -1928,7 +1928,7 @@ input:checked + .s-switch::after {
 }
 
 .tl-zoom-label {
-  width: 38px;
+  min-width: 44px;
   text-align: right;
   font-family: var(--font-mono);
   font-variant-numeric: tabular-nums;
@@ -2440,4 +2440,25 @@ input:checked + .s-switch::after {
   font-variant-numeric: tabular-nums;
   font-size: 10.5px;
   color: #6e7788;
+}
+
+.footer-bug-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 5px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: #8a94a8;
+  cursor: pointer;
+  transition: background 140ms ease, color 140ms ease, border-color 140ms ease;
+}
+
+.footer-bug-btn:hover {
+  background: rgba(56, 189, 248, 0.14);
+  border-color: rgba(56, 189, 248, 0.35);
+  color: #38bdf8;
 }

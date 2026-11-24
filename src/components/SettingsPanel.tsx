@@ -543,6 +543,7 @@ export function SettingsPanel() {
                   <option value="fr">{t.languages.fr}</option>
                   <option value="ru">{t.languages.ru}</option>
                   <option value="it">{t.languages.it}</option>
+                  <option value="el">{t.languages.el}</option>
                 </select>
               </div>
 
@@ -1143,6 +1144,18 @@ export function SettingsPanel() {
                         </button>
                       )}
                     </div>
+                    {effectiveProvider === "deepSeek" &&
+                      apiKeyInput.trim().length > 0 &&
+                      !apiKeyInput.trim().startsWith("sk-") && (
+                        <p
+                          className="mt-1 text-[11px] text-amber-400"
+                          role="note"
+                        >
+                          {lang === "en"
+                            ? "DeepSeek API keys normally start with sk- — verify you copied the secret key."
+                            : "DeepSeek API ključevi obično počinju sa sk- — proverite da ste kopirali pravi API ključ."}
+                        </p>
+                      )}
                   </div>
 
                   <div className="s-field">
