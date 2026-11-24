@@ -13,6 +13,7 @@ src-tauri/gen/
 # Local runtime / test data
 src-tauri/resources/vcruntime/*.dll
 mockup/
+test/
 worker/.cloudflare/
 worker/.dev.vars
 *.log

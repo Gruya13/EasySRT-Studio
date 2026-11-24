@@ -822,7 +822,7 @@ where
 
     if item.size_bytes == 0 || existing_len < item.size_bytes {
         let client = reqwest::Client::builder()
-            .user_agent("EasySRT-Studio/0.3.2")
+            .user_agent(concat!("EasySRT-Studio/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
             .build()
             .context("Failed to initialize HTTP download client")?;
