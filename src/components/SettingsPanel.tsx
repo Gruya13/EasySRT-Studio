@@ -4,6 +4,7 @@ import {
   formatBytes,
   formatDurationShort,
   isTauriRuntime,
+  normalizeTranslationStyle,
 } from "../lib/subtitleUtils";
 import { openDialogPreservingMaximize } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
@@ -13,6 +14,7 @@ import type {
   SegmentPreset,
   SerbianScript,
   TranslationProviderKind,
+  TranslationStyle,
 } from "../types/models";
 
 type SettingsTabId = "obrada" | "titlovi" | "modeli" | "izvoz" | "opste";
@@ -172,6 +174,12 @@ export function SettingsPanel() {
 
   const effectiveProvider: TranslationProviderKind =
     jobOptions.providerOverride ?? config.translation.provider;
+  const effectiveTranslationStyle: TranslationStyle =
+    normalizeTranslationStyle(jobOptions.translationStyle);
+  const splitOnSpeakerChange: boolean =
+    jobOptions.segmentRules.splitOnSpeakerChange ??
+    config.defaultSegmentRules.splitOnSpeakerChange ??
+    true;
 
   const [lastOnlineProvider, setLastOnlineProvider] = useState<
     "deepSeek" | "customOpenAi"
@@ -600,31 +608,96 @@ export function SettingsPanel() {
               </div>
 
               <div className="s-field">
-                <span className="s-label">
-                  {lang === "en" ? "Language Polishing" : "Jezičko poliranje"}
-                </span>
-                <label className="s-toggle-card">
-                  <span className="s-toggle-meta">
-                    <span className="s-toggle-title">
-                      {lang === "en" ? "LLM Polish" : "LLM poliranje"}
-                    </span>
-                    <span className="s-toggle-hint">
-                      {lang === "sr" ? "Ekavski standard" : "Ekavian standard"}
-                    </span>
-                  </span>
-                  <input
-                    id="s-polish-sr"
-                    type="checkbox"
-                    checked={jobOptions.polishSerbian}
-                    onChange={(e) =>
-                      setJobOptions({ polishSerbian: e.target.checked })
+                <span className="s-label">{t.workspace.translationStyle}</span>
+                <div
+                  className="s-seg"
+                  role="group"
+                  aria-label={t.workspace.translationStyle}
+                >
+                  <button
+                    type="button"
+                    className={`s-seg-btn js-translation-style-btn${
+                      effectiveTranslationStyle === "natural"
+                        ? " active-accent"
+                        : ""
+                    }`}
+                    data-translation-style="natural"
+                    aria-pressed={effectiveTranslationStyle === "natural"}
+                    title={t.workspace.translationStyleNaturalHint}
+                    onClick={() =>
+                      setJobOptions({ translationStyle: "natural" })
                     }
-                    hidden
-                  />
-                  <span className="s-switch" aria-hidden="true" />
-                </label>
+                  >
+                    {t.workspace.translationStyleNatural}
+                  </button>
+                  <button
+                    type="button"
+                    className={`s-seg-btn js-translation-style-btn${
+                      effectiveTranslationStyle === "formal"
+                        ? " active-accent"
+                        : ""
+                    }`}
+                    data-translation-style="formal"
+                    aria-pressed={effectiveTranslationStyle === "formal"}
+                    title={t.workspace.translationStyleFormalHint}
+                    onClick={() =>
+                      setJobOptions({ translationStyle: "formal" })
+                    }
+                  >
+                    {t.workspace.translationStyleFormal}
+                  </button>
+                </div>
               </div>
             </div>
+
+            <label className="s-toggle-card">
+              <span className="s-toggle-meta">
+                <span className="s-toggle-title">
+                  {lang === "en" ? "LLM Polish" : "LLM poliranje"}
+                </span>
+                <span className="s-toggle-hint">
+                  {lang === "sr" ? "Ekavski standard" : "Ekavian standard"}
+                </span>
+              </span>
+              <input
+                id="s-polish-sr"
+                type="checkbox"
+                checked={jobOptions.polishSerbian}
+                onChange={(e) =>
+                  setJobOptions({ polishSerbian: e.target.checked })
+                }
+                hidden
+              />
+              <span className="s-switch" aria-hidden="true" />
+            </label>
+
+            <label className="s-toggle-card">
+              <span className="s-toggle-meta">
+                <span className="s-toggle-title">
+                  {t.workspace.splitOnSpeakerChange}
+                </span>
+                <span className="s-toggle-hint">
+                  {t.workspace.splitOnSpeakerChangeHint}
+                </span>
+              </span>
+              <input
+                id="s-split-speaker"
+                type="checkbox"
+                checked={splitOnSpeakerChange}
+                onChange={(e) => {
+                  const enabled = e.target.checked;
+                  updateSegmentRules({ splitOnSpeakerChange: enabled });
+                  void updateConfig({
+                    defaultSegmentRules: {
+                      ...config.defaultSegmentRules,
+                      splitOnSpeakerChange: enabled,
+                    },
+                  });
+                }}
+                hidden
+              />
+              <span className="s-switch" aria-hidden="true" />
+            </label>
 
             <label className="s-toggle-card">
               <span className="s-toggle-meta">

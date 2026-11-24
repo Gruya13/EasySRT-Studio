@@ -3,6 +3,7 @@ import type {
   SegmentRules,
   SerbianScript,
   SubtitleCue,
+  TranslationStyle,
 } from "../types/models";
 
 export function isTauriRuntime(): boolean {
@@ -84,6 +85,7 @@ export function getPresetSegmentRules(
   preset: SegmentPreset,
   current?: SegmentRules,
 ): SegmentRules {
+  const splitOnSpeakerChange = current?.splitOnSpeakerChange ?? true;
   if (preset === "standard") {
     return {
       preset: "standard",
@@ -92,6 +94,7 @@ export function getPresetSegmentRules(
       minDurationMs: 1000,
       maxDurationMs: 7000,
       maxCps: 17,
+      splitOnSpeakerChange,
     };
   }
   if (preset === "reels") {
@@ -102,6 +105,7 @@ export function getPresetSegmentRules(
       minDurationMs: 600,
       maxDurationMs: 3500,
       maxCps: 18,
+      splitOnSpeakerChange,
     };
   }
   return {
@@ -111,7 +115,26 @@ export function getPresetSegmentRules(
     minDurationMs: current?.minDurationMs ?? 1000,
     maxDurationMs: current?.maxDurationMs ?? 7000,
     maxCps: current?.maxCps ?? 17,
+    splitOnSpeakerChange,
   };
+}
+
+export function normalizeSegmentRules(
+  rules?: Partial<SegmentRules> | null,
+): SegmentRules {
+  const base = getPresetSegmentRules(rules?.preset ?? "standard");
+  return {
+    ...base,
+    ...rules,
+    preset: rules?.preset ?? base.preset,
+    splitOnSpeakerChange: rules?.splitOnSpeakerChange ?? true,
+  };
+}
+
+export function normalizeTranslationStyle(
+  style?: TranslationStyle | string | null,
+): TranslationStyle {
+  return style === "formal" ? "formal" : "natural";
 }
 
 /**

@@ -96,9 +96,12 @@ export interface SegmentRules {
   minDurationMs: number;
   maxDurationMs: number;
   maxCps: number;
+  splitOnSpeakerChange?: boolean;
 }
 
 export type SerbianScript = "latin" | "cyrillic";
+
+export type TranslationStyle = "natural" | "formal";
 
 export type TranslationProviderKind =
   | "localLlama"
@@ -151,6 +154,7 @@ export interface TimedWord {
   endMs: number;
   text: string;
   probability: number;
+  speakerChange?: boolean;
 }
 
 export interface SubtitleCue {
@@ -171,6 +175,7 @@ export interface JobOptions {
   glossary: Record<string, string>;
   polishSerbian: boolean;
   correctSourceAsr?: boolean;
+  translationStyle?: TranslationStyle;
   providerOverride: TranslationProviderKind | null;
 }
 

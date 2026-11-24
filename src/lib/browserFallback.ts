@@ -27,6 +27,8 @@ import type {
 import {
   convertSerbianScriptText,
   getPresetSegmentRules,
+  normalizeSegmentRules,
+  normalizeTranslationStyle,
   parseSubtitleFileText,
   recalculateCue,
 } from "./subtitleUtils";
@@ -292,7 +294,9 @@ export function createDemoProject(
   const effectiveOptions: JobOptions = options
     ? {
         ...options,
+        segmentRules: normalizeSegmentRules(options.segmentRules),
         correctSourceAsr: options.correctSourceAsr ?? false,
+        translationStyle: normalizeTranslationStyle(options.translationStyle),
       }
     : {
         sourceLanguage: "en",
@@ -306,6 +310,7 @@ export function createDemoProject(
         },
         polishSerbian: true,
         correctSourceAsr: false,
+        translationStyle: "natural",
         providerOverride: null,
       };
 
@@ -571,7 +576,10 @@ export const browserFallback = {
   },
 
   async saveConfig(config: AppConfig): Promise<AppConfig> {
-    mockConfig = { ...config };
+    mockConfig = {
+      ...config,
+      defaultSegmentRules: normalizeSegmentRules(config.defaultSegmentRules),
+    };
     return mockConfig;
   },
 
@@ -660,12 +668,15 @@ export const browserFallback = {
     project: SubtitleProject,
     rules: SegmentRules,
   ): Promise<SubtitleProject> {
-    const updatedCues = project.cues.map((cue) => recalculateCue(cue, rules));
+    const normalizedRules = normalizeSegmentRules(rules);
+    const updatedCues = project.cues.map((cue) =>
+      recalculateCue(cue, normalizedRules),
+    );
     const updated: SubtitleProject = {
       ...project,
       options: {
         ...project.options,
-        segmentRules: rules,
+        segmentRules: normalizedRules,
       },
       cues: updatedCues,
       updatedAt: new Date().toISOString(),

@@ -8,6 +8,8 @@ import {
   convertSerbianScriptText,
   getPresetSegmentRules,
   isTauriRuntime,
+  normalizeSegmentRules,
+  normalizeTranslationStyle,
   parseSubtitleFileText,
   recalculateCue,
   resolveInitialBatchActiveJobId,
@@ -144,6 +146,7 @@ const DEFAULT_JOB_OPTIONS: JobOptions = {
   glossary: {},
   polishSerbian: true,
   correctSourceAsr: false,
+  translationStyle: "natural",
   providerOverride: null,
 };
 
@@ -297,6 +300,23 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     void action();
   };
+
+  const normalizeLoadedConfig = (
+    loaded: AppConfig,
+    fallbackSplitOnSpeakerChange?: boolean,
+  ): AppConfig => ({
+    ...DEFAULT_CONFIG,
+    ...loaded,
+    defaultSegmentRules: normalizeSegmentRules({
+      ...loaded.defaultSegmentRules,
+      splitOnSpeakerChange:
+        loaded.defaultSegmentRules?.splitOnSpeakerChange ??
+        fallbackSplitOnSpeakerChange ??
+        true,
+    }),
+    autoSendCrashReports: loaded.autoSendCrashReports ?? true,
+    uiLanguage: normalizeUiLanguage(loaded.uiLanguage),
+  });
 
   const findCueIdAtPlayheadZero = (cues: SubtitleCue[]): number | null => {
     const match = cues.find((c) => c.startMs <= 0 && c.endMs >= 0);
@@ -495,12 +515,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             : Promise.resolve(APP_VERSION),
         ]);
 
-        const config: AppConfig = {
-          ...DEFAULT_CONFIG,
-          ...loadedConfig,
-          autoSendCrashReports: loadedConfig.autoSendCrashReports ?? true,
-          uiLanguage: normalizeUiLanguage(loadedConfig.uiLanguage),
-        };
+        const config = normalizeLoadedConfig(loadedConfig);
 
         const jobOptions: JobOptions = {
           ...DEFAULT_JOB_OPTIONS,
@@ -580,7 +595,12 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       set({ config: nextConfig });
       try {
         const saved = await saveConfig(nextConfig);
-        set({ config: saved });
+        set({
+          config: normalizeLoadedConfig(
+            saved,
+            nextConfig.defaultSegmentRules.splitOnSpeakerChange,
+          ),
+        });
       } catch {
         // Keep optimistic UI language
       }
@@ -590,11 +610,19 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       const nextConfig: AppConfig = {
         ...get().config,
         ...patch,
+        defaultSegmentRules: normalizeSegmentRules(
+          patch.defaultSegmentRules ?? get().config.defaultSegmentRules,
+        ),
       };
       set({ config: nextConfig });
       try {
         const saved = await saveConfig(nextConfig);
-        set({ config: saved });
+        set({
+          config: normalizeLoadedConfig(
+            saved,
+            nextConfig.defaultSegmentRules.splitOnSpeakerChange,
+          ),
+        });
       } catch (err) {
         set({
           banner: {
@@ -613,7 +641,15 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getConfig(),
           getApiKeyStatus(),
         ]);
-        set({ setupStatus, catalog, config, apiKeyStatus });
+        set({
+          setupStatus,
+          catalog,
+          config: normalizeLoadedConfig(
+            config,
+            get().config.defaultSegmentRules.splitOnSpeakerChange,
+          ),
+          apiKeyStatus,
+        });
       } catch (err) {
         set({
           banner: {
@@ -641,7 +677,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getSetupStatus(),
           getConfig(),
         ]);
-        set({ setupStatus, config });
+        set({
+          setupStatus,
+          config: normalizeLoadedConfig(
+            config,
+            get().config.defaultSegmentRules.splitOnSpeakerChange,
+          ),
+        });
       } catch (err) {
         set({
           banner: {
@@ -662,7 +704,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       set({ installingBundle: true });
       try {
         const setupStatus = await installCoreRuntime();
-        const config = await getConfig();
+        const config = normalizeLoadedConfig(
+          await getConfig(),
+          get().config.defaultSegmentRules.splitOnSpeakerChange,
+        );
         set({
           setupStatus,
           config,
@@ -690,10 +735,14 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       set({ installingBundle: true });
       try {
         const setupStatus = await installRecommendedBundle();
-        const nextConfig = await saveConfig({
-          ...get().config,
-          hasCompletedSetup: true,
-        });
+        const prevSplit = get().config.defaultSegmentRules.splitOnSpeakerChange;
+        const nextConfig = normalizeLoadedConfig(
+          await saveConfig({
+            ...get().config,
+            hasCompletedSetup: true,
+          }),
+          prevSplit,
+        );
         set({
           setupStatus,
           config: nextConfig,
@@ -720,10 +769,14 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     runImportCustomModel: async (sourcePath, kind, name) => {
       try {
         await importCustomModel(sourcePath, kind, name);
-        const [config, setupStatus] = await Promise.all([
+        const [rawConfig, setupStatus] = await Promise.all([
           getConfig(),
           getSetupStatus(),
         ]);
+        const config = normalizeLoadedConfig(
+          rawConfig,
+          get().config.defaultSegmentRules.splitOnSpeakerChange,
+        );
         set({
           config,
           setupStatus,
@@ -752,7 +805,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getConfig(),
           getSetupStatus(),
         ]);
-        set({ config, setupStatus });
+        set({
+          config: normalizeLoadedConfig(
+            config,
+            get().config.defaultSegmentRules.splitOnSpeakerChange,
+          ),
+          setupStatus,
+        });
       } catch (err) {
         set({
           banner: {
@@ -838,16 +897,28 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     },
 
     updateSegmentRules: (patch) => {
-      set((state) => ({
-        jobOptions: {
-          ...state.jobOptions,
-          segmentRules: {
-            ...state.jobOptions.segmentRules,
-            ...patch,
-            preset: patch.preset ?? "custom",
+      set((state) => {
+        const hasNumericRuleChange =
+          patch.maxCharsPerLine !== undefined ||
+          patch.maxLines !== undefined ||
+          patch.minDurationMs !== undefined ||
+          patch.maxDurationMs !== undefined ||
+          patch.maxCps !== undefined;
+        return {
+          jobOptions: {
+            ...state.jobOptions,
+            segmentRules: {
+              ...state.jobOptions.segmentRules,
+              ...patch,
+              preset:
+                patch.preset ??
+                (hasNumericRuleChange
+                  ? "custom"
+                  : state.jobOptions.segmentRules.preset),
+            },
           },
-        },
-      }));
+        };
+      });
     },
 
     applyResegmentToActiveProject: async () => {
@@ -1279,7 +1350,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           jobOptions: {
             ...DEFAULT_JOB_OPTIONS,
             ...project.options,
+            segmentRules: normalizeSegmentRules(project.options.segmentRules),
             correctSourceAsr: Boolean(project.options.correctSourceAsr),
+            translationStyle: normalizeTranslationStyle(
+              project.options.translationStyle,
+            ),
           },
           isCheckpointsOpen: false,
           activeCueId: findCueIdAtPlayheadZero(project.cues),

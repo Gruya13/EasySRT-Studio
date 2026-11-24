@@ -17,6 +17,8 @@ import {
   formatVttDocument,
   getPresetSegmentRules,
   latinToCyrillic,
+  normalizeSegmentRules,
+  normalizeTranslationStyle,
   parseBulkGlossary,
   parseSubtitleFileText,
   parseTimestampSrt,
@@ -24,7 +26,12 @@ import {
   shouldActivateSyncedProject,
   wrapBalancedLines,
 } from "../subtitleUtils.ts";
-import type { SubtitleCue } from "../../types/models.ts";
+import type {
+  JobOptions,
+  SegmentRules,
+  SubtitleCue,
+  TimedWord,
+} from "../../types/models.ts";
 
 describe("Timestamp Formatting & Parsing", () => {
   it("formats SRT and VTT timestamps across hours, minutes, seconds, and milliseconds", () => {
@@ -356,5 +363,82 @@ describe("Semantic Version Comparison", () => {
     assert.equal(compareSemver("v0.1.1", "0.1.1"), 0);
     assert.equal(compareSemver("0.1.1-beta", "v0.1.1"), 0);
     assert.equal(compareSemver("v0.1.0", "0.1.1"), -1);
+  });
+});
+
+describe("Speaker-Change Rules & Translation Style Contracts", () => {
+  it("defaults splitOnSpeakerChange to true for all presets and preserves explicit overrides", () => {
+    assert.equal(getPresetSegmentRules("standard").splitOnSpeakerChange, true);
+    assert.equal(getPresetSegmentRules("reels").splitOnSpeakerChange, true);
+    assert.equal(getPresetSegmentRules("custom").splitOnSpeakerChange, true);
+
+    const legacyRules: SegmentRules = {
+      preset: "reels",
+      maxCharsPerLine: 20,
+      maxLines: 1,
+      minDurationMs: 600,
+      maxDurationMs: 3500,
+      maxCps: 18,
+    };
+    assert.equal(
+      getPresetSegmentRules("standard", legacyRules).splitOnSpeakerChange,
+      true,
+    );
+    assert.equal(
+      normalizeSegmentRules(legacyRules).splitOnSpeakerChange,
+      true,
+    );
+    assert.equal(normalizeSegmentRules(legacyRules).preset, "reels");
+
+    const disabledRules: SegmentRules = {
+      ...legacyRules,
+      splitOnSpeakerChange: false,
+    };
+    assert.equal(
+      getPresetSegmentRules("standard", disabledRules).splitOnSpeakerChange,
+      false,
+    );
+    assert.equal(
+      getPresetSegmentRules("reels", disabledRules).splitOnSpeakerChange,
+      false,
+    );
+    assert.equal(
+      getPresetSegmentRules("custom", disabledRules).splitOnSpeakerChange,
+      false,
+    );
+    assert.equal(
+      normalizeSegmentRules(disabledRules).splitOnSpeakerChange,
+      false,
+    );
+  });
+
+  it("normalizes translationStyle with backward-compatible natural default", () => {
+    assert.equal(normalizeTranslationStyle(undefined), "natural");
+    assert.equal(normalizeTranslationStyle(null), "natural");
+    assert.equal(normalizeTranslationStyle(""), "natural");
+    assert.equal(normalizeTranslationStyle("natural"), "natural");
+    assert.equal(normalizeTranslationStyle("formal"), "formal");
+    assert.equal(normalizeTranslationStyle("unknown"), "natural");
+
+    const word: TimedWord = {
+      startMs: 0,
+      endMs: 300,
+      text: "Hello",
+      probability: 0.99,
+      speakerChange: true,
+    };
+    assert.equal(word.speakerChange, true);
+
+    const opts: JobOptions = {
+      sourceLanguage: "en",
+      targetLanguage: "sr",
+      script: "latin",
+      segmentRules: getPresetSegmentRules("standard"),
+      glossary: {},
+      polishSerbian: true,
+      translationStyle: "formal",
+      providerOverride: null,
+    };
+    assert.equal(normalizeTranslationStyle(opts.translationStyle), "formal");
   });
 });

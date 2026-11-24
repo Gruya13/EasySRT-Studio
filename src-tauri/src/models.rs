@@ -181,6 +181,14 @@ pub enum SerbianScript {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
+pub enum TranslationStyle {
+    #[default]
+    Natural,
+    Formal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub enum TranslationProviderKind {
     #[default]
     LocalLlama,
@@ -482,6 +490,18 @@ mod tests {
 
         assert_eq!(serde_json::to_value(SerbianScript::Latin).unwrap(), json!("latin"));
         assert_eq!(serde_json::to_value(SerbianScript::Cyrillic).unwrap(), json!("cyrillic"));
+
+        assert_eq!(TranslationStyle::default(), TranslationStyle::Natural);
+        assert_eq!(serde_json::to_value(TranslationStyle::Natural).unwrap(), json!("natural"));
+        assert_eq!(serde_json::to_value(TranslationStyle::Formal).unwrap(), json!("formal"));
+        assert_eq!(
+            serde_json::from_value::<TranslationStyle>(json!("natural")).unwrap(),
+            TranslationStyle::Natural
+        );
+        assert_eq!(
+            serde_json::from_value::<TranslationStyle>(json!("formal")).unwrap(),
+            TranslationStyle::Formal
+        );
 
         assert_eq!(serde_json::to_value(TranslationProviderKind::LocalLlama).unwrap(), json!("localLlama"));
         assert_eq!(serde_json::to_value(TranslationProviderKind::DeepSeek).unwrap(), json!("deepSeek"));
