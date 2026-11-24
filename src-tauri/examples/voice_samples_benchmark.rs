@@ -1,4 +1,4 @@
-//! End-to-end pipeline benchmark across `/home/gru/Downloads/voice_samples/*.mp3`.
+//! End-to-end pipeline benchmark across `~/Downloads/voice_samples/*.mp3`.
 //!
 //! Run with:
 //! `cargo run --release --example voice_samples_benchmark`

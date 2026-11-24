@@ -11,9 +11,10 @@ src-tauri/target/
 src-tauri/gen/
 
 # Local runtime / test data
-portable.flag
 src-tauri/resources/vcruntime/*.dll
 mockup/
+worker/.cloudflare/
+worker/.dev.vars
 *.log
 npm-debug.log*
 yarn-debug.log*

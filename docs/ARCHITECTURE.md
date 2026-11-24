@@ -47,7 +47,7 @@ flowchart TD
 | :--- | :--- |
 | `models.rs` | Canonical `camelCase` data contract shared 1:1 with `src/types/models.ts` (including `JobOptions.correct_source_asr`, diagnostics/crash payloads, and hardware telemetry). |
 | `hardware.rs` | `nvidia-smi` GPU probing (`CREATE_NO_WINDOW` on Windows), multi-GPU max-VRAM selection, Windows `nvcuda.dll` CUDA 12.4 readiness check (`driver >= 550.54`), and `VramTier` classification. |
-| `storage.rs` | Canonical Installed path resolution (`%LOCALAPPDATA%\com.easysrt.studio` / `~/.local/share/com.easysrt.studio`), atomic `config.json` and checkpoint persistence (`<job_id>.easysrt.json`), and OS Keyring + fallback `.credentials.json` with legacy `v0.1.x` compatibility. |
+| `storage.rs` | Canonical Installed path resolution (`%LOCALAPPDATA%\com.easysrt.studio` / `~/.local/share/com.easysrt.studio`), atomic `config.json` and checkpoint persistence (`<job_id>.easysrt.json`), and OS Keyring + fallback `.credentials.json` storage. |
 | `setup_manager.rs` | Curated catalog loader (`resources/catalog.json`), headless NSIS `--install-runtime` bootstrapper (FFmpeg, CUDA/CPU binaries, Silero VAD, Whisper Large V3 Turbo Q5_0, CUDA DLL reuse across `whisper/Release` and `llama`), resumable HTTP `Range` downloads, and SHA-256 verification. |
 | `diagnostics.rs` | Rolling `data/logs/app.log`, Rust panic hook, subprocess failure recording, strict secret/PII/username redaction, offline local report export, and telemetry dispatch to `https://easysrt-telemetry.ig-systems.rs`. |
 | `pipeline/ffmpeg.rs` | Spawns `ffmpeg -y -i <input> -vn -acodec pcm_s16le -ar 16000 -ac 1 <temp.16k.wav>` with cancellation polling and WAV header duration calculation. |
@@ -209,7 +209,7 @@ When converting **Latin → Cyrillic** (`to_cyrillic`), greedily merging every `
 
 ## 6. Installed Storage Layout, Credential Security & Telemetry
 
-`src-tauri/src/storage.rs` resolves paths canonically via Tauri's `app_local_data_dir()` (`Installed` mode, since portable packaging was retired in `v0.2.0`):
+`src-tauri/src/storage.rs` resolves paths canonically via Tauri's `app_local_data_dir()` (`Installed` mode):
 
 | Component | Path & Behavior |
 | :--- | :--- |
@@ -218,7 +218,7 @@ When converting **Latin → Cyrillic** (`to_cyrillic`), greedily merging every `
 | **Models (`models_dir`)** | `<root_dir>/models/{vad,whisper,llm}` (or custom `models_dir_override` in `config.json`) |
 | **Checkpoints & Logs (`data_dir`)** | `<root_dir>/data/checkpoints/<job_id>.easysrt.json`, `<root_dir>/data/logs/app.log`, `<root_dir>/data/reports/` |
 | **Config (`config_path`)** | `<root_dir>/config.json` |
-| **API Key Storage** | Native OS Keyring (`keyring` crate v3: Windows Credential Manager / Linux Keyutils / macOS Keychain) with read-after-write verification and `0600` masked `.credentials.json` (`obf1:<hex>`) fallback supporting both current and legacy `v0.1.x` masks |
+| **API Key Storage** | Native OS Keyring (`keyring` crate v3: Windows Credential Manager / Linux Keyutils / macOS Keychain) with read-after-write verification and `0600` masked `.credentials.json` (`obf1:<hex>`) fallback |
 | **Bug & Crash Telemetry** | `src-tauri/src/diagnostics.rs` sanitizes usernames, local paths, API keys, and bearer tokens (never including subtitle text) before dispatching to Cloudflare Worker `https://easysrt-telemetry.ig-systems.rs` or saving locally when offline |
 
 ---
@@ -239,7 +239,7 @@ EasySRT Studio integrates `tauri-plugin-updater` configured in `src-tauri/tauri.
    - `TAURI_SIGNING_PRIVATE_KEY`: Contents of `~/.tauri/easysrt-studio.key`
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: Password used when generating the keypair
 4. **Automated Verification & Publishing (`.github/workflows/release.yml`)**:
-   - Triggered on `v*` tags (e.g., `git tag -a v0.3.1 -m "Release v0.3.1" && git push origin v0.3.1`).
+   - Triggered on `v*` tags (e.g., `git tag -a v0.3.2 -m "Release v0.3.2" && git push origin v0.3.2`).
    - Runs `npm run typecheck`, `npm test` (frontend unit test suite), and `cargo test --manifest-path src-tauri/Cargo.toml` (Rust backend unit + E2E test suite) **before** building bundles.
    - Stages MSVC x64 runtime DLLs (`vcruntime140.dll`, `msvcp140.dll`, `vcomp140.dll`, etc.) on Windows and builds `whisper.cpp` `b5907` with `-DGGML_VULKAN=ON` using LunarG Vulkan SDK on Ubuntu `22.04`.
    - Publishes signed Windows NSIS installer (`EasySRT Studio_<ver>_x64-setup.exe`), Linux AppImage, `latest.json` (`releaseDraft: false`, `includeUpdaterJson: true`), and `whisper-bin-ubuntu-vulkan-x64.tar.gz` directly to the GitHub Release.

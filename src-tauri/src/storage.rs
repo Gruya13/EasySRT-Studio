@@ -879,7 +879,7 @@ mod tests {
         let current_obf = obfuscate_secret(secret);
         assert_eq!(deobfuscate_secret(&current_obf), secret);
 
-        // Encrypt with legacy v0.1.x key and verify deobfuscate_secret recovers it cleanly
+        // Encrypt with alternate legacy credential mask and verify deobfuscate_secret recovers it cleanly
         let legacy_masked: Vec<u8> = secret
             .as_bytes()
             .iter()

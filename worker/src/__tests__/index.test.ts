@@ -135,7 +135,7 @@ describe("Server-side Sanitization", () => {
       "Config: api_key=mySuperSecretValue123",
       "Win backslash: C:\\Users\\Marko\\AppData\\Local\\com.easysrt.studio\\logs\\app.log",
       "Win slash: D:/Users/Ana/Videos/sample.mp4",
-      "Linux home: /home/gru/Projects/EasySRT Studio/file.srt",
+      "Linux home: /home/alice/Projects/EasySRT Studio/file.srt",
     ].join("\n");
 
     const clean = sanitizeText(input);
@@ -147,7 +147,7 @@ describe("Server-side Sanitization", () => {
     assert.ok(!clean.includes("mySuperSecretValue123"));
     assert.ok(!clean.includes("Marko"));
     assert.ok(!clean.includes("Ana"));
-    assert.ok(!clean.includes("/home/gru/"));
+    assert.ok(!clean.includes("/home/alice/"));
 
     assert.ok(clean.includes("[REDACTED_API_KEY]"));
     assert.ok(clean.includes("[REDACTED_GH_TOKEN]"));

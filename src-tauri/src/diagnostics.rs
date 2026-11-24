@@ -1309,7 +1309,7 @@ mod tests {
             "Win1: C:\\Users\\Milica\\AppData\\Local\\com.easysrt.studio\\logs\\app.log\n",
             "Win2: C:/Users/Marko/Videos/clip.mp4\n",
             "WinJson: \"C:\\\\Users\\\\Nikola\\\\Desktop\\\\test.srt\"\n",
-            "Linux: /home/gru/Projects/EasySRT Studio/audio.wav\n",
+            "Linux: /home/alice/Projects/EasySRT Studio/audio.wav\n",
         );
 
         let sanitized = sanitize_diagnostic_text(raw);
@@ -1325,7 +1325,7 @@ mod tests {
         assert!(!sanitized.contains("Milica"));
         assert!(!sanitized.contains("Marko"));
         assert!(!sanitized.contains("Nikola"));
-        assert!(!sanitized.contains("/home/gru/"));
+        assert!(!sanitized.contains("/home/alice/"));
 
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
         assert!(sanitized.contains("[REDACTED_TOKEN]"));
@@ -1393,7 +1393,7 @@ mod tests {
         fs::create_dir_all(&logs_dir).unwrap();
         fs::write(
             logs_dir.join("app.log"),
-            "INFO started by /home/gru/bin/app with token sk-supersecret123456\n",
+            "INFO started by /home/alice/bin/app with token sk-supersecret123456\n",
         )
         .unwrap();
         fs::write(
