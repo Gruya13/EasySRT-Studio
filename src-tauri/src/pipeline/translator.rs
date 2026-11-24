@@ -283,21 +283,77 @@ fn build_response_format(
     }
 }
 
-fn build_system_prompt(
+fn is_serbian_lang(lang: &str) -> bool {
+    lang.trim().eq_ignore_ascii_case("sr")
+}
+
+fn build_serbian_style_guidelines(formal_style: bool) -> String {
+    let register_rule = if formal_style {
+        "REGISTER & STYLE (Formal broadcast/documentary Serbian — standardni književni stil): \
+         Use polished, clear formal Serbian and consistent formal 'Vi' address across \
+         `context_before`, `translate_cues`, and `context_after`. Avoid slang while staying \
+         genuinely idiomatic Serbian (u duhu srpskog jezika) without stiff English calques."
+    } else {
+        "REGISTER & STYLE (Natural contemporary spoken Serbian — prirodan govorni srpski): \
+         Write fluid, conversational Serbian matching the speaker's tone. Maintain consistent \
+         formal ('Vi') vs informal ('ti') address across `context_before`, `translate_cues`, \
+         and `context_after`."
+    };
+
+    format!(
+        "SERBIAN LINGUISTIC & STYLISTIC RULES (u duhu srpskog jezika):\n\
+         - STRICT EKAVIAN SERBIAN: Always use standard Serbian Ekavian vocabulary \
+         ('mleko', 'devojka', 'vreme', 'gde', 'lepo', 'hiljada', 'muzika', 'nedelja', 'uslov', 'voz', 'hleb') — \
+         NEVER Ijekavian or Croatian lexical forms ('mlijeko', 'vrijeme', 'tko', 'krajolik', \
+         'tisuća', 'glazba', 'tjedan', 'uvjet', 'vlak', 'kruh'). Use accurate Serbian grammar and cases; \
+         never invent non-existent words.\n\
+         - MEANING OVER SYNTAX: Translate and express meaning rather than mirroring English sentence syntax — \
+         rewrite word order so dialogue sounds naturally spoken in contemporary Serbian without English calques.\n\
+         - ACTIVE & REFLEXIVE VOICE: Prefer active or reflexive ('se') constructions over unnatural \
+         English-style 'od strane' passives (e.g., 'it was decided by the team' -> 'tim je odlučio' / 'odlučeno je', \
+         not 'bilo je odlučeno od strane tima').\n\
+         - NO REDUNDANT POSSESSIVES: Eliminate unnecessary English possessives ('moj', 'tvoj', 'njegov', 'njen') \
+         where Serbian omits them (body parts, family, personal items, e.g., 'stavio je ruke u džepove'), \
+         and use reflexive 'svoj' when referring back to the clause subject.\n\
+         - STRICT ENCLITIC PLACEMENT: Place Serbian enclitics ('je', 'sam', 'si', 'smo', 'ste', 'su', \
+         'bih', 'bi', 'se', 'mi', 'ti', 'mu', 'joj', 'ga', 'ih') naturally in the second syntactic slot of the clause — \
+         never leave them stranded at clause boundaries across cue breaks.\n\
+         - NATURAL IDIOMS & DISCOURSE MARKERS: Map conversational expressions into authentic Serbian \
+         instead of literal word-for-word translations ('you know' -> 'znaš' / 'znate', \
+         'kind of' -> 'nekako' / 'na neki način', 'at the end of the day' -> 'na kraju krajeva', \
+         'it makes sense' -> 'ima smisla').\n\
+         - {register_rule}"
+    )
+}
+
+/// Builds the LLM system prompt for a batch operation, allowing callers to choose
+/// between natural spoken Serbian (`formal_style = false`, default) and formal
+/// broadcast/documentary Serbian (`formal_style = true`).
+pub fn build_system_prompt_with_style(
     operation: BatchOperation,
     source_language: &str,
     target_language: &str,
     glossary: &BTreeMap<String, String>,
     correct_source_asr: bool,
+    formal_style: bool,
 ) -> String {
+    let target_is_sr = is_serbian_lang(target_language);
+    let condense_is_sr = target_is_sr
+        || ((target_language.trim().is_empty()
+            || target_language.trim().eq_ignore_ascii_case("none"))
+            && is_serbian_lang(source_language));
+
     let mut prompt = match operation {
         BatchOperation::Translate => {
-            let target_instructions = if target_language.eq_ignore_ascii_case("sr") {
-                "Translate into natural, idiomatic Serbian (strict Ekavian standard: 'mleko', 'devojka', 'vreme', 'gde', 'lepo' — never Ijekavian/Croatian forms like 'mlijeko', 'vrijeme', 'tko', 'krajolik'). If any cue is already in Serbian (e.g., a Serbian host intro before a foreign-language interview), keep it in Serbian and polish any minor ASR errors into natural Ekavian Serbian. Use accurate Serbian grammar and cases, never invent non-existent words, and keep subtitle phrasing concise for comfortable reading speed."
+            let target_instructions = if target_is_sr {
+                "Translate into natural, idiomatic Serbian (u duhu srpskog jezika, strict Ekavian standard). \
+                 If any cue is already in Serbian (e.g., a Serbian host intro before a foreign-language interview), \
+                 keep it in Serbian and polish any minor ASR errors into natural Ekavian Serbian. \
+                 Keep subtitle phrasing concise for comfortable reading speed."
             } else {
                 "Translate accurately, idiomatically, and concisely into the target language for subtitles."
             };
-            if correct_source_asr {
+            let mut base = if correct_source_asr {
                 format!(
                     "You are an expert subtitle translator from '{}' to '{}' and ASR transcript proofreader. {}\n\
                      STRICT RULES:\n\
@@ -318,25 +374,38 @@ fn build_system_prompt(
                      4. Output ONLY a valid JSON object mapping each cue ID string to its translated text: `{{\"1\": \"...\", \"2\": \"...\"}}` with no markdown fences and no commentary.",
                     source_language, target_language, target_instructions
                 )
+            };
+            if target_is_sr {
+                base.push_str("\n\n");
+                base.push_str(&build_serbian_style_guidelines(formal_style));
             }
+            base
         }
         BatchOperation::PolishSerbian => {
-            "You are an expert Serbian subtitle editor and proofreader.\n\
-             STRICT RULES:\n\
-             1. Reconstruct full sentences mentally across `context_before`, `translate_cues`, and `context_after`, and polish ONLY the items in `translate_cues`.\n\
-             2. Fix speech-to-text recognition errors, punctuation, capitalization, and normalize any Ijekavian/Croatian forms into natural Serbian Ekavian standard without changing the speaker's meaning or inventing words, staying within each item's `max_chars` budget when feasible.\n\
-             3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
-             4. Output ONLY a valid JSON object mapping each cue ID string to its polished text: `{\"1\": \"...\", \"2\": \"...\"}` with no markdown fences and no commentary."
-                .to_string()
+            format!(
+                "You are an expert Serbian subtitle editor and proofreader.\n\
+                 STRICT RULES:\n\
+                 1. Reconstruct full sentences mentally across `context_before`, `translate_cues`, and `context_after`, and polish ONLY the items in `translate_cues`.\n\
+                 2. Fix speech-to-text recognition errors, punctuation, capitalization, and normalize any Ijekavian/Croatian forms into natural Serbian Ekavian standard without changing the speaker's meaning or inventing words, staying within each item's `max_chars` budget when feasible.\n\
+                 3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+                 4. Output ONLY a valid JSON object mapping each cue ID string to its polished text: `{{\"1\": \"...\", \"2\": \"...\"}}` with no markdown fences and no commentary.\n\n\
+                 {}",
+                build_serbian_style_guidelines(formal_style)
+            )
         }
         BatchOperation::CondenseCps => {
-            "You are an expert subtitle editor specializing in tightening verbose subtitles to comfortable reading speed (CPS).\n\
-             STRICT RULES:\n\
-             1. Rewrite ONLY the cues in `translate_cues` using `context_before` and `context_after` for continuity so every rewritten cue fits cleanly within its `max_chars` budget (shorten by ~15-30% when needed).\n\
-             2. Preserve the core meaning, tone, speaker intent, and target language (when Serbian, strictly use natural Ekavian standard — never Ijekavian/Croatian forms) by cutting filler words and tightening phrasing without inventing facts.\n\
-             3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
-             4. Output ONLY a valid JSON object mapping each cue ID string to its condensed text: `{\"1\": \"...\", \"2\": \"...\"}` with no markdown fences and no commentary."
-                .to_string()
+            let mut base = "You are an expert subtitle editor specializing in tightening verbose subtitles to comfortable reading speed (CPS).\n\
+                 STRICT RULES:\n\
+                 1. Rewrite ONLY the cues in `translate_cues` using `context_before` and `context_after` for continuity so every rewritten cue fits cleanly within its `max_chars` budget (shorten by ~15-30% when needed).\n\
+                 2. Preserve the core meaning, tone, speaker intent, and target language by cutting filler words and tightening phrasing without inventing facts.\n\
+                 3. NEVER merge, split, add, or drop cues. Return the EXACT same `id` keys as in `translate_cues`.\n\
+                 4. Output ONLY a valid JSON object mapping each cue ID string to its condensed text: `{\"1\": \"...\", \"2\": \"...\"}` with no markdown fences and no commentary."
+                .to_string();
+            if condense_is_sr {
+                base.push_str("\n\n");
+                base.push_str(&build_serbian_style_guidelines(formal_style));
+            }
+            base
         }
     };
 
@@ -350,6 +419,23 @@ fn build_system_prompt(
     }
 
     prompt
+}
+
+fn build_system_prompt(
+    operation: BatchOperation,
+    source_language: &str,
+    target_language: &str,
+    glossary: &BTreeMap<String, String>,
+    correct_source_asr: bool,
+) -> String {
+    build_system_prompt_with_style(
+        operation,
+        source_language,
+        target_language,
+        glossary,
+        correct_source_asr,
+        false,
+    )
 }
 
 fn cue_visible_text(cue: &SubtitleCue) -> &str {
@@ -616,9 +702,24 @@ where
     let batch_size = endpoint.batch_size.clamp(1, 50) as usize;
     let total_batches = project.cues.len().div_ceil(batch_size);
 
+    let effective_source_lang = if project
+        .options
+        .source_language
+        .trim()
+        .eq_ignore_ascii_case("auto")
+    {
+        project
+            .detected_language
+            .as_deref()
+            .filter(|s| !s.trim().is_empty() && !s.trim().eq_ignore_ascii_case("auto"))
+            .unwrap_or(&project.options.source_language)
+    } else {
+        &project.options.source_language
+    };
+
     let system_prompt = build_system_prompt(
         operation,
-        &project.options.source_language,
+        effective_source_lang,
         &project.options.target_language,
         &project.options.glossary,
         project.options.correct_source_asr,
@@ -630,14 +731,16 @@ where
         .context("Failed to initialize translation HTTP client")?;
 
     let is_serbian_target = operation == BatchOperation::PolishSerbian
-        || project.options.target_language.eq_ignore_ascii_case("sr")
+        || is_serbian_lang(&project.options.target_language)
         || (operation == BatchOperation::CondenseCps
-            && project.options.target_language == "none"
-            && (project
-                .detected_language
-                .as_deref()
-                .is_some_and(|l| l.eq_ignore_ascii_case("sr"))
-                || project.options.source_language.eq_ignore_ascii_case("sr")));
+            && (project.options.target_language.trim().is_empty()
+                || project
+                    .options
+                    .target_language
+                    .trim()
+                    .eq_ignore_ascii_case("none"))
+            && (project.detected_language.as_deref().is_some_and(is_serbian_lang)
+                || is_serbian_lang(&project.options.source_language)));
     let rules = segmenter::normalize_rules(&project.options.segment_rules);
 
     for batch_idx in 0..total_batches {
@@ -1464,5 +1567,166 @@ mod tests {
         assert_eq!(project.cues[0].translated_text.lines().count(), 2);
         assert_eq!(project.cues[1].source_text, "Welcome to Belgrade!");
         assert_eq!(project.cues[1].translated_text, "Dobrodošli u Beograd!");
+    }
+
+    fn assert_has_serbian_stylistic_rules(prompt: &str, formal_style: bool) {
+        assert!(
+            prompt.contains("u duhu srpskog jezika"),
+            "missing idiomatic Serbian header in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("MEANING OVER SYNTAX") && prompt.contains("calques"),
+            "missing anti-calque rule in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("od strane") && prompt.contains("tim je odlučio"),
+            "missing active/reflexive voice rule in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("moj") && prompt.contains("svoj"),
+            "missing redundant possessive / reflexive svoj rule in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("STRICT ENCLITIC PLACEMENT")
+                && prompt.contains("'je'")
+                && prompt.contains("'sam'")
+                && prompt.contains("'bih'")
+                && prompt.contains("'se'")
+                && prompt.contains("second syntactic slot"),
+            "missing enclitic placement rule in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("na kraju krajeva")
+                && prompt.contains("ima smisla")
+                && prompt.contains("znaš")
+                && prompt.contains("nekako"),
+            "missing natural idioms/discourse markers rule in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("context_before")
+                && prompt.contains("translate_cues")
+                && prompt.contains("context_after")
+                && prompt.contains("'Vi'"),
+            "missing register consistency rule in prompt:\n{prompt}"
+        );
+        assert!(
+            prompt.contains("NEVER merge, split, add, or drop cues")
+                && prompt.contains("valid JSON object"),
+            "missing strict JSON / cue ID preservation rules in prompt:\n{prompt}"
+        );
+
+        if formal_style {
+            assert!(
+                prompt.contains("Formal broadcast/documentary Serbian")
+                    && prompt.contains("standardni književni stil"),
+                "expected formal register guidance in prompt:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("prirodan govorni srpski"),
+                "formal prompt should not include natural spoken style label:\n{prompt}"
+            );
+        } else {
+            assert!(
+                prompt.contains("Natural contemporary spoken Serbian")
+                    && prompt.contains("prirodan govorni srpski")
+                    && prompt.contains("'ti'"),
+                "expected natural spoken register guidance in prompt:\n{prompt}"
+            );
+            assert!(
+                !prompt.contains("standardni književni stil"),
+                "natural prompt should not include formal documentary style label:\n{prompt}"
+            );
+        }
+    }
+
+    #[test]
+    fn serbian_prompts_include_idiomatic_rules_for_natural_and_formal_styles() {
+        let mut glossary = BTreeMap::new();
+        glossary.insert("EasySRT".to_string(), "EasySRT".to_string());
+
+        let serbian_cases = [
+            (BatchOperation::Translate, "en", "sr", false),
+            (BatchOperation::Translate, "en", "sr", true),
+            (BatchOperation::PolishSerbian, "sr", "sr", false),
+            (BatchOperation::CondenseCps, "en", "sr", false),
+            (BatchOperation::CondenseCps, "sr", "none", false),
+        ];
+
+        for (op, src, dst, correct_asr) in serbian_cases {
+            let default_prompt = build_system_prompt(op, src, dst, &glossary, correct_asr);
+            let natural_prompt =
+                build_system_prompt_with_style(op, src, dst, &glossary, correct_asr, false);
+            let formal_prompt =
+                build_system_prompt_with_style(op, src, dst, &glossary, correct_asr, true);
+
+            assert_eq!(
+                default_prompt, natural_prompt,
+                "build_system_prompt must default to formal_style = false"
+            );
+
+            assert_has_serbian_stylistic_rules(&natural_prompt, false);
+            assert_has_serbian_stylistic_rules(&formal_prompt, true);
+
+            // Verify glossary terms are preserved in both styles
+            assert!(natural_prompt.contains("MANDATORY GLOSSARY TERMS:"));
+            assert!(natural_prompt.contains("- EasySRT => EasySRT"));
+            assert!(formal_prompt.contains("MANDATORY GLOSSARY TERMS:"));
+            assert!(formal_prompt.contains("- EasySRT => EasySRT"));
+
+            if op == BatchOperation::Translate && correct_asr {
+                assert!(natural_prompt.contains("\"source\""));
+                assert!(natural_prompt.contains("Aesop"));
+                assert!(formal_prompt.contains("\"source\""));
+                assert!(formal_prompt.contains("Aesop"));
+            }
+        }
+    }
+
+    #[test]
+    fn non_serbian_prompts_do_not_inject_serbian_stylistic_rules() {
+        let mut glossary = BTreeMap::new();
+        glossary.insert("Belgrade".to_string(), "Belgrade".to_string());
+
+        let non_serbian_cases = [
+            (BatchOperation::Translate, "sr", "en", false),
+            (BatchOperation::Translate, "en", "de", false),
+            (BatchOperation::Translate, "en", "de", true),
+            (BatchOperation::CondenseCps, "en", "en", false),
+            (BatchOperation::CondenseCps, "en", "de", false),
+            (BatchOperation::CondenseCps, "en", "none", false),
+        ];
+
+        let forbidden_serbian_markers = [
+            "u duhu srpskog jezika",
+            "Ekavian",
+            "od strane",
+            "STRICT ENCLITIC PLACEMENT",
+            "na kraju krajeva",
+            "prirodan govorni srpski",
+            "standardni književni stil",
+            "svoj",
+        ];
+
+        for (op, src, dst, correct_asr) in non_serbian_cases {
+            for formal_style in [false, true] {
+                let prompt = build_system_prompt_with_style(
+                    op,
+                    src,
+                    dst,
+                    &glossary,
+                    correct_asr,
+                    formal_style,
+                );
+                for marker in forbidden_serbian_markers {
+                    assert!(
+                        !prompt.contains(marker),
+                        "non-Serbian prompt ({op:?}, {src}->{dst}, formal={formal_style}) unexpectedly contained `{marker}`:\n{prompt}"
+                    );
+                }
+                assert!(prompt.contains("valid JSON object"));
+                assert!(prompt.contains("NEVER merge, split, add, or drop cues"));
+                assert!(prompt.contains("- Belgrade => Belgrade"));
+            }
+        }
     }
 }
