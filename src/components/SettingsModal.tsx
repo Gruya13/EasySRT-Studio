@@ -423,7 +423,7 @@ export function SettingsModal() {
                       value={lang}
                       onChange={(e) => {
                         const nextLang =
-                          e.target.value === "en" ? "en" : "sr";
+                          e.target.value === "sr" ? "sr" : "en";
                         setDraftConfig({
                           ...draftConfig,
                           uiLanguage: nextLang,
@@ -432,8 +432,8 @@ export function SettingsModal() {
                       }}
                       className="w-full rounded-xl border border-slate-800 bg-slate-900 px-3 py-2 text-xs text-slate-100"
                     >
-                      <option value="sr">Srpski (Latinica)</option>
                       <option value="en">English</option>
+                      <option value="sr">Srpski (Latinica)</option>
                     </select>
                   </div>
                 </div>

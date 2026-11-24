@@ -817,12 +817,12 @@ where
         existing_len,
         item.size_bytes,
         "downloading",
-        format!("Preuzimanje {}...", item.name),
+        format!("Downloading {}...", item.name),
     ));
 
     if item.size_bytes == 0 || existing_len < item.size_bytes {
         let client = reqwest::Client::builder()
-            .user_agent("EasySRT-Studio/0.3.1")
+            .user_agent("EasySRT-Studio/0.3.2")
             .connect_timeout(Duration::from_secs(30))
             .build()
             .context("Failed to initialize HTTP download client")?;
@@ -901,7 +901,7 @@ where
                     downloaded_bytes,
                     total_bytes,
                     "downloading",
-                    format!("Preuzimanje {}...", item.name),
+                    format!("Downloading {}...", item.name),
                 ));
                 last_emit = Instant::now();
             }
@@ -917,7 +917,7 @@ where
                 item.size_bytes,
                 item.size_bytes,
                 "verifying",
-                format!("Provera SHA-256 potpisa za {}...", item.name),
+                format!("Verifying SHA-256 checksum for {}...", item.name),
             ));
             if let Err(err) = verify_file_sha256(&part_path, expected_sha) {
                 let _ = fs::remove_file(&part_path);
@@ -932,7 +932,7 @@ where
         item.size_bytes,
         item.size_bytes,
         "extracting",
-        format!("Instalacija {}...", item.name),
+        format!("Installing {}...", item.name),
     ));
 
     if is_binary_kind(item.kind) {
@@ -1009,7 +1009,7 @@ where
         item.size_bytes,
         item.size_bytes,
         "completed",
-        format!("{} je uspešno instaliran.", item.name),
+        format!("{} installed successfully.", item.name),
     ));
 
     Ok(status)

@@ -1,9 +1,9 @@
 [package]
 name = "easysrt-studio"
-version = "0.3.1"
+version = "0.3.2"
 description = "Offline-first transcription, segmentation, and Serbian subtitle translation studio"
 authors = ["IG-Systems"]
-license = "MIT"
+license = "Apache-2.0"
 edition = "2021"
 
 [lib]

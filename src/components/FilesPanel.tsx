@@ -368,7 +368,9 @@ export function FilesPanel() {
   return (
     <section
       id="files-panel"
-      aria-label="Lista ubačenih fajlova"
+      aria-label={
+        lang === "sr" ? "Lista ubačenih fajlova" : "Inserted files list"
+      }
       className={isDragging ? "dragover" : undefined}
       onDragOver={(e) => {
         e.preventDefault();

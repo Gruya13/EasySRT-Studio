@@ -120,7 +120,7 @@ function decodeBase64ToBytes(base64: string): Uint8Array {
 /** Extracts 99th-percentile normalized acoustic amplitude buckets from an AudioBuffer. */
 function extractAudioPeaks(
   buffer: AudioBuffer,
-  bucketCount = 4800,
+  bucketCount = 6400,
 ): Float32Array {
   const totalSamples = buffer.length;
   if (totalSamples === 0 || bucketCount <= 0 || buffer.numberOfChannels === 0) {
@@ -419,7 +419,7 @@ export function WaveformTimeline() {
         if (decoded.duration > 0) {
           setLiveAudioDurationMs(Math.round(decoded.duration * 1000));
         }
-        audioPeaksRef.current = extractAudioPeaks(decoded, 4800);
+        audioPeaksRef.current = extractAudioPeaks(decoded, 6400);
         setWaveformVersion((v) => v + 1);
         return decoded;
       } catch {
@@ -703,7 +703,7 @@ export function WaveformTimeline() {
             setLiveAudioDurationMs(Math.round(buffer.duration * 1000));
           }
           if (!audioPeaksRef.current) {
-            audioPeaksRef.current = extractAudioPeaks(buffer, 4800);
+            audioPeaksRef.current = extractAudioPeaks(buffer, 6400);
             setWaveformVersion((v) => v + 1);
           }
         }
@@ -845,7 +845,7 @@ export function WaveformTimeline() {
     return () => window.removeEventListener("resize", updateSize);
   }, []);
 
-  // Mouse-wheel zoom (scroll up = zoom in, scroll down = zoom out, up to 1000%, cursor-anchored; Shift+wheel = horizontal pan)
+  // Mouse-wheel zoom (scroll up = zoom in, scroll down = zoom out, up to 2000%, cursor-anchored; Shift+wheel = horizontal pan)
   useEffect(() => {
     const vp = viewportRef.current;
     if (!vp) return;

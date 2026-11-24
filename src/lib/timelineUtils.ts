@@ -1,5 +1,5 @@
 export const MIN_TIMELINE_ZOOM_PCT = 100;
-export const MAX_TIMELINE_ZOOM_PCT = 1000;
+export const MAX_TIMELINE_ZOOM_PCT = 2000;
 export const MAX_CANVAS_BACKING_WIDTH = 16384;
 
 /** Compute next timeline zoom percentage from a mouse wheel `deltaY` scroll direction. */
@@ -31,16 +31,17 @@ export function computeButtonZoomPct(
     Math.max(MIN_TIMELINE_ZOOM_PCT, currentZoomPct),
   );
   if (direction === "in") {
-    const step = clampedCurrent >= 400 ? 50 : 25;
+    const step =
+      clampedCurrent >= 1000 ? 100 : clampedCurrent >= 400 ? 50 : 25;
     return Math.min(MAX_TIMELINE_ZOOM_PCT, clampedCurrent + step);
   }
-  const step = clampedCurrent > 400 ? 50 : 25;
+  const step = clampedCurrent > 1000 ? 100 : clampedCurrent > 400 ? 50 : 25;
   return Math.max(MIN_TIMELINE_ZOOM_PCT, clampedCurrent - step);
 }
 
 /**
  * Clamp HTML5 `<canvas>` backing store dimensions to the browser/WebView limit (`16384px`)
- * and compute exact scale factors so HiDPI waveforms stay sharp without blanking at 1000% zoom.
+ * and compute exact scale factors so HiDPI waveforms stay sharp without blanking at 2000% zoom.
  */
 export function computeSafeCanvasSize(
   cssWidth: number,

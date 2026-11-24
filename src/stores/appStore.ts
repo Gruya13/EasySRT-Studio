@@ -109,7 +109,7 @@ const MAX_UNDO_HISTORY = 50;
 const DEFAULT_SEGMENT_RULES: SegmentRules = getPresetSegmentRules("standard");
 
 const DEFAULT_CONFIG: AppConfig = {
-  uiLanguage: "sr",
+  uiLanguage: "en",
   modelsDirOverride: null,
   activeWhisperModelId: "whisper-large-v3-turbo-q5_0",
   activeLlmModelId: "llm-gemma4-e4b-qat",
@@ -424,7 +424,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     isUpdaterOpen: false,
     isCheckpointsOpen: false,
     isBugReportOpen: false,
-    appVersion: "0.3.1",
+    appVersion: "0.3.2",
     availableUpdateVersion: null,
     onlineConfirm: {
       open: false,
@@ -490,8 +490,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           getApiKeyStatus(),
           listCheckpoints(),
           isTauriRuntime()
-            ? getVersion().catch(() => "0.3.1")
-            : Promise.resolve("0.3.1"),
+            ? getVersion().catch(() => "0.3.2")
+            : Promise.resolve("0.3.2"),
         ]);
 
         const config: AppConfig = {

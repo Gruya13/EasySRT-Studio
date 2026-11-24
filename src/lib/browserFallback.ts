@@ -248,7 +248,7 @@ let mockInstalledIds = new Set<string>([
 ]);
 
 let mockConfig: AppConfig = {
-  uiLanguage: "sr",
+  uiLanguage: "en",
   modelsDirOverride: null,
   activeWhisperModelId: "whisper-large-v3-turbo-q5_0",
   activeLlmModelId: "llm-gemma4-e4b-qat",
@@ -1063,13 +1063,13 @@ export const browserFallback = {
   async collectDiagnosticsPreview(): Promise<DiagnosticsPreview> {
     const installedComponents = Array.from(mockInstalledIds);
     return {
-      appVersion: "0.3.1",
+      appVersion: "0.3.2",
       platform: "windows-x64",
       osInfo: "Windows 11 x86_64 (Browser Preview Mode)",
       gpuSummary: "NVIDIA GeForce RTX 3060 (8192 MB VRAM, Driver 560.94, CUDA supported)",
       installedComponents,
       logExcerpt:
-        "[INFO] EasySRT Studio v0.3.1 initialized\n[INFO] Browser preview fallback active — diagnostics sanitized (<user> masked, no API keys or subtitle text).",
+        "[INFO] EasySRT Studio v0.3.2 initialized\n[INFO] Browser preview fallback active — diagnostics sanitized (<user> masked, no API keys or subtitle text).",
       telemetryEndpoint: null,
     };
   },
@@ -1112,7 +1112,7 @@ export const browserFallback = {
 
   async saveDiagnosticsLocal(): Promise<string> {
     await new Promise((r) => setTimeout(r, 120));
-    return "C:/Users/<user>/AppData/Local/com.easysrt.studio/reports/diagnostics-0.3.1.txt";
+    return "C:/Users/<user>/AppData/Local/com.easysrt.studio/reports/diagnostics-0.3.2.txt";
   },
 
   async onDownloadProgress(

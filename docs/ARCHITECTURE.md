@@ -59,7 +59,7 @@ flowchart TD
 | `pipeline/sr_script.rs` | Deterministic Ijekavian→Ekavian lexical/stem normalizer (`normalize_ekavian`) and Serbian Cyrillic ↔ Latin converter with smart digraph casing (`Љ`/`Њ`/`Џ`) and morphological prefix-boundary exception handling. |
 | `pipeline/importer.rs` | Parses `.srt` and `.vtt` files (UTF-8 BOM, CRLF/LF, comma/dot timestamps, WebVTT headers and cue settings) into `SubtitleProject` instances. |
 | `pipeline/exporter.rs` | Formats `.srt`, `.vtt`, and `.txt` outputs with optional UTF-8 BOM (`\u{FEFF}`) and dual source + translated `.srt` export (`includeSourceSrt`). |
-| `src/components/` | Borderless 3-row workspace: `TopBar` (custom drag-region & `core:window:allow-*` window buttons), `FilesPanel` (queue & drag-drop), `SettingsPanel` (6-tab settings + mode pill), `DualEditorBand` (`Original transcript` & `Prevod` cards), and `WaveformTimeline` (3-track `MP3` HiDPI canvas waveform + `Original` & `Prevod` cue tracks with trim handles & `100%–1000%` cursor-anchored scroll-wheel zoom), plus `SetupWizard`, `ExportModal`, `OnlineConfirmModal`, `UpdaterModal`, `BugReportModal`, `ErrorBoundary`, and footer bug/suggestion trigger. |
+| `src/components/` | Borderless 3-row workspace: `TopBar` (custom drag-region & `core:window:allow-*` window buttons), `FilesPanel` (queue & drag-drop), `SettingsPanel` (6-tab settings + mode pill), `DualEditorBand` (`Original transcript` & `Prevod` cards), and `WaveformTimeline` (3-track `MP3` HiDPI canvas waveform + `Original` & `Prevod` cue tracks with trim handles & `100%–2000%` cursor-anchored scroll-wheel zoom), plus `SetupWizard`, `ExportModal`, `OnlineConfirmModal`, `UpdaterModal`, `BugReportModal`, `ErrorBoundary`, and footer bug/suggestion trigger. |
 
 ---
 

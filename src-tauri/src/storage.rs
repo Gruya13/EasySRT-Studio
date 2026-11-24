@@ -107,12 +107,9 @@ pub fn resolve_storage_paths(
     resolve_storage_paths_from_root(&installed_root, StorageMode::Installed, models_dir_override)
 }
 
-/// Default `AppConfig` with Serbian Latin (`"sr"`) as the default UI language.
+/// Default `AppConfig` with English (`"en"`) as the default UI language.
 pub fn default_app_config() -> AppConfig {
-    AppConfig {
-        ui_language: "sr".to_string(),
-        ..AppConfig::default()
-    }
+    AppConfig::default()
 }
 
 /// Atomic file write helper: writes to a temporary file in the same directory and renames it.
@@ -170,7 +167,7 @@ pub fn load_config_from_path(config_path: &Path) -> Result<AppConfig> {
         .with_context(|| format!("Failed to parse config JSON: {}", config_path.display()))?;
 
     if cfg.ui_language.trim().is_empty() {
-        cfg.ui_language = "sr".to_string();
+        cfg.ui_language = "en".to_string();
     }
 
     // Normalize and verify models_dir_override if set
@@ -197,7 +194,7 @@ pub fn load_config_from_path(config_path: &Path) -> Result<AppConfig> {
 pub fn save_config_to_path(config_path: &Path, config: &AppConfig) -> Result<AppConfig> {
     let mut normalized = config.clone();
     if normalized.ui_language.trim().is_empty() {
-        normalized.ui_language = "sr".to_string();
+        normalized.ui_language = "en".to_string();
     }
     if let Some(ref raw_override) = normalized.models_dir_override {
         let trimmed = raw_override.trim();
@@ -221,7 +218,7 @@ pub fn save_config_to_path(config_path: &Path, config: &AppConfig) -> Result<App
     Ok(normalized)
 }
 
-/// Load `AppConfig` from `<root>/config.json`, or return the default config with `ui_language = "sr"`.
+/// Load `AppConfig` from `<root>/config.json`, or return the default config with `ui_language = "en"`.
 pub fn load_config(app: &AppHandle) -> Result<AppConfig> {
     let paths = resolve_storage_paths(app, None)?;
     load_config_from_path(Path::new(&paths.config_path))
@@ -733,20 +730,20 @@ mod tests {
     }
 
     #[test]
-    fn config_default_is_serbian_and_roundtrips_cleanly() {
+    fn config_default_is_english_and_roundtrips_cleanly() {
         let base = make_temp_dir("config");
         let config_path = base.join("config.json");
 
-        // Missing file -> returns default with "sr" UI language
+        // Missing file -> returns default with "en" UI language
         let initial = load_config_from_path(&config_path).unwrap();
-        assert_eq!(initial.ui_language, "sr");
+        assert_eq!(initial.ui_language, "en");
         assert_eq!(initial.default_script, SerbianScript::Latin);
         assert!(!initial.has_completed_setup);
 
         // Modify and save atomically
         let custom_models_dir = base.join("my_models");
         let mut updated = initial.clone();
-        updated.ui_language = "en".to_string();
+        updated.ui_language = "sr".to_string();
         updated.active_whisper_model_id = Some("whisper-large-v3-turbo-q5_0".to_string());
         updated.active_llm_model_id = Some("llm-gemma3-4b-q4km".to_string());
         updated.models_dir_override = Some(custom_models_dir.to_string_lossy().into_owned());

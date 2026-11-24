@@ -10,6 +10,6 @@
   easysrt_postinstall_warn:
     DetailPrint "Warning: Core runtime installation exited with code $0. Check setup-bootstrap.log or retry inside EasySRT Studio."
     IfSilent easysrt_postinstall_done
-    MessageBox MB_OK|MB_ICONEXCLAMATION "EasySRT Studio was installed, but downloading core AI components (FFmpeg/CUDA/Whisper) did not finish (code $0).$\r$\n$\r$\nCheck your internet connection and open 'Modeli' inside EasySRT Studio to complete setup."
+    MessageBox MB_OK|MB_ICONEXCLAMATION "EasySRT Studio was installed, but downloading core AI components (FFmpeg/CUDA/Whisper) did not finish (code $0).$\r$\n$\r$\nCheck your internet connection and open 'Models' inside EasySRT Studio to complete setup."
   easysrt_postinstall_done:
 !macroend

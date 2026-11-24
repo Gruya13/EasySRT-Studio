@@ -141,11 +141,11 @@ export class ErrorBoundary extends Component<
       return this.props.children;
     }
 
-    let uiLanguage = "sr";
+    let uiLanguage = "en";
     try {
       uiLanguage = useAppStore.getState().config.uiLanguage;
     } catch {
-      uiLanguage = "sr";
+      uiLanguage = "en";
     }
     const lang = normalizeUiLanguage(uiLanguage);
     const t = getDictionary(lang).crashRecovery;

@@ -608,7 +608,9 @@ export function SettingsPanel() {
                     <span className="s-toggle-title">
                       {lang === "en" ? "LLM Polish" : "LLM poliranje"}
                     </span>
-                    <span className="s-toggle-hint">Ekavski standard</span>
+                    <span className="s-toggle-hint">
+                      {lang === "sr" ? "Ekavski standard" : "Ekavian standard"}
+                    </span>
                   </span>
                   <input
                     id="s-polish-sr"
@@ -1444,22 +1446,22 @@ export function SettingsPanel() {
                   <button
                     type="button"
                     className={`s-seg-btn js-ui-lang-btn${
-                      lang === "sr" ? " active-info" : ""
-                    }`}
-                    data-lang="sr"
-                    onClick={() => void setUiLanguage("sr")}
-                  >
-                    Srpski
-                  </button>
-                  <button
-                    type="button"
-                    className={`s-seg-btn js-ui-lang-btn${
                       lang === "en" ? " active-info" : ""
                     }`}
                     data-lang="en"
                     onClick={() => void setUiLanguage("en")}
                   >
                     English
+                  </button>
+                  <button
+                    type="button"
+                    className={`s-seg-btn js-ui-lang-btn${
+                      lang === "sr" ? " active-info" : ""
+                    }`}
+                    data-lang="sr"
+                    onClick={() => void setUiLanguage("sr")}
+                  >
+                    Srpski
                   </button>
                 </div>
               </div>

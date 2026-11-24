@@ -130,8 +130,10 @@ export function TopBar() {
               type="button"
               className="tb-toast-close"
               onClick={() => setBanner(null)}
-              aria-label="Zatvori obaveštenje"
-              title="Zatvori"
+              aria-label={
+                lang === "sr" ? "Zatvori obaveštenje" : "Dismiss notification"
+              }
+              title={lang === "sr" ? "Zatvori" : "Dismiss"}
             >
               ×
             </button>
