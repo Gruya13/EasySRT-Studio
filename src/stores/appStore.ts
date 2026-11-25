@@ -1,10 +1,11 @@
 import { getVersion } from "@tauri-apps/api/app";
 import { create } from "zustand";
-import { normalizeUiLanguage, type UiLanguage } from "../i18n";
-import { APP_VERSION } from "../lib/version";
+import { normalizeUiLanguage, type UiLanguage } from "../lib/i18nUtils.ts";
+import { APP_VERSION } from "../lib/version.ts";
 import {
   calculateCueMetrics,
   compareSemver,
+  computeSplitBoundaries,
   convertSerbianScriptText,
   getPresetSegmentRules,
   isTauriRuntime,
@@ -14,9 +15,10 @@ import {
   recalculateCue,
   resolveInitialBatchActiveJobId,
   shouldActivateSyncedProject,
-} from "../lib/subtitleUtils";
+} from "../lib/subtitleUtils.ts";
 import {
   cancelJob,
+  cancelMediaProbe,
   clearApiKey,
   condenseProjectCps,
   convertCuesScript,
@@ -37,16 +39,19 @@ import {
   loadCheckpoint,
   onDownloadProgress,
   onJobProgress,
+  onProbeProgress,
   polishProject,
+  probeMediaFile,
   resegmentProject,
   runFullPipeline,
   runLocalLlmBatch,
   saveConfig,
+  saveProjectCheckpoint,
   setApiKey,
   transcribeAudio,
   translateProject,
   tryLoadCompanionSubtitles,
-} from "../lib/tauri";
+} from "../lib/tauri.ts";
 import type {
   ApiKeyStatus,
   AppConfig,
@@ -57,6 +62,7 @@ import type {
   ExportResult,
   JobOptions,
   JobPhase,
+  MediaProbeResult,
   SegmentPreset,
   SegmentRules,
   SerbianScript,
@@ -64,7 +70,8 @@ import type {
   SubtitleCue,
   SubtitleProject,
   TranslationProviderKind,
-} from "../types/models";
+  TranslationStyle,
+} from "../types/models.ts";
 
 export interface BatchQueueItem {
   jobId: string;
@@ -109,6 +116,132 @@ export interface ReplaceInCuesOptions {
 
 const MAX_UNDO_HISTORY = 50;
 
+export const EDITOR_SOURCE_FONT_MIN = 13;
+export const EDITOR_SOURCE_FONT_MAX = 34;
+export const EDITOR_SOURCE_FONT_DEFAULT = 19;
+export const EDITOR_TRANSLATED_FONT_MIN = 14;
+export const EDITOR_TRANSLATED_FONT_MAX = 36;
+export const EDITOR_TRANSLATED_FONT_DEFAULT = 22;
+export const CHECKPOINT_AUTOSAVE_DEBOUNCE_MS = 600;
+
+export function clampEditorFontSize(
+  target: "source" | "translated",
+  size: number,
+): number {
+  const min =
+    target === "source" ? EDITOR_SOURCE_FONT_MIN : EDITOR_TRANSLATED_FONT_MIN;
+  const max =
+    target === "source" ? EDITOR_SOURCE_FONT_MAX : EDITOR_TRANSLATED_FONT_MAX;
+  const fallback =
+    target === "source"
+      ? EDITOR_SOURCE_FONT_DEFAULT
+      : EDITOR_TRANSLATED_FONT_DEFAULT;
+  if (!Number.isFinite(size)) {
+    return fallback;
+  }
+  return Math.max(min, Math.min(max, Math.round(size)));
+}
+
+export function getTranslationStyleCacheStatus(
+  project: SubtitleProject | null,
+): Record<TranslationStyle, boolean> {
+  if (!project || project.cues.length === 0) {
+    return { natural: false, formal: false };
+  }
+  const activeStyle = normalizeTranslationStyle(
+    project.completedTranslationStyle ?? project.options.translationStyle,
+  );
+  let hasNatural = false;
+  let hasFormal = false;
+  for (const cue of project.cues) {
+    const variants = cue.translatedVariants;
+    if (variants && Object.keys(variants).length > 0) {
+      if (variants.natural?.trim()) hasNatural = true;
+      if (variants.formal?.trim()) hasFormal = true;
+    } else if (cue.translatedText.trim().length > 0) {
+      if (activeStyle === "formal") {
+        hasFormal = true;
+      } else {
+        hasNatural = true;
+      }
+    }
+    if (hasNatural && hasFormal) break;
+  }
+  return { natural: hasNatural, formal: hasFormal };
+}
+
+export function seedProjectTranslatedVariants(
+  project: SubtitleProject,
+): SubtitleProject {
+  const seedStyle = normalizeTranslationStyle(
+    project.completedTranslationStyle ?? project.options.translationStyle,
+  );
+  const normalizedOptions: JobOptions = {
+    ...DEFAULT_JOB_OPTIONS,
+    ...project.options,
+    segmentRules: normalizeSegmentRules(project.options.segmentRules),
+    correctSourceAsr: Boolean(project.options.correctSourceAsr),
+    translationStyle: normalizeTranslationStyle(
+      project.options.translationStyle,
+    ),
+    removeFillers: project.options.removeFillers ?? true,
+  };
+
+  let changed = false;
+  const cues = project.cues.map((cue) => {
+    const existing = cue.translatedVariants;
+    const hasExistingVariants = Boolean(
+      existing && Object.keys(existing).length > 0,
+    );
+    if (!hasExistingVariants && cue.translatedText.trim().length > 0) {
+      changed = true;
+      return {
+        ...cue,
+        translatedVariants: { [seedStyle]: cue.translatedText },
+      };
+    }
+    return cue;
+  });
+
+  if (
+    !changed &&
+    project.options.removeFillers !== undefined &&
+    project.options.translationStyle !== undefined &&
+    project.topicContext !== undefined
+  ) {
+    return project;
+  }
+
+  return {
+    ...project,
+    options: normalizedOptions,
+    cues,
+    topicContext: project.topicContext ?? null,
+    completedTranslationStyle: project.completedTranslationStyle
+      ? normalizeTranslationStyle(project.completedTranslationStyle)
+      : null,
+  };
+}
+
+function isProcessingJobPhase(phase: JobPhase): boolean {
+  return (
+    phase === "convertingAudio" ||
+    phase === "transcribing" ||
+    phase === "segmenting" ||
+    phase === "translating" ||
+    phase === "polishing"
+  );
+}
+
+function isCancellationError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return /\bcancel(?:led|ed)\b/i.test(msg);
+}
+
+function isSubtitlePath(path: string): boolean {
+  return /\.(srt|vtt)$/i.test(path.trim());
+}
+
 const DEFAULT_SEGMENT_RULES: SegmentRules = getPresetSegmentRules("standard");
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -136,6 +269,11 @@ const DEFAULT_CONFIG: AppConfig = {
   },
   hasCompletedSetup: false,
   autoSendCrashReports: true,
+  editorSourceFontSize: EDITOR_SOURCE_FONT_DEFAULT,
+  editorTranslatedFontSize: EDITOR_TRANSLATED_FONT_DEFAULT,
+  autoProbeOnImport: true,
+  autoCheckpoints: true,
+  allowLocalEncryptedVault: false,
 };
 
 const DEFAULT_JOB_OPTIONS: JobOptions = {
@@ -147,10 +285,92 @@ const DEFAULT_JOB_OPTIONS: JobOptions = {
   polishSerbian: true,
   correctSourceAsr: false,
   translationStyle: "natural",
+  removeFillers: true,
   providerOverride: null,
 };
 
-interface AppStoreState {
+export interface AppStoreDeps {
+  getSetupStatus: typeof getSetupStatus;
+  getCatalog: typeof getCatalog;
+  getConfig: typeof getConfig;
+  saveConfig: typeof saveConfig;
+  getApiKeyStatus: typeof getApiKeyStatus;
+  setApiKey: typeof setApiKey;
+  clearApiKey: typeof clearApiKey;
+  listCheckpoints: typeof listCheckpoints;
+  loadCheckpoint: typeof loadCheckpoint;
+  saveProjectCheckpoint: typeof saveProjectCheckpoint;
+  deleteCheckpoint: typeof deleteCheckpoint;
+  transcribeAudio: typeof transcribeAudio;
+  resegmentProject: typeof resegmentProject;
+  translateProject: typeof translateProject;
+  polishProject: typeof polishProject;
+  condenseProjectCps: typeof condenseProjectCps;
+  runFullPipeline: typeof runFullPipeline;
+  runLocalLlmBatch: typeof runLocalLlmBatch;
+  cancelJob: typeof cancelJob;
+  importSubtitleFile: typeof importSubtitleFile;
+  tryLoadCompanionSubtitles: typeof tryLoadCompanionSubtitles;
+  convertCuesScript: typeof convertCuesScript;
+  exportSubtitles: typeof exportSubtitles;
+  installComponent: typeof installComponent;
+  installCoreRuntime: typeof installCoreRuntime;
+  installRecommendedBundle: typeof installRecommendedBundle;
+  importCustomModel: typeof importCustomModel;
+  deleteModel: typeof deleteModel;
+  flushPendingCrashReports: typeof flushPendingCrashReports;
+  probeMediaFile: typeof probeMediaFile;
+  cancelMediaProbe: typeof cancelMediaProbe;
+  onDownloadProgress: typeof onDownloadProgress;
+  onJobProgress: typeof onJobProgress;
+  onProbeProgress: typeof onProbeProgress;
+  getAppVersion: () => Promise<string>;
+  autosaveDebounceMs: number;
+}
+
+const DEFAULT_STORE_DEPS: AppStoreDeps = {
+  getSetupStatus,
+  getCatalog,
+  getConfig,
+  saveConfig,
+  getApiKeyStatus,
+  setApiKey,
+  clearApiKey,
+  listCheckpoints,
+  loadCheckpoint,
+  saveProjectCheckpoint,
+  deleteCheckpoint,
+  transcribeAudio,
+  resegmentProject,
+  translateProject,
+  polishProject,
+  condenseProjectCps,
+  runFullPipeline,
+  runLocalLlmBatch,
+  cancelJob,
+  importSubtitleFile,
+  tryLoadCompanionSubtitles,
+  convertCuesScript,
+  exportSubtitles,
+  installComponent,
+  installCoreRuntime,
+  installRecommendedBundle,
+  importCustomModel,
+  deleteModel,
+  flushPendingCrashReports,
+  probeMediaFile,
+  cancelMediaProbe,
+  onDownloadProgress,
+  onJobProgress,
+  onProbeProgress,
+  getAppVersion: () =>
+    isTauriRuntime()
+      ? getVersion().catch(() => APP_VERSION)
+      : Promise.resolve(APP_VERSION),
+  autosaveDebounceMs: CHECKPOINT_AUTOSAVE_DEBOUNCE_MS,
+};
+
+export interface AppStoreState {
   initialized: boolean;
   setupStatus: SetupStatus | null;
   catalog: CatalogManifest | null;
@@ -163,6 +383,8 @@ interface AppStoreState {
   activeJobId: string | null;
   activeProject: SubtitleProject | null;
   isRunningBatch: boolean;
+  queueCancelRequested: boolean;
+  probeResults: Record<string, MediaProbeResult>;
 
   downloadProgress: Record<string, DownloadProgressEvent>;
   installingBundle: boolean;
@@ -194,6 +416,10 @@ interface AppStoreState {
   setAvailableUpdateVersion: (version: string | null) => void;
   setUiLanguage: (lang: UiLanguage) => Promise<void>;
   updateConfig: (patch: Partial<AppConfig>) => Promise<void>;
+  setEditorFontSize: (
+    target: "source" | "translated",
+    size: number,
+  ) => Promise<void>;
   refreshSetupAndCatalog: () => Promise<void>;
 
   setSetupOpen: (open: boolean) => void;
@@ -219,6 +445,7 @@ interface AppStoreState {
   runClearApiKey: (provider: TranslationProviderKind) => Promise<void>;
 
   setJobOptions: (patch: Partial<JobOptions>) => void;
+  switchTranslationStyle: (style: TranslationStyle) => void;
   setEffectiveProvider: (provider: TranslationProviderKind) => Promise<void>;
   setSegmentPreset: (preset: SegmentPreset) => void;
   updateSegmentRules: (patch: Partial<SegmentRules>) => void;
@@ -235,14 +462,16 @@ interface AppStoreState {
 
   loadCheckpointIntoEditor: (jobId: string) => Promise<void>;
   removeCheckpoint: (jobId: string) => Promise<void>;
+  flushPendingCheckpoint: () => Promise<void>;
 
   closeOnlineConfirm: () => void;
   confirmOnlineAction: (rememberForSession: boolean) => void;
 
-  startBatchPipeline: (mode: "full" | "transcribeOnly") => void;
-  translateActiveProject: () => void;
-  polishActiveProject: () => void;
-  condenseActiveProjectCps: () => void;
+  startBatchPipeline: (mode: "full" | "transcribeOnly") => Promise<void>;
+  stopProcessingQueue: () => Promise<void>;
+  translateActiveProject: () => Promise<void>;
+  polishActiveProject: () => Promise<void>;
+  condenseActiveProjectCps: () => Promise<void>;
   cancelJobById: (jobId: string) => Promise<void>;
 
   updateCue: (
@@ -271,14 +500,21 @@ interface AppStoreState {
   quickExportSrt: () => Promise<void>;
 }
 
-let listenersRegistered = false;
+export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
+  const deps: AppStoreDeps = { ...DEFAULT_STORE_DEPS, ...depsOverrides };
+  let listenersRegistered = false;
+  let autosaveTimer: ReturnType<typeof setTimeout> | null = null;
+  let pendingAutosaveProject: SubtitleProject | null = null;
+  const probePendingQueue: Array<{ jobId: string; audioPath: string }> = [];
+  let probeRunnerActive = false;
+  let activeProbeJobId: string | null = null;
 
-export const useAppStore = create<AppStoreState>((set, get) => {
+  return create<AppStoreState>((set, get) => {
   const withOnlineGuard = (
     requiresLlm: boolean,
     actionLabel: string,
     action: () => Promise<void>,
-  ) => {
+  ): Promise<void> => {
     const state = get();
     const provider =
       state.jobOptions.providerOverride ?? state.config.translation.provider;
@@ -295,10 +531,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           },
         },
       });
-      return;
+      return Promise.resolve();
     }
 
-    void action();
+    return action();
   };
 
   const normalizeLoadedConfig = (
@@ -315,8 +551,169 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         true,
     }),
     autoSendCrashReports: loaded.autoSendCrashReports ?? true,
+    editorSourceFontSize: clampEditorFontSize(
+      "source",
+      loaded.editorSourceFontSize ?? EDITOR_SOURCE_FONT_DEFAULT,
+    ),
+    editorTranslatedFontSize: clampEditorFontSize(
+      "translated",
+      loaded.editorTranslatedFontSize ?? EDITOR_TRANSLATED_FONT_DEFAULT,
+    ),
+    autoProbeOnImport: loaded.autoProbeOnImport ?? true,
+    autoCheckpoints: loaded.autoCheckpoints ?? true,
+    allowLocalEncryptedVault: loaded.allowLocalEncryptedVault ?? false,
     uiLanguage: normalizeUiLanguage(loaded.uiLanguage),
   });
+
+  const flushCheckpointAutosave = async (): Promise<void> => {
+    if (autosaveTimer !== null) {
+      clearTimeout(autosaveTimer);
+      autosaveTimer = null;
+    }
+    const projectToSave = pendingAutosaveProject;
+    pendingAutosaveProject = null;
+    if (!projectToSave || get().config.autoCheckpoints === false) {
+      return;
+    }
+    try {
+      await deps.saveProjectCheckpoint(projectToSave);
+    } catch {
+      // Non-fatal background checkpoint error
+    }
+  };
+
+  const scheduleCheckpointAutosave = (project: SubtitleProject) => {
+    if (get().config.autoCheckpoints === false || !project.jobId.trim()) {
+      if (autosaveTimer !== null) {
+        clearTimeout(autosaveTimer);
+        autosaveTimer = null;
+      }
+      pendingAutosaveProject = null;
+      return;
+    }
+    if (
+      pendingAutosaveProject &&
+      pendingAutosaveProject.jobId !== project.jobId
+    ) {
+      void flushCheckpointAutosave();
+    }
+    pendingAutosaveProject = project;
+    if (autosaveTimer !== null) {
+      clearTimeout(autosaveTimer);
+    }
+    autosaveTimer = setTimeout(() => {
+      void flushCheckpointAutosave();
+    }, deps.autosaveDebounceMs);
+  };
+
+  const applyProbeResultToState = (evt: MediaProbeResult) => {
+    set((state) => {
+      const nextProbeResults = {
+        ...state.probeResults,
+        [evt.jobId]: evt,
+      };
+      const topic = evt.topic?.trim() || null;
+      const updateProjectMeta = (
+        proj: SubtitleProject | null,
+      ): SubtitleProject | null => {
+        if (!proj || proj.jobId !== evt.jobId) return proj;
+        const nextDuration =
+          proj.durationMs > 0 ? proj.durationMs : (evt.durationMs ?? 0);
+        const nextLang = proj.detectedLanguage ?? evt.detectedLanguage ?? null;
+        const nextTopic = topic ?? proj.topicContext ?? null;
+        if (
+          nextDuration === proj.durationMs &&
+          nextLang === proj.detectedLanguage &&
+          nextTopic === (proj.topicContext ?? null)
+        ) {
+          return proj;
+        }
+        return {
+          ...proj,
+          durationMs: nextDuration,
+          detectedLanguage: nextLang,
+          topicContext: nextTopic,
+        };
+      };
+
+      const nextQueue = state.batchQueue.map((item) => {
+        if (item.jobId !== evt.jobId) return item;
+        const nextProj = updateProjectMeta(item.project);
+        return nextProj === item.project ? item : { ...item, project: nextProj };
+      });
+
+      return {
+        probeResults: nextProbeResults,
+        batchQueue: nextQueue,
+        activeProject: updateProjectMeta(state.activeProject),
+      };
+    });
+  };
+
+  const drainProbeQueue = async () => {
+    if (probeRunnerActive) {
+      return;
+    }
+    probeRunnerActive = true;
+    try {
+      while (probePendingQueue.length > 0) {
+        if (get().isRunningBatch || get().config.autoProbeOnImport === false) {
+          break;
+        }
+        const next = probePendingQueue.shift();
+        if (!next) break;
+        const queueItem = get().batchQueue.find(
+          (q) => q.jobId === next.jobId,
+        );
+        if (!queueItem || queueItem.phase !== "queued") {
+          continue;
+        }
+        if (isSubtitlePath(next.audioPath)) {
+          continue;
+        }
+        activeProbeJobId = next.jobId;
+        try {
+          const result = await deps.probeMediaFile(next.jobId, next.audioPath);
+          applyProbeResultToState(result);
+          if (result.stage === "cancelled" || get().isRunningBatch) {
+            break;
+          }
+        } catch (err) {
+          if (get().isRunningBatch) {
+            break;
+          }
+          applyProbeResultToState({
+            jobId: next.jobId,
+            audioPath: next.audioPath,
+            stage: "failed",
+            durationMs: null,
+            speechRatio: null,
+            estimatedSpeakers: null,
+            detectedLanguage: null,
+            topic: null,
+            suggestedStyle: null,
+            error: err instanceof Error ? err.message : String(err),
+          });
+        } finally {
+          if (activeProbeJobId === next.jobId) {
+            activeProbeJobId = null;
+          }
+        }
+      }
+    } finally {
+      activeProbeJobId = null;
+      probeRunnerActive = false;
+    }
+  };
+
+  const preemptActiveProbe = async () => {
+    probePendingQueue.length = 0;
+    try {
+      await deps.cancelMediaProbe(null);
+    } catch {
+      // Ignore probe cancel errors when no probe is running
+    }
+  };
 
   const findCueIdAtPlayheadZero = (cues: SubtitleCue[]): number | null => {
     const match = cues.find((c) => c.startMs <= 0 && c.endMs >= 0);
@@ -324,9 +721,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
   };
 
   const syncProjectIntoQueueAndState = (
-    project: SubtitleProject,
+    rawProject: SubtitleProject,
     options?: { forceActivate?: boolean },
   ) => {
+    const project = seedProjectTranslatedVariants(rawProject);
     set((state) => {
       const existsInQueue = state.batchQueue.some(
         (item) => item.jobId === project.jobId,
@@ -383,7 +781,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
   };
 
   const cloneCuesSnapshot = (cues: SubtitleCue[]): SubtitleCue[] =>
-    cues.map((c) => ({ ...c, warnings: [...c.warnings] }));
+    cues.map((c) => ({
+      ...c,
+      warnings: [...c.warnings],
+      translatedVariants: c.translatedVariants
+        ? { ...c.translatedVariants }
+        : undefined,
+    }));
 
   const pushUndoSnapshot = (currentCues: SubtitleCue[]) => {
     set((state) => {
@@ -426,6 +830,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     activeJobId: null,
     activeProject: null,
     isRunningBatch: false,
+    queueCancelRequested: false,
+    probeResults: {},
 
     downloadProgress: {},
     installingBundle: false,
@@ -464,7 +870,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
       if (!listenersRegistered) {
         listenersRegistered = true;
-        void onDownloadProgress((evt) => {
+        void deps.onDownloadProgress((evt) => {
           set((state) => ({
             downloadProgress: {
               ...state.downloadProgress,
@@ -473,27 +879,49 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           }));
         });
 
-        void onJobProgress((evt) => {
-          set((state) => ({
-            batchQueue: state.batchQueue.map((item) =>
-              item.jobId === evt.jobId
-                ? {
-                    ...item,
-                    phase: evt.phase,
-                    percent: evt.percent,
-                    detail: evt.detail,
-                  }
-                : item,
-            ),
-            activeProject:
-              state.activeProject && state.activeProject.jobId === evt.jobId
-                ? {
-                    ...state.activeProject,
-                    phase: evt.phase,
-                  }
-                : state.activeProject,
-          }));
+        void deps.onJobProgress((evt) => {
+          set((state) => {
+            const queueItem = state.batchQueue.find(
+              (item) => item.jobId === evt.jobId,
+            );
+            if (
+              queueItem?.phase === "cancelled" &&
+              state.queueCancelRequested &&
+              evt.phase !== "cancelled"
+            ) {
+              return state;
+            }
+            return {
+              batchQueue: state.batchQueue.map((item) =>
+                item.jobId === evt.jobId
+                  ? {
+                      ...item,
+                      phase: evt.phase,
+                      percent: evt.percent,
+                      detail: evt.detail,
+                    }
+                  : item,
+              ),
+              activeProject:
+                state.activeProject && state.activeProject.jobId === evt.jobId
+                  ? {
+                      ...state.activeProject,
+                      phase: evt.phase,
+                    }
+                  : state.activeProject,
+            };
+          });
         });
+
+        void deps.onProbeProgress((evt) => {
+          applyProbeResultToState(evt);
+        });
+
+        if (typeof window !== "undefined" && typeof window.addEventListener === "function") {
+          window.addEventListener("beforeunload", () => {
+            void flushCheckpointAutosave();
+          });
+        }
       }
 
       try {
@@ -502,20 +930,19 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           catalog,
           loadedConfig,
           apiKeyStatus,
-          checkpoints,
+          rawCheckpoints,
           appVersion,
         ] = await Promise.all([
-          getSetupStatus(),
-          getCatalog(),
-          getConfig(),
-          getApiKeyStatus(),
-          listCheckpoints(),
-          isTauriRuntime()
-            ? getVersion().catch(() => APP_VERSION)
-            : Promise.resolve(APP_VERSION),
+          deps.getSetupStatus(),
+          deps.getCatalog(),
+          deps.getConfig(),
+          deps.getApiKeyStatus(),
+          deps.listCheckpoints(),
+          deps.getAppVersion(),
         ]);
 
         const config = normalizeLoadedConfig(loadedConfig);
+        const checkpoints = rawCheckpoints.map(seedProjectTranslatedVariants);
 
         const jobOptions: JobOptions = {
           ...DEFAULT_JOB_OPTIONS,
@@ -553,25 +980,27 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
         // Flush pending Rust panic / crash reports queued on disk (silent, non-blocking)
         if (config.autoSendCrashReports !== false) {
-          void flushPendingCrashReports().catch(() => {});
+          void deps.flushPendingCrashReports().catch(() => {});
         }
 
         // Background GitHub latest-release version check (silent, non-blocking)
-        void fetch(
-          "https://api.github.com/repos/Gruya13/EasySRT-Studio/releases/latest",
-          { headers: { Accept: "application/vnd.github+json" } },
-        )
-          .then(async (res) => {
-            if (!res.ok) return;
-            const data = (await res.json()) as { tag_name?: string };
-            const remoteTag = data.tag_name?.trim();
-            if (remoteTag && compareSemver(remoteTag, appVersion) > 0) {
-              set({ availableUpdateVersion: remoteTag.replace(/^v/i, "") });
-            }
-          })
-          .catch(() => {
-            // Offline or GitHub unreachable — ignore silently at startup
-          });
+        if (typeof fetch === "function" && typeof window !== "undefined") {
+          void fetch(
+            "https://api.github.com/repos/Gruya13/EasySRT-Studio/releases/latest",
+            { headers: { Accept: "application/vnd.github+json" } },
+          )
+            .then(async (res) => {
+              if (!res.ok) return;
+              const data = (await res.json()) as { tag_name?: string };
+              const remoteTag = data.tag_name?.trim();
+              if (remoteTag && compareSemver(remoteTag, appVersion) > 0) {
+                set({ availableUpdateVersion: remoteTag.replace(/^v/i, "") });
+              }
+            })
+            .catch(() => {
+              // Offline or GitHub unreachable — ignore silently at startup
+            });
+        }
       } catch (err) {
         set({
           initialized: true,
@@ -594,7 +1023,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       };
       set({ config: nextConfig });
       try {
-        const saved = await saveConfig(nextConfig);
+        const saved = await deps.saveConfig(nextConfig);
         set({
           config: normalizeLoadedConfig(
             saved,
@@ -613,16 +1042,34 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         defaultSegmentRules: normalizeSegmentRules(
           patch.defaultSegmentRules ?? get().config.defaultSegmentRules,
         ),
+        editorSourceFontSize: clampEditorFontSize(
+          "source",
+          patch.editorSourceFontSize ??
+            get().config.editorSourceFontSize ??
+            EDITOR_SOURCE_FONT_DEFAULT,
+        ),
+        editorTranslatedFontSize: clampEditorFontSize(
+          "translated",
+          patch.editorTranslatedFontSize ??
+            get().config.editorTranslatedFontSize ??
+            EDITOR_TRANSLATED_FONT_DEFAULT,
+        ),
       };
       set({ config: nextConfig });
       try {
-        const saved = await saveConfig(nextConfig);
-        set({
-          config: normalizeLoadedConfig(
-            saved,
-            nextConfig.defaultSegmentRules.splitOnSpeakerChange,
-          ),
-        });
+        const saved = await deps.saveConfig(nextConfig);
+        const normalized = normalizeLoadedConfig(
+          saved,
+          nextConfig.defaultSegmentRules.splitOnSpeakerChange,
+        );
+        if (patch.allowLocalEncryptedVault !== undefined) {
+          const apiKeyStatus = await deps
+            .getApiKeyStatus()
+            .catch(() => get().apiKeyStatus);
+          set({ config: normalized, apiKeyStatus });
+        } else {
+          set({ config: normalized });
+        }
       } catch (err) {
         set({
           banner: {
@@ -633,13 +1080,22 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }
     },
 
+    setEditorFontSize: async (target, size) => {
+      const clamped = clampEditorFontSize(target, size);
+      if (target === "source") {
+        await get().updateConfig({ editorSourceFontSize: clamped });
+      } else {
+        await get().updateConfig({ editorTranslatedFontSize: clamped });
+      }
+    },
+
     refreshSetupAndCatalog: async () => {
       try {
         const [setupStatus, catalog, config, apiKeyStatus] = await Promise.all([
-          getSetupStatus(),
-          getCatalog(),
-          getConfig(),
-          getApiKeyStatus(),
+          deps.getSetupStatus(),
+          deps.getCatalog(),
+          deps.getConfig(),
+          deps.getApiKeyStatus(),
         ]);
         set({
           setupStatus,
@@ -672,10 +1128,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         installingItemIds: { ...state.installingItemIds, [itemId]: true },
       }));
       try {
-        await installComponent(itemId);
+        await deps.installComponent(itemId);
         const [setupStatus, config] = await Promise.all([
-          getSetupStatus(),
-          getConfig(),
+          deps.getSetupStatus(),
+          deps.getConfig(),
         ]);
         set({
           setupStatus,
@@ -703,9 +1159,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     runInstallCoreRuntime: async () => {
       set({ installingBundle: true });
       try {
-        const setupStatus = await installCoreRuntime();
+        const setupStatus = await deps.installCoreRuntime();
         const config = normalizeLoadedConfig(
-          await getConfig(),
+          await deps.getConfig(),
           get().config.defaultSegmentRules.splitOnSpeakerChange,
         );
         set({
@@ -734,15 +1190,19 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     runInstallRecommendedBundle: async () => {
       set({ installingBundle: true });
       try {
-        const setupStatus = await installRecommendedBundle();
+        const setupStatus = await deps.installRecommendedBundle();
         const prevSplit = get().config.defaultSegmentRules.splitOnSpeakerChange;
-        const nextConfig = normalizeLoadedConfig(
-          await saveConfig({
-            ...get().config,
-            hasCompletedSetup: true,
-          }),
-          prevSplit,
-        );
+        const freshConfig = await deps.getConfig();
+        let nextConfig = normalizeLoadedConfig(freshConfig, prevSplit);
+        if (!nextConfig.hasCompletedSetup) {
+          nextConfig = normalizeLoadedConfig(
+            await deps.saveConfig({
+              ...nextConfig,
+              hasCompletedSetup: true,
+            }),
+            prevSplit,
+          );
+        }
         set({
           setupStatus,
           config: nextConfig,
@@ -768,10 +1228,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     runImportCustomModel: async (sourcePath, kind, name) => {
       try {
-        await importCustomModel(sourcePath, kind, name);
+        await deps.importCustomModel(sourcePath, kind, name);
         const [rawConfig, setupStatus] = await Promise.all([
-          getConfig(),
-          getSetupStatus(),
+          deps.getConfig(),
+          deps.getSetupStatus(),
         ]);
         const config = normalizeLoadedConfig(
           rawConfig,
@@ -800,10 +1260,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     runDeleteModel: async (modelId) => {
       try {
-        await deleteModel(modelId);
+        await deps.deleteModel(modelId);
         const [config, setupStatus] = await Promise.all([
-          getConfig(),
-          getSetupStatus(),
+          deps.getConfig(),
+          deps.getSetupStatus(),
         ]);
         set({
           config: normalizeLoadedConfig(
@@ -824,7 +1284,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     runSetApiKey: async (provider, apiKey) => {
       try {
-        const apiKeyStatus = await setApiKey(provider, apiKey);
+        const apiKeyStatus = await deps.setApiKey(provider, apiKey);
         set({
           apiKeyStatus,
           banner: {
@@ -847,7 +1307,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     runClearApiKey: async (provider) => {
       try {
-        const apiKeyStatus = await clearApiKey(provider);
+        const apiKeyStatus = await deps.clearApiKey(provider);
         set({ apiKeyStatus });
       } catch (err) {
         set({
@@ -866,6 +1326,72 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           ...patch,
         },
       }));
+    },
+
+    switchTranslationStyle: (style) => {
+      const nextStyle = normalizeTranslationStyle(style);
+      set((state) => ({
+        jobOptions: {
+          ...state.jobOptions,
+          translationStyle: nextStyle,
+        },
+      }));
+
+      const { activeProject, jobOptions } = get();
+      if (!activeProject) {
+        return;
+      }
+
+      const seededProject = seedProjectTranslatedVariants(activeProject);
+      const prevStyle = normalizeTranslationStyle(
+        seededProject.options.translationStyle,
+      );
+      const rules =
+        seededProject.options.segmentRules ?? jobOptions.segmentRules;
+
+      const preparedCues = seededProject.cues.map((cue) => {
+        const existing = cue.translatedVariants;
+        if (
+          (!existing || Object.keys(existing).length === 0) &&
+          cue.translatedText.trim().length > 0
+        ) {
+          return {
+            ...cue,
+            translatedVariants: { [prevStyle]: cue.translatedText },
+          };
+        }
+        return cue;
+      });
+
+      const hasCachedTarget = preparedCues.some((cue) =>
+        Boolean(cue.translatedVariants?.[nextStyle]?.trim()),
+      );
+
+      const nextCues = hasCachedTarget
+        ? preparedCues.map((cue) => {
+            const cachedText = cue.translatedVariants?.[nextStyle] ?? "";
+            return recalculateCue(
+              {
+                ...cue,
+                translatedText: cachedText,
+              },
+              rules,
+            );
+          })
+        : preparedCues;
+
+      const updatedProject: SubtitleProject = {
+        ...seededProject,
+        options: {
+          ...seededProject.options,
+          translationStyle: nextStyle,
+        },
+        cues: nextCues,
+        updatedAt: new Date().toISOString(),
+      };
+
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     setEffectiveProvider: async (provider) => {
@@ -928,11 +1454,12 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }
       pushUndoSnapshot(activeProject.cues);
       try {
-        const updated = await resegmentProject(
+        const updated = await deps.resegmentProject(
           activeProject,
           jobOptions.segmentRules,
         );
         syncProjectIntoQueueAndState(updated);
+        scheduleCheckpointAutosave(updated);
         set({
           banner: {
             type: "success",
@@ -947,14 +1474,17 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         const updatedCues = activeProject.cues.map((cue) =>
           recalculateCue(cue, jobOptions.segmentRules),
         );
-        syncProjectIntoQueueAndState({
+        const fallbackProject: SubtitleProject = {
           ...activeProject,
           options: {
             ...activeProject.options,
             segmentRules: jobOptions.segmentRules,
           },
           cues: updatedCues,
-        });
+          updatedAt: new Date().toISOString(),
+        };
+        syncProjectIntoQueueAndState(fallbackProject);
+        scheduleCheckpointAutosave(fallbackProject);
         if (err instanceof Error && err.message) {
           set({
             banner: {
@@ -979,13 +1509,35 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }
       pushUndoSnapshot(activeProject.cues);
       try {
-        const convertedCues = await convertCuesScript(
+        const convertedCues = await deps.convertCuesScript(
           activeProject.cues,
           targetScript,
         );
-        const recalculated = convertedCues.map((c) =>
-          recalculateCue(c, jobOptions.segmentRules),
-        );
+        const recalculated = convertedCues.map((c, idx) => {
+          const origCue = activeProject.cues[idx];
+          let nextVariants = c.translatedVariants;
+          if (
+            nextVariants &&
+            origCue &&
+            nextVariants === origCue.translatedVariants
+          ) {
+            const convertedMap: Partial<Record<TranslationStyle, string>> = {};
+            for (const style of ["natural", "formal"] as const) {
+              const val = nextVariants[style];
+              if (typeof val === "string") {
+                convertedMap[style] = convertSerbianScriptText(
+                  val,
+                  targetScript,
+                );
+              }
+            }
+            nextVariants = convertedMap;
+          }
+          return recalculateCue(
+            { ...c, translatedVariants: nextVariants },
+            jobOptions.segmentRules,
+          );
+        });
         const updated: SubtitleProject = {
           ...activeProject,
           options: {
@@ -996,6 +1548,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           updatedAt: new Date().toISOString(),
         };
         syncProjectIntoQueueAndState(updated);
+        scheduleCheckpointAutosave(updated);
       } catch (err) {
         set({
           banner: {
@@ -1007,10 +1560,14 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     },
 
     importSubtitleFromPath: async (path) => {
+      await flushCheckpointAutosave();
       try {
-        const project = await importSubtitleFile(path, get().jobOptions);
+        const project = seedProjectTranslatedVariants(
+          await deps.importSubtitleFile(path, get().jobOptions),
+        );
         resetUndoHistory();
         syncProjectIntoQueueAndState(project, { forceActivate: true });
+        scheduleCheckpointAutosave(project);
         set({
           activeCueId: findCueIdAtPlayheadZero(project.cues),
           banner: {
@@ -1032,6 +1589,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     },
 
     importSubtitleFromText: (fileName, content) => {
+      void flushCheckpointAutosave();
       const { jobOptions, config } = get();
       const parsed = parseSubtitleFileText(content, jobOptions.segmentRules);
       if (parsed.length === 0) {
@@ -1068,7 +1626,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         .toString(36)
         .slice(2, 7)}`;
 
-      const project: SubtitleProject = {
+      const project: SubtitleProject = seedProjectTranslatedVariants({
         jobId,
         audioPath: fileName,
         audioFileName: cleanName,
@@ -1082,12 +1640,15 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         cues,
         phase: "completed",
         completedTranslationBatches: 0,
+        completedTranslationStyle: null,
+        topicContext: null,
         errorMessage: null,
         updatedAt: new Date().toISOString(),
-      };
+      });
 
       resetUndoHistory();
       syncProjectIntoQueueAndState(project, { forceActivate: true });
+      scheduleCheckpointAutosave(project);
       set({
         activeCueId: findCueIdAtPlayheadZero(cues),
         banner: {
@@ -1161,6 +1722,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               cues: [],
               phase: firstExisting.phase,
               completedTranslationBatches: 0,
+              completedTranslationStyle: null,
+              topicContext: null,
               errorMessage: firstExisting.errorMessage,
               updatedAt: new Date().toISOString(),
             };
@@ -1190,6 +1753,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               cues: [],
               phase: firstAdded.phase,
               completedTranslationBatches: 0,
+              completedTranslationStyle: null,
+              topicContext: null,
               errorMessage: null,
               updatedAt: new Date().toISOString(),
             }
@@ -1216,18 +1781,21 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       const optionsSnapshot = { ...get().jobOptions };
       const uiLang = get().config.uiLanguage;
       for (const item of itemsToCheck) {
-        void tryLoadCompanionSubtitles(item.audioPath, optionsSnapshot)
+        void deps
+          .tryLoadCompanionSubtitles(item.audioPath, optionsSnapshot)
           .then((companionProject) => {
             if (!companionProject) {
               return;
             }
-            const mergedProject: SubtitleProject = {
-              ...companionProject,
-              jobId: item.jobId,
-              audioPath: item.audioPath,
-              audioFileName: item.audioFileName,
-              phase: "completed",
-            };
+            const mergedProject: SubtitleProject = seedProjectTranslatedVariants(
+              {
+                ...companionProject,
+                jobId: item.jobId,
+                audioPath: item.audioPath,
+                audioFileName: item.audioFileName,
+                phase: "completed",
+              },
+            );
             set((state) => {
               const currentItem = state.batchQueue.find(
                 (q) => q.jobId === item.jobId,
@@ -1267,22 +1835,59 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                   : state.activeCueId,
               };
             });
+            scheduleCheckpointAutosave(mergedProject);
           })
           .catch(() => {
             // Keep file queued cleanly if companion subtitle fails to parse
           });
       }
+
+      // Workstream 5: Schedule sequential background media intake probes when idle
+      if (
+        newlyAddedItems.length > 0 &&
+        get().config.autoProbeOnImport !== false &&
+        !get().isRunningBatch
+      ) {
+        for (const item of newlyAddedItems) {
+          if (!isSubtitlePath(item.audioPath)) {
+            probePendingQueue.push({
+              jobId: item.jobId,
+              audioPath: item.audioPath,
+            });
+          }
+        }
+        void drainProbeQueue();
+      }
     },
 
     removeQueueItem: (jobId) => {
+      if (pendingAutosaveProject?.jobId === jobId) {
+        if (autosaveTimer !== null) {
+          clearTimeout(autosaveTimer);
+          autosaveTimer = null;
+        }
+        pendingAutosaveProject = null;
+      } else if (get().activeJobId === jobId) {
+        void flushCheckpointAutosave();
+      }
+      const probeIdx = probePendingQueue.findIndex((p) => p.jobId === jobId);
+      if (probeIdx !== -1) {
+        probePendingQueue.splice(probeIdx, 1);
+      }
+      if (activeProbeJobId === jobId) {
+        void deps.cancelMediaProbe(jobId).catch(() => false);
+      }
       set((state) => {
         const nextQueue = state.batchQueue.filter(
           (item) => item.jobId !== jobId,
         );
         const isRemovingActive = state.activeJobId === jobId;
         const fallbackItem = nextQueue[0] ?? null;
+        const nextProbes = { ...state.probeResults };
+        delete nextProbes[jobId];
         return {
           batchQueue: nextQueue,
+          probeResults: nextProbes,
           activeJobId: isRemovingActive
             ? (fallbackItem?.jobId ?? null)
             : state.activeJobId,
@@ -1314,21 +1919,25 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       }
       const isSameJob = get().activeJobId === jobId;
       if (!isSameJob) {
+        void flushCheckpointAutosave();
         resetUndoHistory();
       }
+      const probe = get().probeResults[jobId];
       const placeholderProject: SubtitleProject | null = item.project
         ? item.project
         : {
             jobId: item.jobId,
             audioPath: item.audioPath,
             audioFileName: item.audioFileName,
-            durationMs: 0,
-            detectedLanguage: null,
+            durationMs: probe?.durationMs ?? 0,
+            detectedLanguage: probe?.detectedLanguage ?? null,
             options: { ...get().jobOptions },
             words: [],
             cues: [],
             phase: item.phase,
             completedTranslationBatches: 0,
+            completedTranslationStyle: null,
+            topicContext: probe?.topic ?? null,
             errorMessage: item.errorMessage,
             updatedAt: new Date().toISOString(),
           };
@@ -1342,8 +1951,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     },
 
     loadCheckpointIntoEditor: async (jobId) => {
+      await flushCheckpointAutosave();
       try {
-        const project = await loadCheckpoint(jobId);
+        const project = seedProjectTranslatedVariants(
+          await deps.loadCheckpoint(jobId),
+        );
         resetUndoHistory();
         syncProjectIntoQueueAndState(project, { forceActivate: true });
         set({
@@ -1355,6 +1967,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             translationStyle: normalizeTranslationStyle(
               project.options.translationStyle,
             ),
+            removeFillers: project.options.removeFillers ?? true,
           },
           isCheckpointsOpen: false,
           activeCueId: findCueIdAtPlayheadZero(project.cues),
@@ -1371,7 +1984,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
     removeCheckpoint: async (jobId) => {
       try {
-        await deleteCheckpoint(jobId);
+        await deps.deleteCheckpoint(jobId);
         set((state) => ({
           checkpoints: state.checkpoints.filter((c) => c.jobId !== jobId),
         }));
@@ -1384,6 +1997,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         });
       }
     },
+
+    flushPendingCheckpoint: () => flushCheckpointAutosave(),
 
     reprocessQueueItem: (jobId) => {
       if (get().isRunningBatch) {
@@ -1445,10 +2060,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         (state.jobOptions.targetLanguage !== "none" ||
           state.jobOptions.polishSerbian);
 
-      withOnlineGuard(
+      return withOnlineGuard(
         requiresLlm,
         mode === "full" ? "1-Click Pipeline" : "Transcribe",
         async () => {
+          await flushCheckpointAutosave();
+          await preemptActiveProbe();
+
           let queue = get().batchQueue;
           if (queue.length === 0 && get().activeProject) {
             const active = get().activeProject!;
@@ -1488,6 +2106,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
           set((s) => ({
             isRunningBatch: true,
+            queueCancelRequested: false,
             activeJobId: resolveInitialBatchActiveJobId(
               s.activeJobId,
               runnable[0]?.jobId ?? null,
@@ -1507,16 +2126,67 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             runnable.length > 1 &&
             effectiveProvider === "localLlama";
 
+          const attachTopicContext = (
+            project: SubtitleProject,
+            jobId: string,
+          ): SubtitleProject => {
+            const topic =
+              project.topicContext ?? get().probeResults[jobId]?.topic ?? null;
+            return topic ? { ...project, topicContext: topic } : project;
+          };
+
           const handleJobError = async (
             jobId: string,
             audioFileName: string,
             err: unknown,
             fallbackProject?: SubtitleProject,
           ) => {
+            const currentQueueItem = get().batchQueue.find(
+              (q) => q.jobId === jobId,
+            );
+            const wasCancelled =
+              get().queueCancelRequested ||
+              currentQueueItem?.phase === "cancelled" ||
+              isCancellationError(err);
+
+            if (wasCancelled) {
+              const recovered =
+                fallbackProject ??
+                (await deps.loadCheckpoint(jobId).catch(() => null));
+              if (recovered && recovered.cues.length > 0) {
+                syncProjectIntoQueueAndState({
+                  ...recovered,
+                  phase: "cancelled",
+                  errorMessage: null,
+                });
+              }
+              set((s) => ({
+                batchQueue: s.batchQueue.map((q) =>
+                  q.jobId === jobId
+                    ? {
+                        ...q,
+                        phase: "cancelled",
+                        detail: "Cancelled",
+                        errorMessage: null,
+                      }
+                    : q,
+                ),
+                activeProject:
+                  s.activeProject && s.activeProject.jobId === jobId
+                    ? {
+                        ...s.activeProject,
+                        phase: "cancelled",
+                        errorMessage: null,
+                      }
+                    : s.activeProject,
+              }));
+              return;
+            }
+
             const msg = err instanceof Error ? err.message : String(err);
             const recovered =
               fallbackProject ??
-              (await loadCheckpoint(jobId).catch(() => null));
+              (await deps.loadCheckpoint(jobId).catch(() => null));
             if (recovered && recovered.cues.length > 0) {
               syncProjectIntoQueueAndState({
                 ...recovered,
@@ -1578,6 +2248,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             const pendingCloudTasks: Promise<void>[] = [];
 
             for (const item of runnable) {
+              if (get().queueCancelRequested) {
+                break;
+              }
               const currentOptions = { ...get().jobOptions };
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
@@ -1593,11 +2266,23 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               }));
 
               try {
-                const transcribed = await transcribeAudio(
-                  item.audioPath,
-                  currentOptions,
+                const transcribed = attachTopicContext(
+                  await deps.transcribeAudio(
+                    item.audioPath,
+                    currentOptions,
+                    item.jobId,
+                  ),
                   item.jobId,
                 );
+                if (get().queueCancelRequested) {
+                  await handleJobError(
+                    item.jobId,
+                    item.audioFileName,
+                    new Error("Job cancelled"),
+                    transcribed,
+                  );
+                  break;
+                }
                 syncProjectIntoQueueAndState(transcribed);
 
                 const stagePhase = classifyLlmStage(
@@ -1626,8 +2311,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                     try {
                       const finished =
                         stagePhase === "translating"
-                          ? await translateProject(projectForLlm)
-                          : await polishProject(projectForLlm);
+                          ? await deps.translateProject(projectForLlm)
+                          : await deps.polishProject(projectForLlm);
                       syncProjectIntoQueueAndState(finished);
                     } catch (err) {
                       await handleJobError(
@@ -1641,6 +2326,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                 }
               } catch (err) {
                 await handleJobError(item.jobId, item.audioFileName, err);
+                if (get().queueCancelRequested) {
+                  break;
+                }
               }
             }
 
@@ -1655,6 +2343,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             }> = [];
 
             for (const item of runnable) {
+              if (get().queueCancelRequested) {
+                break;
+              }
               const currentOptions = { ...get().jobOptions };
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
@@ -1670,11 +2361,23 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               }));
 
               try {
-                const transcribed = await transcribeAudio(
-                  item.audioPath,
-                  currentOptions,
+                const transcribed = attachTopicContext(
+                  await deps.transcribeAudio(
+                    item.audioPath,
+                    currentOptions,
+                    item.jobId,
+                  ),
                   item.jobId,
                 );
+                if (get().queueCancelRequested) {
+                  await handleJobError(
+                    item.jobId,
+                    item.audioFileName,
+                    new Error("Job cancelled"),
+                    transcribed,
+                  );
+                  break;
+                }
                 const normalizedTranscribed: SubtitleProject = {
                   ...transcribed,
                   options: {
@@ -1689,6 +2392,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                 });
               } catch (err) {
                 await handleJobError(item.jobId, item.audioFileName, err);
+                if (get().queueCancelRequested) {
+                  break;
+                }
               }
             }
 
@@ -1698,18 +2404,23 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               "translating" | "polishing"
             >();
 
-            for (const { project, options: itemOptions } of transcribedEntries) {
-              const stagePhase = classifyLlmStage(project, itemOptions);
-              if (stagePhase) {
-                llmStageByJobId.set(project.jobId, stagePhase);
-                projectsForLlm.push({
-                  ...project,
-                  phase: stagePhase,
-                });
+            if (!get().queueCancelRequested) {
+              for (const {
+                project,
+                options: itemOptions,
+              } of transcribedEntries) {
+                const stagePhase = classifyLlmStage(project, itemOptions);
+                if (stagePhase) {
+                  llmStageByJobId.set(project.jobId, stagePhase);
+                  projectsForLlm.push({
+                    ...project,
+                    phase: stagePhase,
+                  });
+                }
               }
             }
 
-            if (projectsForLlm.length > 0) {
+            if (!get().queueCancelRequested && projectsForLlm.length > 0) {
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) => {
                   const stagePhase = llmStageByJobId.get(q.jobId);
@@ -1724,15 +2435,16 @@ export const useAppStore = create<AppStoreState>((set, get) => {
               }));
 
               try {
-                const finishedProjects = await runLocalLlmBatch(projectsForLlm);
+                const finishedProjects =
+                  await deps.runLocalLlmBatch(projectsForLlm);
                 for (const proj of finishedProjects) {
                   syncProjectIntoQueueAndState(proj);
                 }
               } catch (err) {
                 for (const proj of projectsForLlm) {
-                  const recovered = await loadCheckpoint(proj.jobId).catch(
-                    () => null,
-                  );
+                  const recovered = await deps
+                    .loadCheckpoint(proj.jobId)
+                    .catch(() => null);
                   if (recovered && recovered.phase === "completed") {
                     syncProjectIntoQueueAndState(recovered);
                   } else {
@@ -1748,6 +2460,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             }
           } else {
             for (const item of runnable) {
+              if (get().queueCancelRequested) {
+                break;
+              }
               const currentOptions = { ...get().jobOptions };
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
@@ -1762,69 +2477,204 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                 ),
               }));
 
+              const itemTopic =
+                get().probeResults[item.jobId]?.topic?.trim() ||
+                item.project?.topicContext?.trim() ||
+                null;
+
               try {
-                const project =
-                  mode === "full"
-                    ? await runFullPipeline(
-                        item.audioPath,
-                        currentOptions,
+                if (mode === "full" && itemTopic) {
+                  // Single-file 1-click run with probed/existing topic context:
+                  // transcribe first so `topicContext` is attached on the SubtitleProject
+                  // before invoking LLM translation/polishing (Workstream 5).
+                  const transcribed = attachTopicContext(
+                    await deps.transcribeAudio(
+                      item.audioPath,
+                      currentOptions,
+                      item.jobId,
+                    ),
+                    item.jobId,
+                  );
+                  if (get().queueCancelRequested) {
+                    await handleJobError(
+                      item.jobId,
+                      item.audioFileName,
+                      new Error("Job cancelled"),
+                      transcribed,
+                    );
+                    break;
+                  }
+                  const normalizedTranscribed: SubtitleProject = {
+                    ...transcribed,
+                    options: {
+                      ...currentOptions,
+                      segmentRules: transcribed.options.segmentRules,
+                    },
+                  };
+                  syncProjectIntoQueueAndState(normalizedTranscribed);
+
+                  const stagePhase = classifyLlmStage(
+                    normalizedTranscribed,
+                    currentOptions,
+                  );
+                  if (stagePhase) {
+                    set((s) => ({
+                      batchQueue: s.batchQueue.map((q) =>
+                        q.jobId === item.jobId
+                          ? {
+                              ...q,
+                              phase: stagePhase,
+                              percent: 55,
+                            }
+                          : q,
+                      ),
+                    }));
+
+                    const projectForLlm: SubtitleProject = {
+                      ...normalizedTranscribed,
+                      phase: stagePhase,
+                    };
+                    const finished =
+                      stagePhase === "translating"
+                        ? await deps.translateProject(projectForLlm)
+                        : await deps.polishProject(projectForLlm);
+                    if (get().queueCancelRequested) {
+                      await handleJobError(
                         item.jobId,
-                      )
-                    : await transcribeAudio(
-                        item.audioPath,
-                        currentOptions,
-                        item.jobId,
+                        item.audioFileName,
+                        new Error("Job cancelled"),
+                        finished,
                       );
-                syncProjectIntoQueueAndState(project);
+                      break;
+                    }
+                    syncProjectIntoQueueAndState(finished);
+                  }
+                } else {
+                  const project = attachTopicContext(
+                    mode === "full"
+                      ? await deps.runFullPipeline(
+                          item.audioPath,
+                          currentOptions,
+                          item.jobId,
+                        )
+                      : await deps.transcribeAudio(
+                          item.audioPath,
+                          currentOptions,
+                          item.jobId,
+                        ),
+                    item.jobId,
+                  );
+                  if (get().queueCancelRequested) {
+                    await handleJobError(
+                      item.jobId,
+                      item.audioFileName,
+                      new Error("Job cancelled"),
+                      project,
+                    );
+                    break;
+                  }
+                  syncProjectIntoQueueAndState(project);
+                }
               } catch (err) {
                 await handleJobError(item.jobId, item.audioFileName, err);
+                if (get().queueCancelRequested) {
+                  break;
+                }
               }
             }
           }
 
-          const checkpoints = await listCheckpoints().catch(
-            () => get().checkpoints,
-          );
-          set({ isRunningBatch: false, checkpoints });
+          const rawCheckpoints = await deps
+            .listCheckpoints()
+            .catch(() => get().checkpoints);
+          set({
+            isRunningBatch: false,
+            queueCancelRequested: false,
+            checkpoints: rawCheckpoints.map(seedProjectTranslatedVariants),
+          });
         },
       );
+    },
+
+    stopProcessingQueue: async () => {
+      set({ queueCancelRequested: true });
+      const state = get();
+      const processingIds = state.batchQueue
+        .filter((item) => isProcessingJobPhase(item.phase))
+        .map((item) => item.jobId);
+      const targetIds =
+        processingIds.length > 0
+          ? processingIds
+          : state.activeJobId
+            ? [state.activeJobId]
+            : [];
+      for (const jobId of targetIds) {
+        await get().cancelJobById(jobId);
+      }
+      await preemptActiveProbe();
     },
 
     translateActiveProject: () => {
       const { activeProject, jobOptions } = get();
       if (!activeProject) {
-        return;
+        return Promise.resolve();
       }
-      withOnlineGuard(true, "Translate Project", async () => {
+      return withOnlineGuard(true, "Translate Project", async () => {
+        set({ queueCancelRequested: false });
+        await flushCheckpointAutosave();
+        await preemptActiveProbe();
+        const latestProject = get().activeProject ?? activeProject;
+        const targetStyle = normalizeTranslationStyle(
+          jobOptions.translationStyle ?? latestProject.options.translationStyle,
+        );
+        const topicContext =
+          latestProject.topicContext ??
+          get().probeResults[latestProject.jobId]?.topic ??
+          null;
+        const isSwitchingStyle =
+          latestProject.completedTranslationStyle !== targetStyle;
         const projectWithUpdatedOptions: SubtitleProject = {
-          ...activeProject,
+          ...latestProject,
           options: {
-            ...activeProject.options,
+            ...latestProject.options,
             ...jobOptions,
+            translationStyle: targetStyle,
             targetLanguage:
               jobOptions.targetLanguage === "none"
                 ? "sr"
                 : jobOptions.targetLanguage,
           },
+          completedTranslationBatches: isSwitchingStyle
+            ? 0
+            : latestProject.completedTranslationBatches,
+          topicContext,
           phase: "translating",
         };
         syncProjectIntoQueueAndState(projectWithUpdatedOptions);
         try {
-          const translated = await translateProject(projectWithUpdatedOptions);
+          const translated = await deps.translateProject(
+            projectWithUpdatedOptions,
+          );
           syncProjectIntoQueueAndState(translated);
         } catch (err) {
+          const cancelled =
+            get().queueCancelRequested || isCancellationError(err);
           const msg = err instanceof Error ? err.message : String(err);
           syncProjectIntoQueueAndState({
             ...projectWithUpdatedOptions,
-            phase: "failed",
-            errorMessage: msg,
+            phase: cancelled ? "cancelled" : "failed",
+            errorMessage: cancelled ? null : msg,
           });
-          set({
-            banner: {
-              type: "error",
-              message: msg,
-            },
-          });
+          if (!cancelled) {
+            set({
+              banner: {
+                type: "error",
+                message: msg,
+              },
+            });
+          }
+        } finally {
+          set({ queueCancelRequested: false });
         }
       });
     },
@@ -1832,35 +2682,50 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     polishActiveProject: () => {
       const { activeProject, jobOptions } = get();
       if (!activeProject) {
-        return;
+        return Promise.resolve();
       }
-      withOnlineGuard(true, "Polish Serbian Transcript", async () => {
+      return withOnlineGuard(true, "Polish Serbian Transcript", async () => {
+        set({ queueCancelRequested: false });
+        await flushCheckpointAutosave();
+        await preemptActiveProbe();
+        const latestProject = get().activeProject ?? activeProject;
+        const topicContext =
+          latestProject.topicContext ??
+          get().probeResults[latestProject.jobId]?.topic ??
+          null;
         const projectWithUpdatedOptions: SubtitleProject = {
-          ...activeProject,
+          ...latestProject,
           options: {
-            ...activeProject.options,
+            ...latestProject.options,
             ...jobOptions,
             polishSerbian: true,
           },
+          topicContext,
           phase: "polishing",
         };
         syncProjectIntoQueueAndState(projectWithUpdatedOptions);
         try {
-          const polished = await polishProject(projectWithUpdatedOptions);
+          const polished = await deps.polishProject(projectWithUpdatedOptions);
           syncProjectIntoQueueAndState(polished);
         } catch (err) {
+          const cancelled =
+            get().queueCancelRequested || isCancellationError(err);
           const msg = err instanceof Error ? err.message : String(err);
           syncProjectIntoQueueAndState({
             ...projectWithUpdatedOptions,
-            phase: "failed",
-            errorMessage: msg,
+            phase: cancelled ? "cancelled" : "failed",
+            errorMessage: cancelled ? null : msg,
           });
-          set({
-            banner: {
-              type: "error",
-              message: msg,
-            },
-          });
+          if (!cancelled) {
+            set({
+              banner: {
+                type: "error",
+                message: msg,
+              },
+            });
+          }
+        } finally {
+          set({ queueCancelRequested: false });
         }
       });
     },
@@ -1868,14 +2733,18 @@ export const useAppStore = create<AppStoreState>((set, get) => {
     condenseActiveProjectCps: () => {
       const { activeProject, jobOptions, isRunningBatch } = get();
       if (!activeProject || activeProject.cues.length === 0 || isRunningBatch) {
-        return;
+        return Promise.resolve();
       }
-      withOnlineGuard(true, "Auto-Fit CPS", async () => {
-        pushUndoSnapshot(activeProject.cues);
+      return withOnlineGuard(true, "Auto-Fit CPS", async () => {
+        set({ queueCancelRequested: false });
+        await flushCheckpointAutosave();
+        await preemptActiveProbe();
+        const latestProject = get().activeProject ?? activeProject;
+        pushUndoSnapshot(latestProject.cues);
         const projectWithUpdatedOptions: SubtitleProject = {
-          ...activeProject,
+          ...latestProject,
           options: {
-            ...activeProject.options,
+            ...latestProject.options,
             ...jobOptions,
           },
           phase: "polishing",
@@ -1883,13 +2752,15 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         set({ isRunningBatch: true });
         syncProjectIntoQueueAndState(projectWithUpdatedOptions);
         try {
-          const condensed = await condenseProjectCps(projectWithUpdatedOptions);
-          syncProjectIntoQueueAndState(condensed);
-          const checkpoints = await listCheckpoints().catch(
-            () => get().checkpoints,
+          const condensed = await deps.condenseProjectCps(
+            projectWithUpdatedOptions,
           );
+          syncProjectIntoQueueAndState(condensed);
+          const rawCheckpoints = await deps
+            .listCheckpoints()
+            .catch(() => get().checkpoints);
           set({
-            checkpoints,
+            checkpoints: rawCheckpoints.map(seedProjectTranslatedVariants),
             banner: {
               type: "success",
               message:
@@ -1899,45 +2770,62 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             },
           });
         } catch (err) {
+          const cancelled =
+            get().queueCancelRequested || isCancellationError(err);
           const msg = err instanceof Error ? err.message : String(err);
-          const recovered = await loadCheckpoint(activeProject.jobId).catch(
-            () => null,
-          );
+          const recovered = await deps
+            .loadCheckpoint(latestProject.jobId)
+            .catch(() => null);
           if (recovered && recovered.cues.length > 0) {
             syncProjectIntoQueueAndState({
               ...recovered,
-              phase: "failed",
-              errorMessage: msg,
+              phase: cancelled ? "cancelled" : "failed",
+              errorMessage: cancelled ? null : msg,
             });
           } else {
             syncProjectIntoQueueAndState({
               ...projectWithUpdatedOptions,
-              phase: "failed",
-              errorMessage: msg,
+              phase: cancelled ? "cancelled" : "failed",
+              errorMessage: cancelled ? null : msg,
             });
           }
-          set({
-            banner: {
-              type: "error",
-              message: msg,
-            },
-          });
+          if (!cancelled) {
+            set({
+              banner: {
+                type: "error",
+                message: msg,
+              },
+            });
+          }
         } finally {
-          set({ isRunningBatch: false });
+          set({ isRunningBatch: false, queueCancelRequested: false });
         }
       });
     },
 
     cancelJobById: async (jobId) => {
       try {
-        await cancelJob(jobId);
+        await deps.cancelJob(jobId);
       } finally {
         set((state) => ({
           batchQueue: state.batchQueue.map((item) =>
             item.jobId === jobId
-              ? { ...item, phase: "cancelled", detail: "Cancelled" }
+              ? {
+                  ...item,
+                  phase: "cancelled",
+                  detail: "Cancelled",
+                  errorMessage: null,
+                }
               : item,
           ),
+          activeProject:
+            state.activeProject && state.activeProject.jobId === jobId
+              ? {
+                  ...state.activeProject,
+                  phase: "cancelled",
+                  errorMessage: null,
+                }
+              : state.activeProject,
         }));
       }
     },
@@ -1964,6 +2852,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
       pushUndoSnapshot(activeProject.cues);
       const rules = jobOptions.segmentRules;
+      const activeStyle = normalizeTranslationStyle(
+        activeProject.options.translationStyle ?? jobOptions.translationStyle,
+      );
       const updatedCues = activeProject.cues.map((cue) => {
         if (cue.id !== cueId) {
           return cue;
@@ -1972,17 +2863,31 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           ...cue,
           ...patch,
         };
+        if (patch.translatedText !== undefined) {
+          const nextVariants: Partial<Record<TranslationStyle, string>> = {
+            ...(cue.translatedVariants ?? {}),
+          };
+          if (patch.translatedText.trim().length > 0) {
+            nextVariants[activeStyle] = patch.translatedText;
+          } else {
+            delete nextVariants[activeStyle];
+          }
+          merged.translatedVariants =
+            Object.keys(nextVariants).length > 0 ? nextVariants : undefined;
+        }
         if (merged.endMs <= merged.startMs) {
           merged.endMs = merged.startMs + 500;
         }
         return recalculateCue(merged, rules);
       });
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: updatedCues,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     nudgeCueTime: (cueId, edge, deltaMs) => {
@@ -2026,6 +2931,15 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         ? Math.round(splitMs)
         : Math.round((cue.startMs + cue.endMs) / 2);
       if (cutMs <= cue.startMs || cutMs >= cue.endMs) {
+        return;
+      }
+
+      const { leftEndMs, rightStartMs } = computeSplitBoundaries(
+        cue.startMs,
+        cue.endMs,
+        cutMs,
+      );
+      if (leftEndMs <= cue.startMs || rightStartMs >= cue.endMs) {
         return;
       }
 
@@ -2091,12 +3005,27 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       const [src1, src2] = splitWords(cue.sourceText, true);
       const [tr1, tr2] = splitWords(cue.translatedText, false);
 
+      const variants1: Partial<Record<TranslationStyle, string>> = {};
+      const variants2: Partial<Record<TranslationStyle, string>> = {};
+      if (cue.translatedVariants) {
+        for (const style of ["natural", "formal"] as const) {
+          const variantText = cue.translatedVariants[style];
+          if (variantText && variantText.trim().length > 0) {
+            const [v1, v2] = splitWords(variantText, false);
+            if (v1) variants1[style] = v1;
+            if (v2) variants2[style] = v2;
+          }
+        }
+      }
+
       const firstHalf = recalculateCue(
         {
           ...cue,
-          endMs: cutMs,
+          endMs: leftEndMs,
           sourceText: src1,
           translatedText: tr1,
+          translatedVariants:
+            Object.keys(variants1).length > 0 ? variants1 : undefined,
         },
         jobOptions.segmentRules,
       );
@@ -2104,9 +3033,11 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       const secondHalf = recalculateCue(
         {
           ...cue,
-          startMs: cutMs,
+          startMs: rightStartMs,
           sourceText: src2,
           translatedText: tr2,
+          translatedVariants:
+            Object.keys(variants2).length > 0 ? variants2 : undefined,
         },
         jobOptions.segmentRules,
       );
@@ -2118,11 +3049,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         ...activeProject.cues.slice(idx + 1),
       ].map((item, i) => ({ ...item, id: i + 1 }));
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: nextCues,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
       set({ activeCueId: idx + 2 });
     },
 
@@ -2139,6 +3072,16 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       const current = activeProject.cues[idx];
       const next = activeProject.cues[idx + 1];
 
+      const mergedVariants: Partial<Record<TranslationStyle, string>> = {};
+      for (const style of ["natural", "formal"] as const) {
+        const a = current.translatedVariants?.[style]?.trim() ?? "";
+        const b = next.translatedVariants?.[style]?.trim() ?? "";
+        const joined = [a, b].filter(Boolean).join("\n");
+        if (joined) {
+          mergedVariants[style] = joined;
+        }
+      }
+
       const merged = recalculateCue(
         {
           id: current.id,
@@ -2153,6 +3096,8 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           ]
             .filter(Boolean)
             .join("\n"),
+          translatedVariants:
+            Object.keys(mergedVariants).length > 0 ? mergedVariants : undefined,
           cps: 0,
           warnings: [],
         },
@@ -2165,11 +3110,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         ...activeProject.cues.slice(idx + 2),
       ].map((item, i) => ({ ...item, id: i + 1 }));
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: nextCues,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     deleteCueById: (cueId) => {
@@ -2185,11 +3132,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         .filter((c) => c.id !== cueId)
         .map((item, i) => ({ ...item, id: i + 1 }));
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: nextCues,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     addCueAtEnd: () => {
@@ -2214,11 +3163,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         ...metrics,
       };
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: [...activeProject.cues, newCue],
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     replaceInCues: (options) => {
@@ -2236,6 +3187,9 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         return 0;
       }
 
+      const activeStyle = normalizeTranslationStyle(
+        activeProject.options.translationStyle ?? jobOptions.translationStyle,
+      );
       const escaped = searchText.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
       const checkSource =
         targetColumn === "both" || targetColumn === "source";
@@ -2250,6 +3204,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
           let nextSource = cue.sourceText;
           let nextTranslated = cue.translatedText;
           let cueChanged = false;
+          let translatedChanged = false;
 
           if (checkSource && nextSource) {
             const matches = nextSource.match(globalRegex);
@@ -2269,6 +3224,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
                 () => replaceText,
               );
               cueChanged = true;
+              translatedChanged = true;
             }
           }
 
@@ -2276,11 +3232,25 @@ export const useAppStore = create<AppStoreState>((set, get) => {
             return cue;
           }
 
+          let nextVariants = cue.translatedVariants;
+          if (translatedChanged) {
+            const copy: Partial<Record<TranslationStyle, string>> = {
+              ...(cue.translatedVariants ?? {}),
+            };
+            if (nextTranslated.trim().length > 0) {
+              copy[activeStyle] = nextTranslated;
+            } else {
+              delete copy[activeStyle];
+            }
+            nextVariants = Object.keys(copy).length > 0 ? copy : undefined;
+          }
+
           return recalculateCue(
             {
               ...cue,
               sourceText: nextSource,
               translatedText: nextTranslated,
+              translatedVariants: nextVariants,
             },
             jobOptions.segmentRules,
           );
@@ -2288,11 +3258,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
 
         if (totalReplaced > 0) {
           pushUndoSnapshot(activeProject.cues);
-          syncProjectIntoQueueAndState({
+          const updatedProject: SubtitleProject = {
             ...activeProject,
             cues: nextCues,
             updatedAt: new Date().toISOString(),
-          });
+          };
+          syncProjectIntoQueueAndState(updatedProject);
+          scheduleCheckpointAutosave(updatedProject);
         }
 
         return totalReplaced;
@@ -2329,16 +3301,31 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         }
 
         pushUndoSnapshot(cues);
+        const nextTranslated =
+          !sourceMatches && translatedMatches
+            ? cue.translatedText.replace(singleRegex, () => replaceText)
+            : cue.translatedText;
+        let nextVariants = cue.translatedVariants;
+        if (!sourceMatches && translatedMatches) {
+          const copy: Partial<Record<TranslationStyle, string>> = {
+            ...(cue.translatedVariants ?? {}),
+          };
+          if (nextTranslated.trim().length > 0) {
+            copy[activeStyle] = nextTranslated;
+          } else {
+            delete copy[activeStyle];
+          }
+          nextVariants = Object.keys(copy).length > 0 ? copy : undefined;
+        }
+
         const updatedCue = recalculateCue(
           {
             ...cue,
             sourceText: sourceMatches
               ? cue.sourceText.replace(singleRegex, () => replaceText)
               : cue.sourceText,
-            translatedText:
-              !sourceMatches && translatedMatches
-                ? cue.translatedText.replace(singleRegex, () => replaceText)
-                : cue.translatedText,
+            translatedText: nextTranslated,
+            translatedVariants: nextVariants,
           },
           jobOptions.segmentRules,
         );
@@ -2348,11 +3335,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         );
 
         set({ activeCueId: cue.id });
-        syncProjectIntoQueueAndState({
+        const updatedProject: SubtitleProject = {
           ...activeProject,
           cues: nextCues,
           updatedAt: new Date().toISOString(),
-        });
+        };
+        syncProjectIntoQueueAndState(updatedProject);
+        scheduleCheckpointAutosave(updatedProject);
         return 1;
       }
 
@@ -2378,11 +3367,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         canRedo: nextRedo.length > 0,
       });
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: previousCues,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     redoCueEdit: () => {
@@ -2404,11 +3395,13 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         canRedo: nextRedo.length > 0,
       });
 
-      syncProjectIntoQueueAndState({
+      const updatedProject: SubtitleProject = {
         ...activeProject,
         cues: restoredCues,
         updatedAt: new Date().toISOString(),
-      });
+      };
+      syncProjectIntoQueueAndState(updatedProject);
+      scheduleCheckpointAutosave(updatedProject);
     },
 
     playCueSegment: (cue) => {
@@ -2431,8 +3424,10 @@ export const useAppStore = create<AppStoreState>((set, get) => {
         return null;
       }
       try {
+        await flushCheckpointAutosave();
         await get().updateConfig({ export: options });
-        const result = await exportSubtitles(activeProject, options);
+        const latestProject = get().activeProject ?? activeProject;
+        const result = await deps.exportSubtitles(latestProject, options);
         set({
           banner: {
             type: "success",
@@ -2467,4 +3462,7 @@ export const useAppStore = create<AppStoreState>((set, get) => {
       await get().runExportSubtitles(quickOptions);
     },
   };
-});
+  });
+}
+
+export const useAppStore = createAppStore();

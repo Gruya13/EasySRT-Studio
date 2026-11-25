@@ -10,6 +10,7 @@ import {
   computeSafeCanvasSize,
   computeWheelZoomPct,
   formatRulerTimestamp,
+  resolveTimelineMediaState,
 } from "../timelineUtils.ts";
 
 describe("timelineUtils", () => {
@@ -63,5 +64,136 @@ describe("timelineUtils", () => {
     assert.equal(formatRulerTimestamp(1500), "00:01.5");
     assert.equal(formatRulerTimestamp(65000), "01:05");
     assert.equal(formatRulerTimestamp(3661500), "1:01:01.5");
+  });
+
+  it("resolves timeline media state across empty startup, queued audio, completed project, and standalone SRT/VTT", () => {
+    // 1. Empty startup (nothing loaded)
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: null,
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: false,
+        hasAudioSource: false,
+        audioPath: null,
+        audioFileName: null,
+        isSubtitleOnly: false,
+      },
+    );
+
+    // 2. Queued audio/video file before ASR (both with null activeProject and placeholder cues: [])
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: null,
+        selectedQueueItem: {
+          audioPath: "/media/interview_ep1.webm",
+          audioFileName: "interview_ep1.webm",
+        },
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: true,
+        audioPath: "/media/interview_ep1.webm",
+        audioFileName: "interview_ep1.webm",
+        isSubtitleOnly: false,
+      },
+    );
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "/media/interview_ep1.mp3",
+          audioFileName: "interview_ep1.mp3",
+          cues: [],
+        },
+        selectedQueueItem: {
+          audioPath: "/media/interview_ep1.mp3",
+          audioFileName: "interview_ep1.mp3",
+        },
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: true,
+        audioPath: "/media/interview_ep1.mp3",
+        audioFileName: "interview_ep1.mp3",
+        isSubtitleOnly: false,
+      },
+    );
+
+    // 3. Completed audio + subtitle project
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "C:\\Studio\\Podcast_Ep14.mp4",
+          audioFileName: "Podcast_Ep14.mp4",
+          cues: [
+            {
+              id: 1,
+              startMs: 500,
+              endMs: 3200,
+              sourceText: "Hello world",
+              translatedText: "Zdravo svete",
+              cps: 4.4,
+              warnings: [],
+            },
+          ],
+        },
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: true,
+        audioPath: "C:\\Studio\\Podcast_Ep14.mp4",
+        audioFileName: "Podcast_Ep14.mp4",
+        isSubtitleOnly: false,
+      },
+    );
+
+    // 4. Standalone imported .srt / .vtt without companion audio
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "/subs/movie_subtitles.srt",
+          audioFileName: "movie_subtitles.srt",
+          cues: [
+            {
+              id: 1,
+              startMs: 1000,
+              endMs: 4000,
+              sourceText: "Imported subtitle",
+              translatedText: "",
+              cps: 5.7,
+              warnings: [],
+            },
+          ],
+        },
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: false,
+        audioPath: null,
+        audioFileName: null,
+        isSubtitleOnly: true,
+      },
+    );
+
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "captions.VTT",
+          audioFileName: "captions.VTT",
+          cues: [],
+        },
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: false,
+        audioPath: null,
+        audioFileName: null,
+        isSubtitleOnly: true,
+      },
+    );
   });
 });

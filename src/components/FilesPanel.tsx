@@ -17,6 +17,7 @@ const SUPPORTED_EXTENSIONS = [
   "opus",
   "mp4",
   "mkv",
+  "webm",
   "srt",
   "vtt",
 ];
@@ -69,6 +70,7 @@ export function FilesPanel() {
   const activeJobId = useAppStore((s) => s.activeJobId);
   const activeProject = useAppStore((s) => s.activeProject);
   const isRunningBatch = useAppStore((s) => s.isRunningBatch);
+  const probeResults = useAppStore((s) => s.probeResults);
 
   const enqueueAudioFiles = useAppStore((s) => s.enqueueAudioFiles);
   const importSubtitleFromPath = useAppStore((s) => s.importSubtitleFromPath);
@@ -78,7 +80,7 @@ export function FilesPanel() {
   const reprocessQueueItem = useAppStore((s) => s.reprocessQueueItem);
   const setExportOpen = useAppStore((s) => s.setExportOpen);
   const startBatchPipeline = useAppStore((s) => s.startBatchPipeline);
-  const cancelJobById = useAppStore((s) => s.cancelJobById);
+  const stopProcessingQueue = useAppStore((s) => s.stopProcessingQueue);
 
   const [isDragging, setIsDragging] = useState(false);
   const filePickerRef = useRef<HTMLInputElement | null>(null);
@@ -109,11 +111,6 @@ export function FilesPanel() {
 
   const doneCount = useMemo(
     () => displayRows.filter((r) => r.phase === "completed").length,
-    [displayRows],
-  );
-
-  const runningItem = useMemo(
-    () => displayRows.find((r) => isProcessingPhase(r.phase)) ?? null,
     [displayRows],
   );
 
@@ -252,10 +249,7 @@ export function FilesPanel() {
   };
 
   const handleStopBatch = () => {
-    const targetId = runningItem?.jobId ?? activeJobId;
-    if (targetId) {
-      void cancelJobById(targetId);
-    }
+    void stopProcessingQueue();
   };
 
   const renderStatusIcon = (status: RowVisualStatus) => {
@@ -445,7 +439,7 @@ export function FilesPanel() {
             id="file-picker"
             type="file"
             multiple
-            accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.mp4,.mkv,.srt,.vtt"
+            accept=".mp3,.wav,.m4a,.flac,.ogg,.aac,.opus,.mp4,.mkv,.webm,.srt,.vtt"
             onChange={handleBrowserFileChange}
             hidden
           />
@@ -468,7 +462,7 @@ export function FilesPanel() {
           >
             <span>{t.workspace.dropTitle}</span>
             <span style={{ fontSize: "10.5px", color: "#5f6a7e" }}>
-              MP3, WAV, M4A, FLAC, OGG, MP4, MKV, .SRT, .VTT
+              MP3, WAV, M4A, FLAC, OGG, MP4, MKV, WEBM, .SRT, .VTT
             </span>
           </div>
         ) : (
@@ -477,16 +471,41 @@ export function FilesPanel() {
             const isSelected =
               item.jobId === activeJobId ||
               (!activeJobId && activeProject?.jobId === item.jobId);
+            const probe = probeResults[item.jobId];
             const format = getFileFormatLabel(item.audioFileName);
-            const duration =
+            const effectiveDurationMs =
               item.project && item.project.durationMs > 0
-                ? formatDurationShort(item.project.durationMs)
+                ? item.project.durationMs
+                : (probe?.durationMs ?? 0);
+            const duration =
+              effectiveDurationMs > 0
+                ? formatDurationShort(effectiveDurationMs)
                 : "--:--";
             const cuesCount = item.project?.cues.length ?? null;
             const metaParts = [format, duration];
             if (status === "done" && cuesCount !== null) {
               metaParts.push(`${cuesCount} ${t.queue.cuesCount}`);
             }
+            const probeActive =
+              probe &&
+              (probe.stage === "acoustic" ||
+                probe.stage === "asr" ||
+                probe.stage === "topic");
+            const probeTopic =
+              probe?.topic?.trim() || item.project?.topicContext?.trim() || "";
+            const probeLang =
+              probe?.detectedLanguage?.trim() ||
+              item.project?.detectedLanguage?.trim() ||
+              "";
+            const showProbePills = Boolean(
+              probe &&
+                probe.stage !== "cancelled" &&
+                probe.stage !== "failed" &&
+                (probeActive ||
+                  probe.estimatedSpeakers !== null ||
+                  probeLang ||
+                  probeTopic),
+            );
 
             return (
               <div
@@ -510,6 +529,38 @@ export function FilesPanel() {
                     <div className="file-meta-line">
                       {metaParts.join(" • ")}
                     </div>
+
+                    {showProbePills && (
+                      <div className="file-probe-pills">
+                        {probe?.estimatedSpeakers !== null &&
+                          probe?.estimatedSpeakers !== undefined &&
+                          probe.estimatedSpeakers > 0 && (
+                            <span className="file-probe-pill speakers">
+                              {probe.estimatedSpeakers === 1
+                                ? t.probe.oneSpeaker
+                                : `${probe.estimatedSpeakers} ${t.probe.speakers}`}
+                            </span>
+                          )}
+                        {probeLang && (
+                          <span className="file-probe-pill lang">
+                            {probeLang.toUpperCase()}
+                          </span>
+                        )}
+                        {probeTopic && (
+                          <span
+                            className="file-probe-pill topic"
+                            title={`${t.probe.topicLabel}: ${probeTopic}`}
+                          >
+                            {probeTopic}
+                          </span>
+                        )}
+                        {probeActive && (
+                          <span className="file-probe-pill analyzing">
+                            {t.probe.analyzing}
+                          </span>
+                        )}
+                      </div>
+                    )}
 
                     {status === "processing" && (
                       <div className="file-inline-progress">

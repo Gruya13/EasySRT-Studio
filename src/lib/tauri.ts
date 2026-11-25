@@ -4,7 +4,6 @@ import { open } from "@tauri-apps/plugin-dialog";
 import type {
   ApiKeyStatus,
   AppConfig,
-  AudioPreviewData,
   BugReportRequest,
   CatalogItemKind,
   CatalogManifest,
@@ -17,6 +16,7 @@ import type {
   InstalledComponentStatus,
   JobOptions,
   JobProgressEvent,
+  MediaProbeResult,
   ReportSubmitResult,
   SegmentRules,
   SerbianScript,
@@ -24,12 +24,14 @@ import type {
   SubtitleCue,
   SubtitleProject,
   TranslationProviderKind,
-} from "../types/models";
-import { browserFallback } from "./browserFallback";
-import { isTauriRuntime } from "./subtitleUtils";
+  WaveformPreviewData,
+} from "../types/models.ts";
+import { browserFallback } from "./browserFallback.ts";
+import { isTauriRuntime } from "./subtitleUtils.ts";
 
 export const DOWNLOAD_PROGRESS_EVENT = "download-progress" as const;
 export const JOB_PROGRESS_EVENT = "job-progress" as const;
+export const PROBE_PROGRESS_EVENT = "probe-progress" as const;
 
 // ---------------------------------------------------------------------------
 // Setup & Catalog Commands
@@ -154,6 +156,13 @@ export function loadCheckpoint(jobId: string): Promise<SubtitleProject> {
     return browserFallback.loadCheckpoint(jobId);
   }
   return invoke<SubtitleProject>("load_checkpoint", { jobId });
+}
+
+export function saveProjectCheckpoint(project: SubtitleProject): Promise<void> {
+  if (!isTauriRuntime()) {
+    return browserFallback.saveProjectCheckpoint(project);
+  }
+  return invoke<void>("save_project_checkpoint", { project });
 }
 
 export function deleteCheckpoint(jobId: string): Promise<void> {
@@ -300,13 +309,34 @@ export function exportSubtitles(
   return invoke<ExportResult>("export_subtitles", { project, options });
 }
 
-export function readAudioPreviewBase64(
+export function prepareAudioWaveform(
   audioPath: string,
-): Promise<AudioPreviewData> {
+  targetBuckets?: number,
+): Promise<WaveformPreviewData> {
   if (!isTauriRuntime()) {
-    return browserFallback.readAudioPreviewBase64(audioPath);
+    return browserFallback.prepareAudioWaveform(audioPath, targetBuckets);
   }
-  return invoke<AudioPreviewData>("read_audio_preview_base64", { audioPath });
+  return invoke<WaveformPreviewData>("prepare_audio_waveform", {
+    audioPath,
+    targetBuckets: targetBuckets ?? null,
+  });
+}
+
+export function probeMediaFile(
+  jobId: string,
+  audioPath: string,
+): Promise<MediaProbeResult> {
+  if (!isTauriRuntime()) {
+    return browserFallback.probeMediaFile(jobId, audioPath);
+  }
+  return invoke<MediaProbeResult>("probe_media_file", { jobId, audioPath });
+}
+
+export function cancelMediaProbe(jobId?: string | null): Promise<boolean> {
+  if (!isTauriRuntime()) {
+    return browserFallback.cancelMediaProbe(jobId);
+  }
+  return invoke<boolean>("cancel_media_probe", { jobId: jobId ?? null });
 }
 
 export async function setWindowMaximized(
@@ -400,6 +430,17 @@ export function onJobProgress(
     return browserFallback.onJobProgress(handler);
   }
   return listen<JobProgressEvent>(JOB_PROGRESS_EVENT, (event) => {
+    handler(event.payload);
+  });
+}
+
+export function onProbeProgress(
+  handler: (event: MediaProbeResult) => void,
+): Promise<UnlistenFn> {
+  if (!isTauriRuntime()) {
+    return browserFallback.onProbeProgress(handler);
+  }
+  return listen<MediaProbeResult>(PROBE_PROGRESS_EVENT, (event) => {
     handler(event.payload);
   });
 }

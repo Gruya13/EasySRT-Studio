@@ -65,7 +65,7 @@
   },
   "workspace": {
     "dropTitle": "Drag & drop audio or .SRT / .VTT files here or click to browse",
-    "dropSubtitle": "Supported formats: MP3, WAV, M4A, FLAC, OGG, AAC, OPUS + direct .SRT / .VTT subtitle import",
+    "dropSubtitle": "Supported formats: MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, MP4, MKV, WEBM + direct .SRT / .VTT subtitle import",
     "selectFilesBtn": "Select Audio Files",
     "importSubtitleBtn": "Import .SRT / .VTT",
     "addDemoSampleBtn": "Load Demo Project",
@@ -87,6 +87,8 @@
     "polishSerbianHint": "Fixes grammar, punctuation, and speech recognition artifacts",
     "correctSourceAsr": "Correct Source ASR",
     "correctSourceAsrHint": "Fixes speech-to-text errors in source transcript during translation",
+    "removeFillers": "Remove spoken filler words",
+    "removeFillersHint": "Omits pure conversational disfluencies (um, uh, like, you know, znači, ovaj)",
     "splitOnSpeakerChange": "Split cue on speaker change",
     "splitOnSpeakerChangeHint": "Automatically starts a new subtitle cue when a different speaker begins talking",
     "translationStyle": "Serbian Translation Style",
@@ -193,8 +195,8 @@
       "critical_cps": "Critical CPS (too fast)",
       "line_too_long": "Line exceeds max characters",
       "too_many_lines": "Too many lines",
-      "short_duration": "Duration too short",
-      "long_duration": "Duration too long"
+      "duration_too_short": "Duration too short",
+      "duration_too_long": "Duration too long"
     },
     "statsTotal": "Total cues",
     "statsWarnings": "Warnings",
@@ -273,6 +275,14 @@
     "defaultScriptLabel": "Default Serbian Script",
     "autoSendCrashReports": "Auto-send crash diagnostics",
     "autoSendCrashReportsHint": "Sends sanitized crash reports (no API keys or subtitle text)",
+    "autoProbeOnImport": "Auto-analyze media on import",
+    "autoProbeOnImportHint": "Detects duration, speakers, language, and topic in the background",
+    "autoCheckpoints": "Auto checkpoints",
+    "notInstalledTag": "Not installed",
+    "memorySessionBannerTitle": "OS Keyring unavailable — key is stored in RAM for this session only",
+    "memorySessionBannerHint": "Your API key stays in memory and clears on exit unless you opt in to local encrypted vault persistence below.",
+    "allowLocalVault": "Allow local encrypted vault persistence",
+    "allowLocalVaultHint": "Explicit opt-in fallback when OS Keyring is unavailable (DPAPI / 0600 encrypted vault)",
     "bugReportRowLabel": "Bug Report & Diagnostics",
     "bugReportRowBtn": "Report Bug",
     "saveSettings": "Save Settings",
@@ -352,5 +362,29 @@
     "saveLocalBtn": "Save Diagnostics Locally",
     "savingLocal": "Saving diagnostics...",
     "localSavedPrefix": "Diagnostics saved:"
+  },
+  "editor": {
+    "originalTitle": "Original transcript",
+    "translationTitle": "Translation",
+    "styleNaturalShort": "Natural",
+    "styleFormalShort": "Formal",
+    "styleFormalNotGenerated": "Formal translation not generated yet — click Translate",
+    "styleNaturalNotGenerated": "Natural translation not generated yet — click Translate",
+    "fontSizeDecrease": "Decrease font size",
+    "fontSizeIncrease": "Increase font size",
+    "fontSizeHint": "Font size (Ctrl + scroll)",
+    "noCueSelected": "No cue selected",
+    "selectOrAddCue": "Select or add a subtitle cue...",
+    "saved": "Saved",
+    "savedCheck": "✓ Saved",
+    "unsaved": "Unsaved",
+    "revert": "Revert",
+    "saveEdit": "Save edit"
+  },
+  "probe": {
+    "analyzing": "Analyzing...",
+    "oneSpeaker": "1 speaker",
+    "speakers": "speakers",
+    "topicLabel": "Topic"
   }
 }

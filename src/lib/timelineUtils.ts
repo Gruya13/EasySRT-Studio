@@ -1,6 +1,92 @@
+import type { SubtitleProject } from "../types/models.ts";
+
 export const MIN_TIMELINE_ZOOM_PCT = 100;
 export const MAX_TIMELINE_ZOOM_PCT = 2000;
 export const MAX_CANVAS_BACKING_WIDTH = 16384;
+
+export interface TimelineMediaState {
+  hasLoadedProjectOrFile: boolean;
+  hasAudioSource: boolean;
+  audioPath: string | null;
+  audioFileName: string | null;
+  isSubtitleOnly: boolean;
+}
+
+export function isSubtitleOnlyPath(path?: string | null): boolean {
+  const trimmed = (path ?? "").trim();
+  return trimmed.length > 0 && /\.(srt|vtt)$/i.test(trimmed);
+}
+
+function extractFileName(path: string): string {
+  const parts = path.split(/[\\/]/);
+  return parts[parts.length - 1] || path;
+}
+
+/**
+ * Pure media-presence resolver for `WaveformTimeline` (Workstream 6).
+ * Distinguishes:
+ * 1. Empty startup (`activeProject === null && selectedQueueItem === null`)
+ * 2. Queued audio/video file before transcription
+ * 3. Completed audio+subtitle project
+ * 4. Standalone imported `.srt` / `.vtt` file without companion audio
+ */
+export function resolveTimelineMediaState(input: {
+  activeProject: Pick<
+    SubtitleProject,
+    "audioPath" | "audioFileName" | "cues"
+  > | null;
+  selectedQueueItem: {
+    audioPath: string;
+    audioFileName: string;
+  } | null;
+}): TimelineMediaState {
+  const { activeProject, selectedQueueItem } = input;
+  const hasLoadedProjectOrFile = Boolean(activeProject || selectedQueueItem);
+
+  if (!hasLoadedProjectOrFile) {
+    return {
+      hasLoadedProjectOrFile: false,
+      hasAudioSource: false,
+      audioPath: null,
+      audioFileName: null,
+      isSubtitleOnly: false,
+    };
+  }
+
+  const rawPath = (
+    activeProject?.audioPath?.trim() ||
+    selectedQueueItem?.audioPath?.trim() ||
+    ""
+  ).trim();
+  const rawName = (
+    activeProject?.audioFileName?.trim() ||
+    selectedQueueItem?.audioFileName?.trim() ||
+    ""
+  ).trim();
+
+  const subtitleOnly =
+    !rawPath ||
+    isSubtitleOnlyPath(rawPath) ||
+    (!rawPath && isSubtitleOnlyPath(rawName));
+
+  if (subtitleOnly) {
+    return {
+      hasLoadedProjectOrFile: true,
+      hasAudioSource: false,
+      audioPath: null,
+      audioFileName: null,
+      isSubtitleOnly: true,
+    };
+  }
+
+  return {
+    hasLoadedProjectOrFile: true,
+    hasAudioSource: true,
+    audioPath: rawPath,
+    audioFileName: rawName || extractFileName(rawPath),
+    isSubtitleOnly: false,
+  };
+}
 
 /** Compute next timeline zoom percentage from a mouse wheel `deltaY` scroll direction. */
 export function computeWheelZoomPct(

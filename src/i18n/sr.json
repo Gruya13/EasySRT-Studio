@@ -65,7 +65,7 @@
   },
   "workspace": {
     "dropTitle": "Prevucite audio ili .SRT / .VTT fajlove ovde ili kliknite za izbor",
-    "dropSubtitle": "Podržani formati: MP3, WAV, M4A, FLAC, OGG, AAC, OPUS + direktan uvoz .SRT / .VTT titlova",
+    "dropSubtitle": "Podržani formati: MP3, WAV, M4A, FLAC, OGG, AAC, OPUS, MP4, MKV, WEBM + direktan uvoz .SRT / .VTT titlova",
     "selectFilesBtn": "Izaberi audio fajlove",
     "importSubtitleBtn": "Uvezi .SRT / .VTT",
     "addDemoSampleBtn": "Učitaj demo projekat",
@@ -87,6 +87,8 @@
     "polishSerbianHint": "Ispravlja padeže, interpunkciju i greške prepoznavanja govora",
     "correctSourceAsr": "Ispravi izvorni ASR",
     "correctSourceAsrHint": "Popravlja greške prepoznavanja u izvornom transkriptu tokom prevoda",
+    "removeFillers": "Izbaci govorne poštapalice",
+    "removeFillersHint": "Uklanja čiste govorne poštapalice (znači, ovaj, um, uh, like, you know)",
     "splitOnSpeakerChange": "Podeli titl na promenu govornika",
     "splitOnSpeakerChangeHint": "Automatski započinje novi titl kada progovori drugi sagovornik",
     "translationStyle": "Stil prevoda na srpski",
@@ -193,8 +195,8 @@
       "critical_cps": "Prebrz titl (CPS kritičan)",
       "line_too_long": "Predugačak red",
       "too_many_lines": "Previše redova",
-      "short_duration": "Prekratko trajanje",
-      "long_duration": "Predugo trajanje"
+      "duration_too_short": "Prekratko trajanje",
+      "duration_too_long": "Predugo trajanje"
     },
     "statsTotal": "Ukupno titlova",
     "statsWarnings": "Upozorenja",
@@ -273,6 +275,14 @@
     "defaultScriptLabel": "Podrazumevano srpsko pismo",
     "autoSendCrashReports": "Automatsko slanje crash dijagnostike",
     "autoSendCrashReportsHint": "Šalje anonimizovan izveštaj o padu (bez API ključeva i titlova)",
+    "autoProbeOnImport": "Automatska analiza medija pri uvozu",
+    "autoProbeOnImportHint": "Detektuje trajanje, broj govornika, jezik i temu u pozadini",
+    "autoCheckpoints": "Automatski checkpoint-i",
+    "notInstalledTag": "Nije instaliran",
+    "memorySessionBannerTitle": "Sistemski Keyring nije dostupan — ključ se čuva samo u RAM memoriji za ovu sesiju",
+    "memorySessionBannerHint": "API ključ ostaje u memoriji i briše se pri izlasku osim ako ispod ne omogućite lokalno šifrovano čuvanje.",
+    "allowLocalVault": "Dozvoli lokalno šifrovano čuvanje ključeva",
+    "allowLocalVaultHint": "Eksplicitna zamena kada sistemski Keyring nije dostupan (DPAPI / 0600 šifrovano skladište)",
     "bugReportRowLabel": "Prijava greške i dijagnostika",
     "bugReportRowBtn": "Prijavi bug",
     "saveSettings": "Sačuvaj podešavanja",
@@ -352,5 +362,29 @@
     "saveLocalBtn": "Sačuvaj dijagnostiku lokalno",
     "savingLocal": "Čuvanje dijagnostike...",
     "localSavedPrefix": "Dijagnostika sačuvana:"
+  },
+  "editor": {
+    "originalTitle": "Izvorni transkript",
+    "translationTitle": "Prevod",
+    "styleNaturalShort": "Govorni",
+    "styleFormalShort": "Formalni",
+    "styleFormalNotGenerated": "Formalni prevod još nije generisan — kliknite Prevedi",
+    "styleNaturalNotGenerated": "Govorni prevod još nije generisan — kliknite Prevedi",
+    "fontSizeDecrease": "Umanji veličinu fonta",
+    "fontSizeIncrease": "Uvećaj veličinu fonta",
+    "fontSizeHint": "Veličina fonta (Ctrl + točkić)",
+    "noCueSelected": "Nema aktivnog titla",
+    "selectOrAddCue": "Izaberite ili dodajte titl na timeline-u...",
+    "saved": "Sačuvano",
+    "savedCheck": "✓ Sačuvano",
+    "unsaved": "Nesačuvano",
+    "revert": "Poništi",
+    "saveEdit": "Sačuvaj izmenu"
+  },
+  "probe": {
+    "analyzing": "Analiza...",
+    "oneSpeaker": "1 govornik",
+    "speakers": "govornika",
+    "topicLabel": "Tema"
   }
 }

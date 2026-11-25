@@ -115,6 +115,7 @@ export function SettingsPanel() {
   const isRunningBatch = useAppStore((s) => s.isRunningBatch);
 
   const setJobOptions = useAppStore((s) => s.setJobOptions);
+  const switchTranslationStyle = useAppStore((s) => s.switchTranslationStyle);
   const setEffectiveProvider = useAppStore((s) => s.setEffectiveProvider);
   const setSegmentPreset = useAppStore((s) => s.setSegmentPreset);
   const updateSegmentRules = useAppStore((s) => s.updateSegmentRules);
@@ -161,7 +162,6 @@ export function SettingsPanel() {
   const [exportDirDraft, setExportDirDraft] = useState(
     config.export.outputDir ?? "",
   );
-  const [autoCheckpoints, setAutoCheckpoints] = useState(true);
   const [selectedCheckpointId, setSelectedCheckpointId] = useState<string>(
     checkpoints[0]?.jobId ?? "",
   );
@@ -262,6 +262,15 @@ export function SettingsPanel() {
   const catalogLlmModels = useMemo(
     () => (catalog?.items ?? []).filter((i) => i.kind === "llmModel"),
     [catalog],
+  );
+  const installedComponentIds = useMemo(
+    () =>
+      new Set(
+        (setupStatus?.components ?? [])
+          .filter((c) => c.installed)
+          .map((c) => c.id),
+      ),
+    [setupStatus],
   );
   const customWhisperModels = useMemo(
     () => config.customModels.filter((m) => m.kind === "whisperModel"),
@@ -624,9 +633,7 @@ export function SettingsPanel() {
                     data-translation-style="natural"
                     aria-pressed={effectiveTranslationStyle === "natural"}
                     title={t.workspace.translationStyleNaturalHint}
-                    onClick={() =>
-                      setJobOptions({ translationStyle: "natural" })
-                    }
+                    onClick={() => switchTranslationStyle("natural")}
                   >
                     {t.workspace.translationStyleNatural}
                   </button>
@@ -640,9 +647,7 @@ export function SettingsPanel() {
                     data-translation-style="formal"
                     aria-pressed={effectiveTranslationStyle === "formal"}
                     title={t.workspace.translationStyleFormalHint}
-                    onClick={() =>
-                      setJobOptions({ translationStyle: "formal" })
-                    }
+                    onClick={() => switchTranslationStyle("formal")}
                   >
                     {t.workspace.translationStyleFormal}
                   </button>
@@ -714,6 +719,27 @@ export function SettingsPanel() {
                 checked={Boolean(jobOptions.correctSourceAsr)}
                 onChange={(e) =>
                   setJobOptions({ correctSourceAsr: e.target.checked })
+                }
+                hidden
+              />
+              <span className="s-switch" aria-hidden="true" />
+            </label>
+
+            <label className="s-toggle-card">
+              <span className="s-toggle-meta">
+                <span className="s-toggle-title">
+                  {t.workspace.removeFillers}
+                </span>
+                <span className="s-toggle-hint">
+                  {t.workspace.removeFillersHint}
+                </span>
+              </span>
+              <input
+                id="s-remove-fillers"
+                type="checkbox"
+                checked={jobOptions.removeFillers !== false}
+                onChange={(e) =>
+                  setJobOptions({ removeFillers: e.target.checked })
                 }
                 hidden
               />
@@ -1014,11 +1040,22 @@ export function SettingsPanel() {
                       <option value="">
                         {t.settings.autoSelectRecommended}
                       </option>
-                      {catalogWhisperModels.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.name} ({formatBytes(m.sizeBytes)})
-                        </option>
-                      ))}
+                      {catalogWhisperModels.map((m) => {
+                        const isInstalled =
+                          !setupStatus || installedComponentIds.has(m.id);
+                        return (
+                          <option
+                            key={m.id}
+                            value={m.id}
+                            disabled={!isInstalled}
+                          >
+                            {m.name} ({formatBytes(m.sizeBytes)})
+                            {!isInstalled
+                              ? ` — ${t.settings.notInstalledTag}`
+                              : ""}
+                          </option>
+                        );
+                      })}
                       {customWhisperModels.map((m) => (
                         <option key={m.id} value={m.id}>
                           [Custom] {m.name}
@@ -1044,11 +1081,22 @@ export function SettingsPanel() {
                       <option value="">
                         {t.settings.autoSelectRecommended}
                       </option>
-                      {catalogLlmModels.map((m) => (
-                        <option key={m.id} value={m.id}>
-                          {m.name} ({formatBytes(m.sizeBytes)})
-                        </option>
-                      ))}
+                      {catalogLlmModels.map((m) => {
+                        const isInstalled =
+                          !setupStatus || installedComponentIds.has(m.id);
+                        return (
+                          <option
+                            key={m.id}
+                            value={m.id}
+                            disabled={!isInstalled}
+                          >
+                            {m.name} ({formatBytes(m.sizeBytes)})
+                            {!isInstalled
+                              ? ` — ${t.settings.notInstalledTag}`
+                              : ""}
+                          </option>
+                        );
+                      })}
                       {customLlmModels.map((m) => (
                         <option key={m.id} value={m.id}>
                           [Custom] {m.name}
@@ -1325,6 +1373,47 @@ export function SettingsPanel() {
                     />
                   </div>
                 </div>
+
+                {apiKeyStatus.storageBackend === "memory-session" && (
+                  <div
+                    id="s-keyring-session-banner"
+                    className="s-keyring-banner"
+                    role="status"
+                  >
+                    <div className="s-keyring-banner-title">
+                      {t.settings.memorySessionBannerTitle}
+                    </div>
+                    <div className="s-keyring-banner-hint">
+                      {t.settings.memorySessionBannerHint}
+                    </div>
+                  </div>
+                )}
+
+                {(apiKeyStatus.storageBackend !== "keyring" ||
+                  Boolean(config.allowLocalEncryptedVault)) && (
+                  <label className="s-toggle-card">
+                    <span className="s-toggle-meta">
+                      <span className="s-toggle-title">
+                        {t.settings.allowLocalVault}
+                      </span>
+                      <span className="s-toggle-hint">
+                        {t.settings.allowLocalVaultHint}
+                      </span>
+                    </span>
+                    <input
+                      id="s-allow-local-vault"
+                      type="checkbox"
+                      checked={Boolean(config.allowLocalEncryptedVault)}
+                      onChange={(e) =>
+                        void updateConfig({
+                          allowLocalEncryptedVault: e.target.checked,
+                        })
+                      }
+                      hidden
+                    />
+                    <span className="s-switch" aria-hidden="true" />
+                  </label>
+                )}
               </>
             )}
           </div>
@@ -1607,22 +1696,45 @@ export function SettingsPanel() {
                 <label className="s-toggle-card">
                   <span className="s-toggle-meta">
                     <span className="s-toggle-title">
-                      {lang === "en"
-                        ? "Auto checkpoints"
-                        : "Automatski checkpoint-i"}
+                      {t.settings.autoCheckpoints}
                     </span>
                   </span>
                   <input
                     id="s-auto-cp"
                     type="checkbox"
-                    checked={autoCheckpoints}
-                    onChange={(e) => setAutoCheckpoints(e.target.checked)}
+                    checked={config.autoCheckpoints !== false}
+                    onChange={(e) =>
+                      void updateConfig({ autoCheckpoints: e.target.checked })
+                    }
                     hidden
                   />
                   <span className="s-switch" aria-hidden="true" />
                 </label>
               </div>
             </div>
+
+            <label className="s-toggle-card">
+              <span className="s-toggle-meta">
+                <span className="s-toggle-title">
+                  {t.settings.autoProbeOnImport}
+                </span>
+                <span className="s-toggle-hint">
+                  {t.settings.autoProbeOnImportHint}
+                </span>
+              </span>
+              <input
+                id="s-auto-probe"
+                type="checkbox"
+                checked={config.autoProbeOnImport !== false}
+                onChange={(e) =>
+                  void updateConfig({
+                    autoProbeOnImport: e.target.checked,
+                  })
+                }
+                hidden
+              />
+              <span className="s-switch" aria-hidden="true" />
+            </label>
 
             {checkpoints.length > 0 && (
               <div className="s-action-row">
