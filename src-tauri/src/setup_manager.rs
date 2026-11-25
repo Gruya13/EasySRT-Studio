@@ -11,6 +11,7 @@ use crate::storage;
 use anyhow::{anyhow, Context, Result};
 use futures_util::StreamExt;
 use sha2::{Digest, Sha256};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -21,6 +22,81 @@ use uuid::Uuid;
 
 const EMBEDDED_CATALOG_JSON: &str = include_str!("../resources/catalog.json");
 const CUDA_RUNTIME_DLLS: &[&str] = &["cublas64_12.dll", "cublasLt64_12.dll", "cudart64_12.dll"];
+
+const ALLOWED_CATALOG_HOSTS: &[&str] = &[
+    "github.com",
+    "objects.githubusercontent.com",
+    "huggingface.co",
+    "cdn-lfs.huggingface.co",
+    "cas-bridge.xethub.hf.co",
+];
+
+const MAX_ARCHIVE_FILES: usize = 2_000;
+const MAX_ARCHIVE_BYTES: u64 = 4 * 1024 * 1024 * 1024; // 4 GiB
+const DOWNLOAD_CHUNK_STALL_TIMEOUT: Duration = Duration::from_secs(45);
+const ABSOLUTE_MAX_DOWNLOAD_BYTES: u64 = 10 * 1024 * 1024 * 1024; // 10 GiB
+const DOWNLOAD_SIZE_MARGIN_BYTES: u64 = 64 * 1024 * 1024; // 64 MiB
+const CUDA_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Validate that a catalog item's `sha256` field is present and is a valid 64-character hex digest.
+pub fn validate_sha256_hex(sha256: Option<&str>) -> Result<String> {
+    let raw = sha256
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| anyhow!("Catalog item is missing required SHA-256 checksum"))?;
+    if raw.len() != 64 || !raw.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(anyhow!(
+            "Invalid SHA-256 checksum '{}': expected 64 hexadecimal characters",
+            raw
+        ));
+    }
+    Ok(raw.to_ascii_lowercase())
+}
+
+fn is_allowed_redirect_host(host: &str) -> bool {
+    ALLOWED_CATALOG_HOSTS.contains(&host)
+        || host.ends_with(".githubusercontent.com")
+        || host.ends_with(".huggingface.co")
+        || host.ends_with(".hf.co")
+}
+
+/// Validate that a catalog download URL uses `https://`, contains no embedded credentials,
+/// and targets an explicitly allowlisted download host.
+pub fn validate_catalog_download_url(raw_url: &str) -> Result<reqwest::Url> {
+    let parsed = reqwest::Url::parse(raw_url.trim())
+        .with_context(|| format!("Invalid catalog download URL: '{}'", raw_url))?;
+    if parsed.scheme() != "https" {
+        return Err(anyhow!(
+            "Catalog download URL must use https:// (got '{}')",
+            parsed.scheme()
+        ));
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err(anyhow!(
+            "Catalog download URL must not contain embedded credentials"
+        ));
+    }
+    let host = parsed
+        .host_str()
+        .map(|h| h.to_ascii_lowercase())
+        .ok_or_else(|| anyhow!("Catalog download URL is missing a hostname"))?;
+    if !ALLOWED_CATALOG_HOSTS.contains(&host.as_str()) {
+        return Err(anyhow!(
+            "Catalog download host '{}' is not in the allowed hosts list",
+            host
+        ));
+    }
+    Ok(parsed)
+}
+
+/// Validate both the download URL allowlist and mandatory 64-hex SHA-256 digest of a catalog item.
+pub fn validate_catalog_item_for_download(item: &CatalogItem) -> Result<(reqwest::Url, String)> {
+    let url = validate_catalog_download_url(&item.url)
+        .with_context(|| format!("Rejected catalog item '{}'", item.id))?;
+    let sha256 = validate_sha256_hex(item.sha256.as_deref())
+        .with_context(|| format!("Rejected catalog item '{}'", item.id))?;
+    Ok((url, sha256))
+}
 
 /// Return the platform identifier matching `CatalogItem.platform`.
 pub fn current_platform_tag() -> &'static str {
@@ -41,34 +117,43 @@ pub fn load_embedded_catalog() -> Result<CatalogManifest> {
     Ok(manifest)
 }
 
-/// Load catalog from an explicit list of directories or executable siblings, falling back
-/// to the compile-time embedded `catalog.json`.
+/// Load catalog from compile-time embedded `catalog.json` in release builds, or check explicit
+/// directories / executable siblings first in debug builds before falling back to embedded.
 pub fn load_catalog_from_dirs(resource_dir: Option<&Path>) -> Result<CatalogManifest> {
-    let mut candidates: Vec<PathBuf> = Vec::new();
-    if let Some(res_dir) = resource_dir {
-        candidates.push(res_dir.join("resources").join("catalog.json"));
-        candidates.push(res_dir.join("catalog.json"));
-    }
-    if let Ok(exe_path) = std::env::current_exe() {
-        if let Some(exe_dir) = exe_path.parent() {
-            candidates.push(exe_dir.join("resources").join("catalog.json"));
-            candidates.push(exe_dir.join("catalog.json"));
-        }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = resource_dir;
+        load_embedded_catalog()
     }
 
-    for candidate in candidates {
-        if candidate.is_file() {
-            if let Ok(raw) = fs::read_to_string(&candidate) {
-                if let Ok(manifest) = serde_json::from_str::<CatalogManifest>(&raw) {
-                    if !manifest.items.is_empty() {
-                        return Ok(manifest);
+    #[cfg(debug_assertions)]
+    {
+        let mut candidates: Vec<PathBuf> = Vec::new();
+        if let Some(res_dir) = resource_dir {
+            candidates.push(res_dir.join("resources").join("catalog.json"));
+            candidates.push(res_dir.join("catalog.json"));
+        }
+        if let Ok(exe_path) = std::env::current_exe() {
+            if let Some(exe_dir) = exe_path.parent() {
+                candidates.push(exe_dir.join("resources").join("catalog.json"));
+                candidates.push(exe_dir.join("catalog.json"));
+            }
+        }
+
+        for candidate in candidates {
+            if candidate.is_file() {
+                if let Ok(raw) = fs::read_to_string(&candidate) {
+                    if let Ok(manifest) = serde_json::from_str::<CatalogManifest>(&raw) {
+                        if !manifest.items.is_empty() {
+                            return Ok(manifest);
+                        }
                     }
                 }
             }
         }
-    }
 
-    load_embedded_catalog()
+        load_embedded_catalog()
+    }
 }
 
 /// Load the component catalog, checking `<resource_dir>/resources/catalog.json` first if overridden
@@ -534,9 +619,9 @@ pub fn compute_file_sha256(path: &Path) -> Result<String> {
     Ok(hex::encode(hasher.finalize()))
 }
 
-/// Verify a file's SHA-256 matches `expected_hex` (case-insensitive).
+/// Verify a file's SHA-256 matches `expected_hex` (case-insensitive, mandatory 64 hex chars).
 pub fn verify_file_sha256(path: &Path, expected_hex: &str) -> Result<()> {
-    let expected = expected_hex.trim().to_ascii_lowercase();
+    let expected = validate_sha256_hex(Some(expected_hex))?;
     let actual = compute_file_sha256(path)?;
     if actual != expected {
         return Err(anyhow!(
@@ -565,8 +650,52 @@ fn set_executable_permission(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Extract a `.zip` archive safely into `target_dir` (guarding against zip-slip).
-pub fn extract_zip_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+fn sanitize_archive_rel_path(raw: &Path, label: &str) -> Result<Option<PathBuf>> {
+    use std::path::Component;
+
+    let mut clean = PathBuf::new();
+    for comp in raw.components() {
+        match comp {
+            Component::Normal(part) => clean.push(part),
+            Component::CurDir => {}
+            Component::ParentDir | Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!(
+                    "{label} archive contains unsafe path traversal entry: {}",
+                    raw.display()
+                ));
+            }
+        }
+    }
+
+    if clean.as_os_str().is_empty() {
+        Ok(None)
+    } else {
+        Ok(Some(clean))
+    }
+}
+
+fn ensure_no_symlink_components_under(root: &Path, rel: &Path) -> Result<()> {
+    let mut cursor = root.to_path_buf();
+    for comp in rel.components() {
+        cursor.push(comp);
+        if let Ok(meta) = fs::symlink_metadata(&cursor) {
+            if meta.file_type().is_symlink() {
+                return Err(anyhow!(
+                    "Refusing to extract through symlink component: {}",
+                    cursor.display()
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn extract_zip_archive_with_limits(
+    archive_path: &Path,
+    target_dir: &Path,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<()> {
     fs::create_dir_all(target_dir).with_context(|| {
         format!(
             "Failed to create zip target directory: {}",
@@ -579,31 +708,75 @@ pub fn extract_zip_archive(archive_path: &Path, target_dir: &Path) -> Result<()>
     let mut archive = zip::ZipArchive::new(file)
         .with_context(|| format!("Invalid zip archive: {}", archive_path.display()))?;
 
+    if archive.len() > max_files {
+        return Err(anyhow!(
+            "Zip archive exceeds maximum allowed entry count ({} > {})",
+            archive.len(),
+            max_files
+        ));
+    }
+
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+
     for idx in 0..archive.len() {
         let mut entry = archive
             .by_index(idx)
             .with_context(|| format!("Failed to read zip entry #{}", idx))?;
-        let Some(rel_path) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
+
+        let is_unix_symlink = entry
+            .unix_mode()
+            .is_some_and(|mode| (mode & 0o170000) == 0o120000);
+        if entry.is_symlink() || is_unix_symlink {
+            return Err(anyhow!(
+                "Zip archive contains disallowed symlink entry: {}",
+                entry.name()
+            ));
+        }
+
+        let Some(enclosed) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
             return Err(anyhow!(
                 "Zip archive contains unsafe path traversal entry: {}",
                 entry.name()
             ));
         };
+        let Some(rel_path) = sanitize_archive_rel_path(&enclosed, "Zip")? else {
+            continue;
+        };
+        ensure_no_symlink_components_under(target_dir, &rel_path)?;
 
         let out_path = target_dir.join(&rel_path);
         if entry.is_dir() || entry.name().ends_with('/') {
             fs::create_dir_all(&out_path)?;
         } else {
+            file_count += 1;
+            if file_count > max_files {
+                return Err(anyhow!(
+                    "Zip archive exceeds maximum allowed file count ({max_files})"
+                ));
+            }
             if let Some(parent) = out_path.parent() {
                 fs::create_dir_all(parent)?;
             }
+            let remaining = max_bytes.saturating_sub(total_bytes);
             let mut out_file = File::create(&out_path).with_context(|| {
                 format!("Failed to create extracted file: {}", out_path.display())
             })?;
-            std::io::copy(&mut entry, &mut out_file).with_context(|| {
+            let mut limited = (&mut entry).take(remaining.saturating_add(1));
+            let copied = std::io::copy(&mut limited, &mut out_file).with_context(|| {
+                let _ = fs::remove_file(&out_path);
                 format!("Failed to extract zip entry to {}", out_path.display())
             })?;
             out_file.flush()?;
+            drop(out_file);
+
+            if copied > remaining {
+                let _ = fs::remove_file(&out_path);
+                return Err(anyhow!(
+                    "Zip archive exceeds maximum decompressed size limit ({max_bytes} bytes)"
+                ));
+            }
+            total_bytes = total_bytes.saturating_add(copied);
 
             #[cfg(unix)]
             if let Some(mode) = entry.unix_mode() {
@@ -617,8 +790,89 @@ pub fn extract_zip_archive(archive_path: &Path, target_dir: &Path) -> Result<()>
     Ok(())
 }
 
-/// Extract a `.tar.gz` archive safely into `target_dir` (preserving internal symlinks and permissions).
-pub fn extract_tar_gz_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+/// Extract a `.zip` archive safely into `target_dir` (rejecting symlinks, zip-slip traversal,
+/// and archive bombs exceeding file-count or decompressed-byte caps).
+pub fn extract_zip_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+    extract_zip_archive_with_limits(archive_path, target_dir, MAX_ARCHIVE_FILES, MAX_ARCHIVE_BYTES)
+}
+
+fn is_shared_lib_soname(name: &str) -> bool {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return false;
+    }
+    if let Some(stem) = name.strip_suffix(".so") {
+        return !stem.is_empty();
+    }
+    if let Some((prefix, suffix)) = name.split_once(".so.") {
+        !prefix.is_empty()
+            && !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+    } else {
+        false
+    }
+}
+
+fn validate_same_dir_soname_symlink(rel_path: &Path, link_target: &Path) -> Result<String> {
+    use std::path::Component;
+
+    let leaf_name = rel_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow!(
+                "Tar.gz archive contains disallowed symlink with invalid name: {}",
+                rel_path.display()
+            )
+        })?;
+    if !is_shared_lib_soname(leaf_name) {
+        return Err(anyhow!(
+            "Tar.gz archive contains disallowed non-shared-library symlink: {}",
+            rel_path.display()
+        ));
+    }
+
+    let mut comps = link_target.components();
+    let target_str = match (comps.next(), comps.next()) {
+        (Some(Component::Normal(single)), None) => single.to_str().ok_or_else(|| {
+            anyhow!(
+                "Tar.gz archive contains disallowed symlink with non-UTF-8 target: {}",
+                rel_path.display()
+            )
+        })?,
+        _ => {
+            return Err(anyhow!(
+                "Tar.gz archive contains disallowed symlink target '{}' for {}",
+                link_target.display(),
+                rel_path.display()
+            ));
+        }
+    };
+
+    if !is_shared_lib_soname(target_str) || target_str == leaf_name {
+        return Err(anyhow!(
+            "Tar.gz archive contains disallowed symlink target '{}' for {}",
+            target_str,
+            rel_path.display()
+        ));
+    }
+
+    Ok(target_str.to_string())
+}
+
+fn extract_tar_gz_archive_with_limits(
+    archive_path: &Path,
+    target_dir: &Path,
+    max_files: usize,
+    max_bytes: u64,
+) -> Result<()> {
     fs::create_dir_all(target_dir).with_context(|| {
         format!(
             "Failed to create tar.gz target directory: {}",
@@ -631,25 +885,216 @@ pub fn extract_tar_gz_archive(archive_path: &Path, target_dir: &Path) -> Result<
     let gz = flate2::read::GzDecoder::new(file);
     let mut archive = tar::Archive::new(gz);
 
+    let mut file_count = 0usize;
+    let mut total_bytes = 0u64;
+    let mut extracted_non_symlink_paths: HashSet<PathBuf> = HashSet::new();
+    let mut seen_symlink_paths: HashSet<PathBuf> = HashSet::new();
+    let mut pending_so_symlinks: Vec<(PathBuf, String)> = Vec::new();
+
     for entry_res in archive
         .entries()
         .context("Failed to read entries from tar.gz archive")?
     {
         let mut entry = entry_res.context("Corrupt entry in tar.gz archive")?;
-        let unpacked = entry.unpack_in(target_dir).with_context(|| {
-            format!(
-                "Failed unpacking tar.gz entry into {}",
-                target_dir.display()
-            )
-        })?;
-        if !unpacked {
+        let entry_type = entry.header().entry_type();
+        let entry_path = entry
+            .path()
+            .context("Invalid path in tar.gz archive")?
+            .into_owned();
+
+        if entry_type == tar::EntryType::Link {
             return Err(anyhow!(
-                "Tar.gz archive contains unsafe path traversal entry"
+                "Tar.gz archive contains disallowed hardlink entry: {}",
+                entry_path.display()
             ));
         }
+
+        if entry_type == tar::EntryType::Symlink {
+            let Some(rel_path) = sanitize_archive_rel_path(&entry_path, "Tar.gz")? else {
+                return Err(anyhow!(
+                    "Tar.gz archive contains disallowed root symlink entry"
+                ));
+            };
+            let link_target = entry
+                .link_name()
+                .context("Invalid symlink target in tar.gz archive")?
+                .ok_or_else(|| {
+                    anyhow!(
+                        "Tar.gz archive contains symlink without target: {}",
+                        entry_path.display()
+                    )
+                })?
+                .into_owned();
+            let validated_target = validate_same_dir_soname_symlink(&rel_path, &link_target)?;
+            if !seen_symlink_paths.insert(rel_path.clone())
+                || extracted_non_symlink_paths.contains(&rel_path)
+            {
+                return Err(anyhow!(
+                    "Tar.gz archive contains duplicate or colliding symlink entry: {}",
+                    rel_path.display()
+                ));
+            }
+            file_count += 1;
+            if file_count > max_files {
+                return Err(anyhow!(
+                    "Tar.gz archive exceeds maximum allowed file count ({max_files})"
+                ));
+            }
+            // Defer creation until after all regular files/dirs are extracted so no file can
+            // ever extract through a symlink.
+            pending_so_symlinks.push((rel_path, validated_target));
+            continue;
+        }
+
+        if !matches!(
+            entry_type,
+            tar::EntryType::Regular
+                | tar::EntryType::Continuous
+                | tar::EntryType::Directory
+                | tar::EntryType::GNULongName
+                | tar::EntryType::GNULongLink
+                | tar::EntryType::XHeader
+                | tar::EntryType::XGlobalHeader
+        ) {
+            return Err(anyhow!(
+                "Tar.gz archive contains unsupported entry type {:?} for {}",
+                entry_type,
+                entry_path.display()
+            ));
+        }
+
+        let Some(rel_path) = sanitize_archive_rel_path(&entry_path, "Tar.gz")? else {
+            continue;
+        };
+        if entry_type.is_dir() || entry_type.is_file() {
+            if rel_path
+                .ancestors()
+                .any(|anc| !anc.as_os_str().is_empty() && seen_symlink_paths.contains(anc))
+            {
+                return Err(anyhow!(
+                    "Tar.gz archive contains colliding symlink and file/directory entry: {}",
+                    rel_path.display()
+                ));
+            }
+            for anc in rel_path.ancestors() {
+                if !anc.as_os_str().is_empty() {
+                    extracted_non_symlink_paths.insert(anc.to_path_buf());
+                }
+            }
+        }
+        ensure_no_symlink_components_under(target_dir, &rel_path)?;
+
+        let out_path = target_dir.join(&rel_path);
+        if entry_type.is_dir() {
+            fs::create_dir_all(&out_path)?;
+            continue;
+        }
+        if !entry_type.is_file() {
+            continue;
+        }
+
+        file_count += 1;
+        if file_count > max_files {
+            return Err(anyhow!(
+                "Tar.gz archive exceeds maximum allowed file count ({max_files})"
+            ));
+        }
+
+        if let Some(parent) = out_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+
+        let remaining = max_bytes.saturating_sub(total_bytes);
+        let mut out_file = File::create(&out_path).with_context(|| {
+            format!("Failed to create extracted file: {}", out_path.display())
+        })?;
+        let mode = entry.header().mode().ok();
+        let mut limited = (&mut entry).take(remaining.saturating_add(1));
+        let copied = std::io::copy(&mut limited, &mut out_file).with_context(|| {
+            let _ = fs::remove_file(&out_path);
+            format!("Failed to extract tar.gz entry to {}", out_path.display())
+        })?;
+        out_file.flush()?;
+        drop(out_file);
+
+        if copied > remaining {
+            let _ = fs::remove_file(&out_path);
+            return Err(anyhow!(
+                "Tar.gz archive exceeds maximum decompressed size limit ({max_bytes} bytes)"
+            ));
+        }
+        total_bytes = total_bytes.saturating_add(copied);
+
+        #[cfg(unix)]
+        if let Some(m) = mode {
+            if m & 0o111 != 0 {
+                let _ = set_executable_permission(&out_path);
+            }
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
     }
 
+    // Create validated same-directory ELF shared-library SONAME symlinks strictly after all
+    // regular files/directories have been extracted.
+    #[cfg(unix)]
+    for (rel_path, target_name) in pending_so_symlinks {
+        if let Some(parent_rel) = rel_path.parent().filter(|p| !p.as_os_str().is_empty()) {
+            ensure_no_symlink_components_under(target_dir, parent_rel)?;
+        }
+        let link_path = target_dir.join(&rel_path);
+        match fs::symlink_metadata(&link_path) {
+            Ok(meta) if meta.file_type().is_symlink() => {
+                // Allow replacing an existing symlink on reinstall or Vulkan <-> CPU backend switch.
+                fs::remove_file(&link_path).with_context(|| {
+                    format!(
+                        "Failed to replace existing shared-library symlink: {}",
+                        link_path.display()
+                    )
+                })?;
+            }
+            Ok(_) => {
+                return Err(anyhow!(
+                    "Tar.gz archive symlink destination already exists as a non-symlink: {}",
+                    link_path.display()
+                ));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => {
+                return Err(err).with_context(|| {
+                    format!(
+                        "Failed to inspect symlink destination metadata: {}",
+                        link_path.display()
+                    )
+                });
+            }
+        }
+        if let Some(parent) = link_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        std::os::unix::fs::symlink(&target_name, &link_path).with_context(|| {
+            format!(
+                "Failed to create shared-library symlink {} -> {}",
+                link_path.display(),
+                target_name
+            )
+        })?;
+    }
+    #[cfg(not(unix))]
+    let _ = pending_so_symlinks;
+
     Ok(())
+}
+
+/// Extract a `.tar.gz` archive safely into `target_dir` (rejecting hardlinks, unsafe symlinks,
+/// path traversal, and archive bombs, while safely deferring same-directory `.so` SONAME symlinks).
+pub fn extract_tar_gz_archive(archive_path: &Path, target_dir: &Path) -> Result<()> {
+    extract_tar_gz_archive_with_limits(
+        archive_path,
+        target_dir,
+        MAX_ARCHIVE_FILES,
+        MAX_ARCHIVE_BYTES,
+    )
 }
 
 fn move_file_across_fs(src: &Path, dst: &Path) -> Result<()> {
@@ -772,13 +1217,15 @@ pub async fn install_component_to_paths<F>(
 where
     F: FnMut(DownloadProgressEvent),
 {
-    let mut config = storage::load_config_from_path(config_path)?;
     let item = catalog
         .items
         .iter()
         .find(|i| i.id == item_id)
         .ok_or_else(|| anyhow!("Catalog item '{}' not found", item_id))?
         .clone();
+
+    // Enforce HTTPS allowlist and mandatory 64-hex SHA-256 upfront before any download/install.
+    let (validated_url, expected_sha) = validate_catalog_item_for_download(&item)?;
 
     if item.id == "cudart-win-cuda12.4" && try_reuse_cuda_dlls_from_whisper(paths)? {
         let target_subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
@@ -791,7 +1238,7 @@ where
                 item.size_bytes,
                 item.size_bytes,
                 "completed",
-                format!("{} je preuzet iz lokalnog Whisper CUDA paketa.", item.name),
+                format!("{} reused from local Whisper CUDA package.", item.name),
             ));
             return Ok(status);
         }
@@ -812,6 +1259,14 @@ where
         existing_len = 0;
     }
 
+    let max_allowed_bytes = if item.size_bytes > 0 {
+        item.size_bytes
+            .saturating_add(DOWNLOAD_SIZE_MARGIN_BYTES)
+            .min(ABSOLUTE_MAX_DOWNLOAD_BYTES)
+    } else {
+        ABSOLUTE_MAX_DOWNLOAD_BYTES
+    };
+
     on_progress(make_progress_event(
         &item.id,
         existing_len,
@@ -821,13 +1276,34 @@ where
     ));
 
     if item.size_bytes == 0 || existing_len < item.size_bytes {
+        let redirect_policy = reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() >= 10 {
+                return attempt.error("Too many redirects while downloading catalog component");
+            }
+            let url = attempt.url();
+            if url.scheme() != "https" {
+                return attempt.error("Refusing non-HTTPS redirect during catalog download");
+            }
+            let host = url
+                .host_str()
+                .map(|h| h.to_ascii_lowercase())
+                .unwrap_or_default();
+            if !is_allowed_redirect_host(&host) {
+                return attempt.error(format!(
+                    "Refusing redirect to non-allowlisted host '{host}'"
+                ));
+            }
+            attempt.follow()
+        });
+
         let client = reqwest::Client::builder()
             .user_agent(concat!("EasySRT-Studio/", env!("CARGO_PKG_VERSION")))
             .connect_timeout(Duration::from_secs(30))
+            .redirect(redirect_policy)
             .build()
             .context("Failed to initialize HTTP download client")?;
 
-        let mut req = client.get(&item.url);
+        let mut req = client.get(validated_url.clone());
         if existing_len > 0 {
             req = req.header(reqwest::header::RANGE, format!("bytes={}-", existing_len));
         }
@@ -835,7 +1311,7 @@ where
         let resp = req
             .send()
             .await
-            .with_context(|| format!("Failed to connect to {}", item.url))?;
+            .with_context(|| format!("Failed to connect to {}", validated_url))?;
 
         let status = resp.status();
         let (mut part_file, mut downloaded_bytes) =
@@ -871,29 +1347,66 @@ where
                 return Err(anyhow!(
                     "Download failed for '{}' ({}): HTTP {}",
                     item.name,
-                    item.url,
+                    validated_url,
                     status
                 ));
             };
+
+        if let Some(cl) = resp.content_length() {
+            if downloaded_bytes.saturating_add(cl) > max_allowed_bytes {
+                drop(part_file);
+                let _ = fs::remove_file(&part_path);
+                return Err(anyhow!(
+                    "Download for '{}' exceeds maximum allowed size ({} > {} bytes)",
+                    item.id,
+                    downloaded_bytes.saturating_add(cl),
+                    max_allowed_bytes
+                ));
+            }
+        }
 
         let total_bytes = if item.size_bytes > 0 {
             item.size_bytes
         } else {
             resp.content_length()
-                .map(|cl| cl + downloaded_bytes)
+                .map(|cl| cl.saturating_add(downloaded_bytes))
                 .unwrap_or(0)
         };
 
         let mut stream = resp.bytes_stream();
         let mut last_emit = Instant::now();
 
-        while let Some(chunk_res) = stream.next().await {
+        loop {
+            let next_chunk = tokio::time::timeout(DOWNLOAD_CHUNK_STALL_TIMEOUT, stream.next())
+                .await
+                .map_err(|_| {
+                    anyhow!(
+                        "Download stalled for '{}' (no data received for {}s)",
+                        item.id,
+                        DOWNLOAD_CHUNK_STALL_TIMEOUT.as_secs()
+                    )
+                })?;
+
+            let Some(chunk_res) = next_chunk else {
+                break;
+            };
+
             let chunk = chunk_res
                 .with_context(|| format!("Network stream interrupted for {}", item.id))?;
+            let next_total = downloaded_bytes.saturating_add(chunk.len() as u64);
+            if next_total > max_allowed_bytes {
+                drop(part_file);
+                let _ = fs::remove_file(&part_path);
+                return Err(anyhow!(
+                    "Download for '{}' exceeded maximum allowed byte ceiling ({} bytes)",
+                    item.id,
+                    max_allowed_bytes
+                ));
+            }
             part_file
                 .write_all(&chunk)
                 .with_context(|| format!("Disk write error for {}", part_path.display()))?;
-            downloaded_bytes += chunk.len() as u64;
+            downloaded_bytes = next_total;
 
             if last_emit.elapsed() >= Duration::from_millis(100) {
                 on_progress(make_progress_event(
@@ -909,21 +1422,17 @@ where
         part_file.flush()?;
     }
 
-    // Verify SHA-256 checksum
-    if let Some(ref expected_sha) = item.sha256 {
-        if !expected_sha.trim().is_empty() {
-            on_progress(make_progress_event(
-                &item.id,
-                item.size_bytes,
-                item.size_bytes,
-                "verifying",
-                format!("Verifying SHA-256 checksum for {}...", item.name),
-            ));
-            if let Err(err) = verify_file_sha256(&part_path, expected_sha) {
-                let _ = fs::remove_file(&part_path);
-                return Err(err);
-            }
-        }
+    // Mandatory SHA-256 checksum verification (never skipped)
+    on_progress(make_progress_event(
+        &item.id,
+        item.size_bytes,
+        item.size_bytes,
+        "verifying",
+        format!("Verifying SHA-256 checksum for {}...", item.name),
+    ));
+    if let Err(err) = verify_file_sha256(&part_path, &expected_sha) {
+        let _ = fs::remove_file(&part_path);
+        return Err(err);
     }
 
     // Extract or move into target location
@@ -981,17 +1490,24 @@ where
         let dest_path = expected_item_path(&item, paths);
         move_file_across_fs(&part_path, &dest_path)?;
 
-        // Auto-select newly installed model if none is currently active
-        let mut config_changed = false;
-        if item.kind == CatalogItemKind::WhisperModel && config.active_whisper_model_id.is_none() {
-            config.active_whisper_model_id = Some(item.id.clone());
-            config_changed = true;
-        } else if item.kind == CatalogItemKind::LlmModel && config.active_llm_model_id.is_none() {
-            config.active_llm_model_id = Some(item.id.clone());
-            config_changed = true;
-        }
-        if config_changed {
-            let _ = storage::save_config_to_path(config_path, &config);
+        // Auto-select newly installed model if none is currently active (serialized RMW)
+        if matches!(
+            item.kind,
+            CatalogItemKind::WhisperModel | CatalogItemKind::LlmModel
+        ) {
+            let item_kind = item.kind;
+            let item_id_clone = item.id.clone();
+            let _ = storage::update_config_at_path(config_path, |cfg| {
+                if item_kind == CatalogItemKind::WhisperModel
+                    && cfg.active_whisper_model_id.is_none()
+                {
+                    cfg.active_whisper_model_id = Some(item_id_clone);
+                } else if item_kind == CatalogItemKind::LlmModel
+                    && cfg.active_llm_model_id.is_none()
+                {
+                    cfg.active_llm_model_id = Some(item_id_clone);
+                }
+            });
         }
     }
 
@@ -1134,13 +1650,59 @@ pub fn probe_windows_cuda_runtime(paths: &StoragePaths) -> std::result::Result<(
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
 
-        let output = cmd
-            .output()
+        let mut child = cmd
+            .spawn()
             .map_err(|err| format!("Failed to launch {label} at {}: {err}", exe.display()))?;
 
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        check_cuda_probe_output(label, output.status.code(), output.status.success(), &stdout, &stderr)?;
+        let stdout_pipe = child.stdout.take();
+        let stderr_pipe = child.stderr.take();
+        let stdout_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stdout_pipe {
+                let _ = pipe.take(256 * 1024).read_to_end(&mut buf);
+            }
+            buf
+        });
+        let stderr_handle = std::thread::spawn(move || {
+            let mut buf = Vec::new();
+            if let Some(pipe) = stderr_pipe {
+                let _ = pipe.take(256 * 1024).read_to_end(&mut buf);
+            }
+            buf
+        });
+
+        let started = Instant::now();
+        let status = loop {
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    if started.elapsed() >= CUDA_PROBE_TIMEOUT {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        let _ = stdout_handle.join();
+                        let _ = stderr_handle.join();
+                        return Err(format!(
+                            "Timed out probing {label} --help after {}s",
+                            CUDA_PROBE_TIMEOUT.as_secs()
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                Err(err) => {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = stdout_handle.join();
+                    let _ = stderr_handle.join();
+                    return Err(format!("Failed polling {label} --help: {err}"));
+                }
+            }
+        };
+
+        let stdout_bytes = stdout_handle.join().unwrap_or_default();
+        let stderr_bytes = stderr_handle.join().unwrap_or_default();
+        let stdout = String::from_utf8_lossy(&stdout_bytes);
+        let stderr = String::from_utf8_lossy(&stderr_bytes);
+        check_cuda_probe_output(label, status.code(), status.success(), &stdout, &stderr)?;
     }
 
     Ok(())
@@ -1166,7 +1728,7 @@ where
         0,
         "warning",
         format!(
-            "CUDA runtime provera nije uspela ({probe_err}). Automatska instalacija CPU binarnih fajlova..."
+            "CUDA runtime probe failed ({probe_err}). Automatically installing CPU fallback binaries..."
         ),
     ));
 
@@ -1286,13 +1848,13 @@ where
         }
     }
 
-    let mut updated_config = storage::load_config_from_path(config_path)?;
-    if updated_config.active_whisper_model_id.is_none() {
-        if let Some(w_id) = installed_whisper_id {
-            updated_config.active_whisper_model_id = Some(w_id);
+    let updated_config = storage::update_config_at_path(config_path, |cfg| {
+        if cfg.active_whisper_model_id.is_none() {
+            if let Some(w_id) = installed_whisper_id {
+                cfg.active_whisper_model_id = Some(w_id);
+            }
         }
-    }
-    storage::save_config_to_path(config_path, &updated_config)?;
+    })?;
 
     Ok(compute_setup_status(
         catalog,
@@ -1396,15 +1958,15 @@ pub async fn install_recommended_bundle(app: &AppHandle) -> Result<SetupStatus> 
         }
     }
 
-    let mut updated_config = storage::load_config(app)?;
-    if let Some(w_id) = installed_whisper_id {
-        updated_config.active_whisper_model_id = Some(w_id);
-    }
-    if let Some(l_id) = installed_llm_id {
-        updated_config.active_llm_model_id = Some(l_id);
-    }
-    updated_config.has_completed_setup = true;
-    storage::save_config(app, &updated_config)?;
+    let updated_config = storage::update_config(app, |cfg| {
+        if let Some(w_id) = installed_whisper_id {
+            cfg.active_whisper_model_id = Some(w_id);
+        }
+        if let Some(l_id) = installed_llm_id {
+            cfg.active_llm_model_id = Some(l_id);
+        }
+        cfg.has_completed_setup = true;
+    })?;
 
     Ok(compute_setup_status(
         &catalog,
@@ -1694,49 +2256,51 @@ pub fn import_custom_model(
     kind: CatalogItemKind,
     name: Option<String>,
 ) -> Result<CustomModelEntry> {
-    let mut config = storage::load_config(app)?;
-    let entry = import_custom_model_with_config(&mut config, source_path, kind, name)?;
-    storage::save_config(app, &config)?;
-    Ok(entry)
+    storage::try_update_config(app, |cfg| {
+        import_custom_model_with_config(cfg, source_path, kind, name)
+    })
 }
 
 /// Delete a downloaded catalog model/component or remove an imported custom model entry.
 pub fn delete_model(app: &AppHandle, model_id: &str) -> Result<()> {
-    let mut config = storage::load_config(app)?;
+    let config = storage::load_config(app)?;
     let paths = storage::resolve_storage_paths(app, config.models_dir_override.as_deref())?;
     let catalog = load_catalog(app)?;
+    let catalog_item = catalog.items.iter().find(|i| i.id == model_id).cloned();
 
-    // Remove from custom_models if present
-    let before_len = config.custom_models.len();
-    config.custom_models.retain(|m| m.id != model_id);
-    let removed_custom = config.custom_models.len() != before_len;
+    storage::try_update_config(app, |cfg| {
+        let before_len = cfg.custom_models.len();
+        cfg.custom_models.retain(|m| m.id != model_id);
+        let removed_custom = cfg.custom_models.len() != before_len;
 
-    // Also remove downloaded catalog file if it matches a catalog item
-    if let Some(item) = catalog.items.iter().find(|i| i.id == model_id) {
-        let target_path = expected_item_path(item, &paths);
-        if target_path.is_file() {
-            fs::remove_file(&target_path).with_context(|| {
-                format!("Failed to delete model file: {}", target_path.display())
-            })?;
+        if let Some(ref item) = catalog_item {
+            let target_path = expected_item_path(item, &paths);
+            if target_path.is_file() {
+                fs::remove_file(&target_path).with_context(|| {
+                    format!("Failed to delete model file: {}", target_path.display())
+                })?;
+            }
+            if is_binary_kind(item.kind) {
+                let subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
+                let marker = marker_file_path(&subdir, &item.id);
+                let _ = fs::remove_file(marker);
+            }
+        } else if !removed_custom {
+            return Err(anyhow!(
+                "Model '{}' not found in catalog or custom models",
+                model_id
+            ));
         }
-        if is_binary_kind(item.kind) {
-            let subdir = Path::new(&paths.bin_dir).join(&item.target_subdir);
-            let marker = marker_file_path(&subdir, &item.id);
-            let _ = fs::remove_file(marker);
+
+        if cfg.active_whisper_model_id.as_deref() == Some(model_id) {
+            cfg.active_whisper_model_id = None;
         }
-    } else if !removed_custom {
-        return Err(anyhow!("Model '{}' not found in catalog or custom models", model_id));
-    }
+        if cfg.active_llm_model_id.as_deref() == Some(model_id) {
+            cfg.active_llm_model_id = None;
+        }
 
-    if config.active_whisper_model_id.as_deref() == Some(model_id) {
-        config.active_whisper_model_id = None;
-    }
-    if config.active_llm_model_id.as_deref() == Some(model_id) {
-        config.active_llm_model_id = None;
-    }
-
-    storage::save_config(app, &config)?;
-    Ok(())
+        Ok(())
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -2354,6 +2918,455 @@ mod tests {
         let paths =
             storage::resolve_storage_paths_from_root(&dir, StorageMode::Installed, None).unwrap();
         assert!(probe_windows_cuda_runtime(&paths).is_err());
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn validates_mandatory_sha256_and_https_allowlisted_hosts() {
+        // Every embedded catalog item must satisfy both URL allowlist and 64-hex SHA-256
+        let catalog = load_embedded_catalog().unwrap();
+        for item in &catalog.items {
+            validate_catalog_item_for_download(item)
+                .unwrap_or_else(|e| panic!("Embedded item '{}' failed validation: {e}", item.id));
+        }
+
+        // SHA-256 rejection cases
+        assert!(validate_sha256_hex(None).is_err());
+        assert!(validate_sha256_hex(Some("")).is_err());
+        assert!(validate_sha256_hex(Some("   ")).is_err());
+        assert!(validate_sha256_hex(Some("deadbeef")).is_err());
+        assert!(validate_sha256_hex(Some(&"z".repeat(64))).is_err());
+        assert!(validate_sha256_hex(Some(&"a".repeat(63))).is_err());
+        assert!(validate_sha256_hex(Some(&"a".repeat(65))).is_err());
+        assert_eq!(
+            validate_sha256_hex(Some(&"A".repeat(64))).unwrap(),
+            "a".repeat(64)
+        );
+
+        // Allowlisted HTTPS URLs pass
+        for ok_url in [
+            "https://github.com/ggml-org/whisper.cpp/releases/download/b1/x.zip",
+            "https://objects.githubusercontent.com/some/asset",
+            "https://huggingface.co/ggml-org/whisper-vad/resolve/main/model.bin",
+            "https://cdn-lfs.huggingface.co/repos/abc/def",
+            "https://cas-bridge.xethub.hf.co/xet-bridge-us/123",
+        ] {
+            assert!(
+                validate_catalog_download_url(ok_url).is_ok(),
+                "Expected allowlisted URL to pass: {ok_url}"
+            );
+        }
+
+        // Non-HTTPS, credentialed, or non-allowlisted hosts are rejected
+        for bad_url in [
+            "http://github.com/ggml-org/whisper.cpp/releases/download/b1/x.zip",
+            "http://huggingface.co/model.bin",
+            "https://evil.example.com/model.bin",
+            "https://github.com.evil.example/asset.zip",
+            "https://user:pass@github.com/asset.zip",
+            "file:///etc/passwd",
+        ] {
+            assert!(
+                validate_catalog_download_url(bad_url).is_err(),
+                "Expected URL to be rejected: {bad_url}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn install_component_rejects_missing_sha256_or_disallowed_host_before_network() {
+        let dir = make_temp_dir("install_sec_reject");
+        let paths =
+            storage::resolve_storage_paths_from_root(&dir, StorageMode::Installed, None).unwrap();
+
+        let base_item = CatalogItem {
+            id: "bad-item".to_string(),
+            name: "Bad Item".to_string(),
+            kind: CatalogItemKind::VadModel,
+            platform: "all".to_string(),
+            version: "1.0".to_string(),
+            url: "https://github.com/ggml-org/whisper.cpp/releases/download/v1/test.bin".to_string(),
+            sha256: None,
+            size_bytes: 128,
+            vram_tier: None,
+            target_subdir: "vad".to_string(),
+            executable_name: None,
+            archive_type: ArchiveType::Raw,
+            description: "test".to_string(),
+            required: false,
+        };
+
+        // 1. Missing sha256 rejected
+        let manifest_no_sha = CatalogManifest {
+            schema_version: 1,
+            updated_at: "2026-11-25T00:00:00Z".to_string(),
+            items: vec![base_item.clone()],
+        };
+        let err_sha = install_component_to_paths(
+            &manifest_no_sha,
+            &paths,
+            Path::new(&paths.config_path),
+            None,
+            "bad-item",
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err_sha:#}").to_ascii_lowercase().contains("sha-256"),
+            "unexpected error: {err_sha:#}"
+        );
+
+        // 2. Non-allowlisted host rejected even with valid sha256
+        let mut bad_host_item = base_item;
+        bad_host_item.sha256 = Some("a".repeat(64));
+        bad_host_item.url = "https://untrusted.example.org/payload.bin".to_string();
+        let manifest_bad_host = CatalogManifest {
+            schema_version: 1,
+            updated_at: "2026-11-25T00:00:00Z".to_string(),
+            items: vec![bad_host_item],
+        };
+        let err_host = install_component_to_paths(
+            &manifest_bad_host,
+            &paths,
+            Path::new(&paths.config_path),
+            None,
+            "bad-item",
+            |_| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err_host:#}").to_ascii_lowercase().contains("allowed hosts"),
+            "unexpected error: {err_host:#}"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archives_reject_symlinks_hardlinks_traversal_and_size_or_count_bombs() {
+        let dir = make_temp_dir("archive_sec");
+
+        // 1. ZIP containing a Unix symlink entry must be rejected
+        let zip_symlink = dir.join("symlink.zip");
+        {
+            let file = File::create(&zip_symlink).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .add_symlink("evil_link", "/etc/passwd", SimpleFileOptions::default())
+                .unwrap();
+            writer.finish().unwrap();
+        }
+        let zip_out = dir.join("zip_symlink_out");
+        let err = extract_zip_archive(&zip_symlink, &zip_out).unwrap_err();
+        assert!(
+            err.to_string().to_ascii_lowercase().contains("symlink"),
+            "Expected symlink error, got: {err}"
+        );
+
+        // 1b. ZIP exceeding max file count must be rejected
+        let zip_many = dir.join("many.zip");
+        {
+            let file = File::create(&zip_many).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            for i in 0..5 {
+                writer
+                    .start_file(format!("f{i}.txt"), SimpleFileOptions::default())
+                    .unwrap();
+                writer.write_all(b"hi").unwrap();
+            }
+            writer.finish().unwrap();
+        }
+        let zip_many_out = dir.join("zip_many_out");
+        let err_many =
+            extract_zip_archive_with_limits(&zip_many, &zip_many_out, 3, 1024 * 1024).unwrap_err();
+        assert!(
+            err_many
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("entry count"),
+            "Expected entry count limit error, got: {err_many}"
+        );
+
+        // 2. ZIP exceeding max decompressed byte cap must be rejected
+        let zip_bomb = dir.join("bomb.zip");
+        {
+            let file = File::create(&zip_bomb).unwrap();
+            let mut writer = zip::ZipWriter::new(file);
+            writer
+                .start_file("big.bin", SimpleFileOptions::default())
+                .unwrap();
+            writer.write_all(&vec![b'A'; 2048]).unwrap();
+            writer.finish().unwrap();
+        }
+        let zip_bomb_out = dir.join("zip_bomb_out");
+        let err_bomb =
+            extract_zip_archive_with_limits(&zip_bomb, &zip_bomb_out, 10, 1024).unwrap_err();
+        assert!(
+            err_bomb
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("decompressed size"),
+            "Expected size limit error, got: {err_bomb}"
+        );
+
+        // 3. TAR.GZ malicious symlinks (/etc/passwd, ../escape, ../libfoo.so.1, non-.so) must be rejected
+        for (idx, (link_name, target)) in [
+            ("evil_symlink", "/etc/passwd"),
+            ("libfoo.so", "/etc/passwd"),
+            ("libfoo.so", "../escape"),
+            ("libfoo.so", "../libfoo.so.1"),
+            ("evil.txt", "target.txt"),
+            ("libfoo.so", "libfoo.so"), // self-loop
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let tar_bad = dir.join(format!("bad_symlink_{idx}.tar.gz"));
+            {
+                let file = File::create(&tar_bad).unwrap();
+                let enc = GzEncoder::new(file, Compression::default());
+                let mut builder = tar::Builder::new(enc);
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Symlink);
+                header.set_size(0);
+                header.set_mode(0o777);
+                header.set_cksum();
+                builder.append_link(&mut header, link_name, target).unwrap();
+                builder.into_inner().unwrap().finish().unwrap();
+            }
+            let tar_out = dir.join(format!("tar_bad_sym_out_{idx}"));
+            let err_tar_sym = extract_tar_gz_archive(&tar_bad, &tar_out).unwrap_err();
+            assert!(
+                err_tar_sym
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("symlink"),
+                "Expected tar symlink error for {link_name} -> {target}, got: {err_tar_sym}"
+            );
+        }
+
+        // 3b. TAR.GZ benign same-dir ELF SONAME symlinks (deferred after regular files) extract safely
+        let tar_soname = dir.join("soname.tar.gz");
+        {
+            let file = File::create(&tar_soname).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(enc);
+
+            // Put symlinks BEFORE the regular file in the archive to verify deferred creation
+            let mut l1 = tar::Header::new_gnu();
+            l1.set_entry_type(tar::EntryType::Symlink);
+            l1.set_size(0);
+            l1.set_mode(0o777);
+            l1.set_cksum();
+            builder
+                .append_link(&mut l1, "pkg/libfoo.so", "libfoo.so.1")
+                .unwrap();
+
+            let mut l2 = tar::Header::new_gnu();
+            l2.set_entry_type(tar::EntryType::Symlink);
+            l2.set_size(0);
+            l2.set_mode(0o777);
+            l2.set_cksum();
+            builder
+                .append_link(&mut l2, "pkg/libfoo.so.1", "libfoo.so.1.2.3")
+                .unwrap();
+
+            let payload = b"ELF-shared-library-bytes";
+            let mut fh = tar::Header::new_gnu();
+            fh.set_size(payload.len() as u64);
+            fh.set_mode(0o755);
+            fh.set_cksum();
+            builder
+                .append_data(&mut fh, "pkg/libfoo.so.1.2.3", &payload[..])
+                .unwrap();
+
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let tar_soname_out = dir.join("tar_soname_out");
+        extract_tar_gz_archive(&tar_soname, &tar_soname_out).unwrap();
+        let real_so = tar_soname_out.join("pkg").join("libfoo.so.1.2.3");
+        assert_eq!(fs::read(&real_so).unwrap(), b"ELF-shared-library-bytes");
+        #[cfg(unix)]
+        {
+            let link_so = tar_soname_out.join("pkg").join("libfoo.so");
+            assert!(fs::symlink_metadata(&link_so).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read(&link_so).unwrap(), b"ELF-shared-library-bytes");
+
+            // Symlinks also count toward max_files (3 entries total > max_files = 2 -> rejected)
+            let tar_soname_cap = dir.join("tar_soname_cap");
+            assert!(
+                extract_tar_gz_archive_with_limits(&tar_soname, &tar_soname_cap, 2, 1024 * 1024)
+                    .is_err()
+            );
+
+            // (a) Re-extracting over an existing install (reinstall or Vulkan <-> CPU switch)
+            // cleanly replaces the previous SONAME symlinks and preserves the resolved target.
+            extract_tar_gz_archive(&tar_soname, &tar_soname_out).unwrap();
+            assert!(fs::symlink_metadata(&link_so).unwrap().file_type().is_symlink());
+            assert_eq!(fs::read(&link_so).unwrap(), b"ELF-shared-library-bytes");
+
+            // (b) Extracting a SONAME symlink over an existing regular file or directory on disk
+            // must be rejected (never clobber non-symlink paths).
+            let tar_file_collision_out = dir.join("tar_file_collision_out");
+            fs::create_dir_all(tar_file_collision_out.join("pkg")).unwrap();
+            fs::write(
+                tar_file_collision_out.join("pkg").join("libfoo.so"),
+                b"existing-regular-file",
+            )
+            .unwrap();
+            let err_file_collision =
+                extract_tar_gz_archive(&tar_soname, &tar_file_collision_out).unwrap_err();
+            assert!(
+                err_file_collision
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("non-symlink"),
+                "Expected non-symlink collision error for regular file, got: {err_file_collision}"
+            );
+
+            let tar_dir_collision_out = dir.join("tar_dir_collision_out");
+            fs::create_dir_all(tar_dir_collision_out.join("pkg").join("libfoo.so")).unwrap();
+            let err_dir_collision =
+                extract_tar_gz_archive(&tar_soname, &tar_dir_collision_out).unwrap_err();
+            assert!(
+                err_dir_collision
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("non-symlink"),
+                "Expected non-symlink collision error for directory, got: {err_dir_collision}"
+            );
+        }
+
+        // (c) Same-archive collisions (regular file + symlink at same path in either order, or
+        // duplicate symlink entries) must be rejected on all platforms.
+        for (case_idx, symlink_first) in [false, true].into_iter().enumerate() {
+            let tar_same_archive_collide =
+                dir.join(format!("soname_same_archive_collide_{case_idx}.tar.gz"));
+            {
+                let file = File::create(&tar_same_archive_collide).unwrap();
+                let enc = GzEncoder::new(file, Compression::default());
+                let mut builder = tar::Builder::new(enc);
+
+                let append_sym = |b: &mut tar::Builder<GzEncoder<File>>| {
+                    let mut l = tar::Header::new_gnu();
+                    l.set_entry_type(tar::EntryType::Symlink);
+                    l.set_size(0);
+                    l.set_mode(0o777);
+                    l.set_cksum();
+                    b.append_link(&mut l, "pkg/libfoo.so", "libfoo.so.1")
+                        .unwrap();
+                };
+                let append_file = |b: &mut tar::Builder<GzEncoder<File>>| {
+                    let payload = b"colliding-regular-file";
+                    let mut fh = tar::Header::new_gnu();
+                    fh.set_size(payload.len() as u64);
+                    fh.set_mode(0o644);
+                    fh.set_cksum();
+                    b.append_data(&mut fh, "pkg/libfoo.so", &payload[..])
+                        .unwrap();
+                };
+
+                if symlink_first {
+                    append_sym(&mut builder);
+                    append_file(&mut builder);
+                } else {
+                    append_file(&mut builder);
+                    append_sym(&mut builder);
+                }
+                builder.into_inner().unwrap().finish().unwrap();
+            }
+            let out_collide = dir.join(format!("tar_same_archive_collide_out_{case_idx}"));
+            let err_collide =
+                extract_tar_gz_archive(&tar_same_archive_collide, &out_collide).unwrap_err();
+            assert!(
+                err_collide
+                    .to_string()
+                    .to_ascii_lowercase()
+                    .contains("colliding"),
+                "Expected same-archive collision error (symlink_first={symlink_first}), got: {err_collide}"
+            );
+        }
+
+        let tar_dup_symlink = dir.join("soname_dup_symlink.tar.gz");
+        {
+            let file = File::create(&tar_dup_symlink).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            for target in ["libfoo.so.1", "libfoo.so.2"] {
+                let mut l = tar::Header::new_gnu();
+                l.set_entry_type(tar::EntryType::Symlink);
+                l.set_size(0);
+                l.set_mode(0o777);
+                l.set_cksum();
+                builder
+                    .append_link(&mut l, "pkg/libfoo.so", target)
+                    .unwrap();
+            }
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let err_dup = extract_tar_gz_archive(&tar_dup_symlink, &dir.join("tar_dup_sym_out"))
+            .unwrap_err();
+        assert!(
+            err_dup
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("duplicate"),
+            "Expected duplicate symlink error, got: {err_dup}"
+        );
+
+        // 4. TAR.GZ containing a hardlink must be rejected
+        let tar_hardlink = dir.join("hardlink.tar.gz");
+        {
+            let file = File::create(&tar_hardlink).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Link);
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder
+                .append_link(&mut header, "evil_hardlink", "/etc/passwd")
+                .unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let tar_hl_out = dir.join("tar_hardlink_out");
+        let err_tar_hl = extract_tar_gz_archive(&tar_hardlink, &tar_hl_out).unwrap_err();
+        assert!(
+            err_tar_hl
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("hardlink"),
+            "Expected tar hardlink error, got: {err_tar_hl}"
+        );
+
+        // 5. TAR.GZ exceeding max bytes / file count must be rejected
+        let tar_bomb = dir.join("bomb.tar.gz");
+        {
+            let file = File::create(&tar_bomb).unwrap();
+            let enc = GzEncoder::new(file, Compression::default());
+            let mut builder = tar::Builder::new(enc);
+            let data = vec![b'B'; 2048];
+            let mut header = tar::Header::new_gnu();
+            header.set_size(data.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, "f1.bin", &data[..]).unwrap();
+            builder.into_inner().unwrap().finish().unwrap();
+        }
+        let tar_bomb_out = dir.join("tar_bomb_out");
+        let err_tar_bomb =
+            extract_tar_gz_archive_with_limits(&tar_bomb, &tar_bomb_out, 10, 1024).unwrap_err();
+        assert!(
+            err_tar_bomb
+                .to_string()
+                .to_ascii_lowercase()
+                .contains("decompressed size"),
+            "Expected tar size limit error, got: {err_tar_bomb}"
+        );
+
         let _ = fs::remove_dir_all(&dir);
     }
 }

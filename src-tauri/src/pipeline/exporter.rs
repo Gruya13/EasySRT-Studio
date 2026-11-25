@@ -2,9 +2,9 @@
 //! and dual source + translated `.srt` output).
 
 use crate::models::{ExportFormat, ExportOptions, ExportResult, SubtitleCue, SubtitleProject};
-use anyhow::{Context, Result};
+use anyhow::{anyhow, Context, Result};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// Formats milliseconds as an SRT timestamp (`HH:MM:SS,mmm`).
 pub fn format_srt_timestamp(ms: u64) -> String {
@@ -98,6 +98,90 @@ pub fn format_txt(cues: &[SubtitleCue], use_source: bool, utf8_bom: bool) -> Str
     out
 }
 
+fn is_windows_reserved_device_name(token: &str) -> bool {
+    let upper = token.to_ascii_uppercase();
+    matches!(
+        upper.as_str(),
+        "CON"
+            | "PRN"
+            | "AUX"
+            | "NUL"
+            | "COM1"
+            | "COM2"
+            | "COM3"
+            | "COM4"
+            | "COM5"
+            | "COM6"
+            | "COM7"
+            | "COM8"
+            | "COM9"
+            | "LPT1"
+            | "LPT2"
+            | "LPT3"
+            | "LPT4"
+            | "LPT5"
+            | "LPT6"
+            | "LPT7"
+            | "LPT8"
+            | "LPT9"
+    )
+}
+
+/// Sanitizes an untrusted filename token (`stem`, `target_language`, `source_language`,
+/// `detected_language`) by allowing only safe alphanumeric characters, `_`, and `-`,
+/// stripping `..`, `/`, `\`, NUL, and control characters, and falling back to `fallback`.
+pub fn sanitize_filename_token(raw: &str, fallback: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len().min(128));
+    let mut prev_underscore = false;
+
+    for ch in raw.chars() {
+        if ch == '\0' || ch.is_control() || matches!(ch, '/' | '\\' | '.') {
+            continue;
+        }
+        if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            cleaned.push(ch);
+            prev_underscore = ch == '_';
+        } else if ch.is_whitespace() && !prev_underscore && !cleaned.is_empty() {
+            cleaned.push('_');
+            prev_underscore = true;
+        }
+        if cleaned.chars().count() >= 120 {
+            break;
+        }
+    }
+
+    let trimmed = cleaned.trim_matches(|c| c == '_' || c == '-');
+    if trimmed.is_empty() || is_windows_reserved_device_name(trimmed) {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn safe_output_path(output_dir: &Path, file_name: &str) -> Result<PathBuf> {
+    let rel = Path::new(file_name);
+    let mut comps = rel.components();
+    match (comps.next(), comps.next()) {
+        (Some(Component::Normal(_)), None) => {}
+        _ => {
+            return Err(anyhow!(
+                "Refusing unsafe export filename '{}'",
+                file_name
+            ));
+        }
+    }
+
+    let out_path = output_dir.join(rel);
+    if out_path.parent() != Some(output_dir) {
+        return Err(anyhow!(
+            "Export path '{}' escapes target directory '{}'",
+            out_path.display(),
+            output_dir.display()
+        ));
+    }
+    Ok(out_path)
+}
+
 fn resolve_export_dir(project: &SubtitleProject, options: &ExportOptions) -> Result<PathBuf> {
     if !options.save_beside_audio {
         if let Some(dir) = options.output_dir.as_deref() {
@@ -125,14 +209,14 @@ fn resolve_export_dir(project: &SubtitleProject, options: &ExportOptions) -> Res
 }
 
 fn resolve_stem(project: &SubtitleProject) -> String {
-    Path::new(&project.audio_file_name)
+    let raw_stem = Path::new(&project.audio_file_name)
         .file_stem()
         .or_else(|| Path::new(&project.audio_path).file_stem())
         .and_then(|s| s.to_str())
-        .map(|s| s.trim())
+        .map(str::trim)
         .filter(|s| !s.is_empty())
-        .unwrap_or("subtitles")
-        .to_string()
+        .unwrap_or("subtitles");
+    sanitize_filename_token(raw_stem, "subtitles")
 }
 
 /// Exports `project` subtitles according to `options` and returns the written file paths.
@@ -154,28 +238,30 @@ pub fn export_project_files(
         .iter()
         .any(|c| !c.translated_text.trim().is_empty());
 
-    let src_lang = project
+    let raw_src_lang = project
         .detected_language
         .as_deref()
-        .filter(|s| !s.is_empty() && *s != "auto")
+        .map(str::trim)
+        .filter(|s| !s.is_empty() && !s.eq_ignore_ascii_case("auto"))
         .unwrap_or_else(|| {
             let s = project.options.source_language.trim();
-            if !s.is_empty() && s != "auto" {
+            if !s.is_empty() && !s.eq_ignore_ascii_case("auto") {
                 s
             } else {
                 "src"
             }
         });
+    let src_lang = sanitize_filename_token(raw_src_lang, "lang");
 
     let target_lang = if has_translation {
         let t = project.options.target_language.trim();
         if !t.is_empty() {
-            t
+            sanitize_filename_token(t, "lang")
         } else {
-            "sr"
+            "sr".to_string()
         }
     } else {
-        src_lang
+        src_lang.clone()
     };
 
     let formats = if options.formats.is_empty() {
@@ -194,7 +280,7 @@ pub fn export_project_files(
         };
 
         let file_name = format!("{stem}.{target_lang}.{ext}");
-        let file_path = out_dir.join(file_name);
+        let file_path = safe_output_path(&out_dir, &file_name)?;
         fs::write(&file_path, content.as_bytes()).with_context(|| {
             format!(
                 "Failed to write exported subtitle file: {}",
@@ -208,9 +294,10 @@ pub fn export_project_files(
         let src_tag = if src_lang == target_lang {
             format!("{src_lang}.source")
         } else {
-            src_lang.to_string()
+            src_lang
         };
-        let src_file_path = out_dir.join(format!("{stem}.{src_tag}.srt"));
+        let src_file_name = format!("{stem}.{src_tag}.srt");
+        let src_file_path = safe_output_path(&out_dir, &src_file_name)?;
         let src_content = format_srt(&project.cues, true, options.utf8_bom);
         fs::write(&src_file_path, src_content.as_bytes()).with_context(|| {
             format!(
@@ -280,6 +367,17 @@ mod tests {
     }
 
     #[test]
+    fn sanitize_filename_token_strips_traversal_and_falls_back_cleanly() {
+        assert_eq!(sanitize_filename_token("epizoda_01", "subtitles"), "epizoda_01");
+        assert_eq!(sanitize_filename_token("zh-CN", "lang"), "zh-CN");
+        assert_eq!(sanitize_filename_token("../../escape", "lang"), "escape");
+        assert_eq!(sanitize_filename_token("..\\..\\pwn", "lang"), "pwn");
+        assert_eq!(sanitize_filename_token("../../../", "lang"), "lang");
+        assert_eq!(sanitize_filename_token("...\0\n\r/\\", "subtitles"), "subtitles");
+        assert_eq!(sanitize_filename_token("CON", "subtitles"), "subtitles");
+    }
+
+    #[test]
     fn exports_files_including_source_srt() {
         let temp_dir = std::env::temp_dir().join(format!(
             "easysrt_export_test_{}",
@@ -321,5 +419,65 @@ mod tests {
         assert!(en_srt.contains("Hello everyone!"));
 
         let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[test]
+    fn traversal_in_language_or_stem_cannot_escape_output_dir() {
+        let outer_dir = std::env::temp_dir().join(format!(
+            "easysrt_export_escape_{}",
+            uuid::Uuid::new_v4()
+        ));
+        let output_dir = outer_dir.join("nested").join("exports");
+        fs::create_dir_all(&output_dir).unwrap();
+
+        let options = JobOptions {
+            target_language: "../../escape".to_string(),
+            source_language: "../../../src_escape".to_string(),
+            ..JobOptions::default()
+        };
+
+        let project = SubtitleProject {
+            job_id: "job-escape".to_string(),
+            audio_path: output_dir.join("clip.mp3").to_string_lossy().to_string(),
+            audio_file_name: "../../evil_stem\0.mp3".to_string(),
+            duration_ms: 6000,
+            detected_language: Some("../../det_escape".to_string()),
+            options,
+            words: vec![],
+            cues: sample_cues(),
+            phase: JobPhase::Completed,
+            completed_translation_batches: 1,
+            error_message: None,
+            updated_at: "2026-11-22T18:00:00Z".to_string(),
+        };
+
+        let export_opts = ExportOptions {
+            output_dir: Some(output_dir.to_string_lossy().to_string()),
+            save_beside_audio: false,
+            include_source_srt: true,
+            formats: vec![ExportFormat::Srt],
+            utf8_bom: false,
+        };
+
+        let res = export_project_files(&project, &export_opts).unwrap();
+        assert_eq!(res.written_files.len(), 2);
+
+        for written in &res.written_files {
+            let p = Path::new(written);
+            assert_eq!(
+                p.parent(),
+                Some(output_dir.as_path()),
+                "Exported file {} escaped output_dir {}",
+                p.display(),
+                output_dir.display()
+            );
+            assert!(p.is_file());
+        }
+
+        // Verify nothing leaked into outer_dir or outer_dir/nested
+        assert!(!outer_dir.join("escape.srt").exists());
+        assert!(!outer_dir.join("nested").join("escape.srt").exists());
+
+        let _ = fs::remove_dir_all(&outer_dir);
     }
 }

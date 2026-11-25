@@ -76,6 +76,45 @@ fn default_dtw() -> i64 {
     -1
 }
 
+/// Validates a Whisper language code against `^[a-zA-Z]{2,8}(-[a-zA-Z0-9]{2,8})?$` (including `"auto"`).
+pub fn validate_whisper_lang(lang: &str) -> Result<&str> {
+    let trimmed = lang.trim();
+    if trimmed.is_empty() || trimmed != lang {
+        return Err(anyhow!(
+            "Invalid Whisper language code '{}': must match ^[a-zA-Z]{{2,8}}(-[a-zA-Z0-9]{{2,8}})?$",
+            lang
+        ));
+    }
+
+    let mut parts = trimmed.split('-');
+    let first = parts.next().unwrap_or("");
+    let second = parts.next();
+    if parts.next().is_some() {
+        return Err(anyhow!(
+            "Invalid Whisper language code '{}': unexpected extra subtags",
+            lang
+        ));
+    }
+
+    let first_ok = (2..=8).contains(&first.len())
+        && first.bytes().all(|b| b.is_ascii_alphabetic());
+    let second_ok = match second {
+        None => true,
+        Some(sub) => {
+            (2..=8).contains(&sub.len()) && sub.bytes().all(|b| b.is_ascii_alphanumeric())
+        }
+    };
+
+    if !first_ok || !second_ok {
+        return Err(anyhow!(
+            "Invalid Whisper language code '{}': must match ^[a-zA-Z]{{2,8}}(-[a-zA-Z0-9]{{2,8}})?$",
+            lang
+        ));
+    }
+
+    Ok(trimmed)
+}
+
 /// Formats the user's glossary terms into a concise `--prompt` string for Whisper.
 pub fn build_whisper_prompt(glossary: &BTreeMap<String, String>) -> Option<String> {
     if glossary.is_empty() {
@@ -99,6 +138,39 @@ pub fn build_whisper_prompt(glossary: &BTreeMap<String, String>) -> Option<Strin
     } else {
         Some(format!("Glossary: {}.", terms.join(", ")))
     }
+}
+
+/// Builds a Whisper `--prompt` string: uses the punctuated user glossary when non-empty,
+/// or falls back to a minimal, neutral language-matched punctuation style primer so clips
+/// starting mid-sentence do not get stuck in all-lowercase zero-punctuation decoding mode.
+pub fn build_whisper_prompt_for_lang(
+    lang: &str,
+    glossary: &BTreeMap<String, String>,
+) -> Option<String> {
+    if let Some(glossary_prompt) = build_whisper_prompt(glossary) {
+        return Some(glossary_prompt);
+    }
+
+    let primary = lang
+        .trim()
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let primer = match primary.as_str() {
+        "en" => "Hello. How are you? Well, let's see.",
+        "sr" | "hr" | "bs" => "Zdravo. Kako ste? Dobro, hvala.",
+        "de" => "Hallo. Wie geht es Ihnen? Gut, danke.",
+        "fr" => "Bonjour. Comment allez-vous ? Bien, merci.",
+        "es" => "Hola. ¿Cómo estás? Bien, gracias.",
+        "it" => "Ciao. Come stai? Bene, grazie.",
+        "pt" => "Olá. Como vai? Bem, obrigado.",
+        "ru" => "Привет. Как дела? Хорошо, спасибо.",
+        _ => return None,
+    };
+
+    Some(primer.to_string())
 }
 
 fn is_special_whisper_token(raw: &str) -> bool {
@@ -756,7 +828,8 @@ async fn probe_whisper_binary_detailed(whisper_bin: &Path) -> WhisperProbeResult
 
     let mut cmd = Command::new(whisper_bin);
     configure_command_env(&mut cmd, whisper_bin);
-    cmd.arg("--help")
+    cmd.kill_on_drop(true)
+        .arg("--help")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -959,6 +1032,8 @@ async fn run_whisper_process<F>(
 where
     F: FnMut(f64, String),
 {
+    let validated_lang = validate_whisper_lang(spec.lang).map_err(WhisperExecError::Other)?;
+
     let expected_json_path =
         Path::new(&format!("{}.json", spec.output_prefix.to_string_lossy())).to_path_buf();
     let _ = fs::remove_file(&expected_json_path);
@@ -975,7 +1050,7 @@ where
         .arg("-f")
         .arg(spec.wav_path)
         .arg("-l")
-        .arg(spec.lang)
+        .arg(validated_lang)
         .arg("-t")
         .arg(threads.to_string())
         .arg("-bs")
@@ -997,7 +1072,7 @@ where
         }
     }
 
-    if let Some(prompt) = build_whisper_prompt(spec.glossary) {
+    if let Some(prompt) = build_whisper_prompt_for_lang(validated_lang, spec.glossary) {
         cmd.arg("--prompt").arg(prompt);
     }
 
@@ -2018,6 +2093,11 @@ where
         return Err(anyhow!("Job cancelled"));
     }
 
+    let trimmed_lang = source_language.trim();
+    if !trimmed_lang.is_empty() {
+        validate_whisper_lang(trimmed_lang)?;
+    }
+
     if !whisper_bin.exists() {
         return Err(anyhow!(
             "Whisper binary not found at {}",
@@ -2228,6 +2308,87 @@ mod tests {
         glossary.insert("Beograd".to_string(), "Београд".to_string());
         let prompt = build_whisper_prompt(&glossary).unwrap();
         assert_eq!(prompt, "Glossary: Beograd, Београд, EasySRT, EasySRT Studio.");
+    }
+
+    #[test]
+    fn validates_whisper_language_codes_strictly() {
+        for ok in ["auto", "en", "sr", "de", "zh-CN", "pt-BR", "sr-Latn"] {
+            assert_eq!(validate_whisper_lang(ok).unwrap(), ok);
+        }
+        for bad in [
+            "",
+            "a",
+            "--flag",
+            "-l",
+            "en;rm",
+            "../en",
+            "en sr",
+            " en",
+            "en-",
+            "-en",
+            "123",
+            "toolonglang",
+            "en-US-extra",
+        ] {
+            assert!(
+                validate_whisper_lang(bad).is_err(),
+                "Expected language code {bad:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn builds_language_aware_punctuation_prompt_when_glossary_empty() {
+        let empty = BTreeMap::new();
+
+        let en_prompt = build_whisper_prompt_for_lang("en", &empty).unwrap();
+        assert!(en_prompt.contains('.') && en_prompt.contains('?') && en_prompt.contains(','));
+
+        let sr_prompt = build_whisper_prompt_for_lang("sr", &empty).unwrap();
+        assert!(sr_prompt.contains('.') && sr_prompt.contains('?') && sr_prompt.contains(','));
+
+        // Regional subtag and Balkan aliases resolve cleanly
+        assert_eq!(
+            build_whisper_prompt_for_lang("en-US", &empty),
+            Some(en_prompt)
+        );
+        assert_eq!(
+            build_whisper_prompt_for_lang("hr", &empty),
+            Some(sr_prompt)
+        );
+
+        // "auto" and unmapped scripts return None so language detection is not biased
+        assert_eq!(build_whisper_prompt_for_lang("auto", &empty), None);
+        assert_eq!(build_whisper_prompt_for_lang("ja", &empty), None);
+
+        // Non-empty glossary takes precedence and remains cleanly punctuated
+        let mut glossary = BTreeMap::new();
+        glossary.insert("EasySRT".to_string(), "EasySRT Studio".to_string());
+        assert_eq!(
+            build_whisper_prompt_for_lang("en", &glossary).as_deref(),
+            Some("Glossary: EasySRT, EasySRT Studio.")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_whisper_cli_rejects_flag_injection_in_source_language() {
+        let cancel = Arc::new(AtomicBool::new(false));
+        let err = run_whisper_cli(
+            Path::new("/nonexistent/whisper-cli"),
+            Path::new("/nonexistent/model.bin"),
+            None,
+            Path::new("/nonexistent/audio.wav"),
+            "--flag",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("Invalid Whisper language code"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

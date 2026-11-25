@@ -7,7 +7,7 @@
 
 use crate::models::TimedWord;
 use anyhow::{anyhow, Context, Result};
-use std::f64::consts::TAU;
+use std::f64::consts::{PI, TAU};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
@@ -27,6 +27,7 @@ const MIN_PITCH_LAG: usize = 45; // floor(16000 / 350)
 const MAX_PITCH_LAG: usize = 214; // ceil(16000 / 75)
 
 const NUM_MEL_BANDS: usize = 16;
+const NUM_MFCC_COEFFS: usize = 12; // DCT-II c1..=c12; formant comparison uses c2..=c12 (slice [1..])
 const MEL_MIN_HZ: f64 = 80.0;
 const MEL_MAX_HZ: f64 = 7_600.0;
 const MEL_LOG_FLOOR: f64 = 1e-5;
@@ -48,7 +49,12 @@ const SHORT_WINDOW_FRAME_CUTOFF: usize = 10;
 const HYSTERESIS_COOLDOWN_MS: u64 = 750;
 const HYSTERESIS_TURN_THRESHOLD: f64 = 1.05;
 const MICRO_PEAK_MERGE_MS: u64 = 350;
-const MIN_ACOUSTIC_GATE_FOR_PAUSE_BONUS: f64 = 0.42;
+const MIN_ACOUSTIC_GATE_FOR_PAUSE_BONUS: f64 = 0.40;
+
+const PROBE_CHUNK_MS: u64 = 4_000;
+const PROBE_MAX_CHUNKS: usize = 32;
+const PROBE_CLUSTER_MERGE_THRESHOLD: f64 = 0.80;
+const PROBE_SINGLETON_STRONG_SEPARATION: f64 = 1.20;
 
 /// Microsoft `KSDATAFORMAT_SUBTYPE_PCM` GUID for `WAVE_FORMAT_EXTENSIBLE` (0xFFFE).
 const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
@@ -455,7 +461,10 @@ fn validate_pcm16_mono_16khz_fmt(fmt: &[u8], path: &Path) -> Result<()> {
 #[derive(Debug, Clone)]
 struct WindowFeatures {
     median_f0_hz: Option<f64>,
-    mel_shape: [f64; NUM_MEL_BANDS],
+    /// DCT-II MFCC coefficients `c1..=c12` derived from the 16-band log-mel mean spectrum.
+    /// Formant speaker comparisons use `c2..=c12` (`&mfcc[1..]`) to exclude the universal
+    /// `-6 dB/oct` speech tilt captured in `c1`.
+    mfcc: [f64; NUM_MFCC_COEFFS],
     median_centroid_hz: f64,
     voiced_frames: usize,
 }
@@ -553,6 +562,7 @@ struct DspContext {
     hann: [f64; FRAME_LEN],
     hann_power_norm: f64,
     mel_filters: Vec<Vec<(usize, f64)>>,
+    dct_matrix: [[f64; NUM_MEL_BANDS]; NUM_MFCC_COEFFS],
     samples: Vec<f64>,
     norm_frame: [f64; FRAME_LEN],
     mel_fft_buf: Vec<Complex>,
@@ -576,6 +586,7 @@ impl DspContext {
         }
 
         let mel_filters = build_mel_filterbank();
+        let dct_matrix = build_dct_matrix();
 
         Self {
             fft_mel: FftPlan::new(FRAME_LEN),
@@ -583,6 +594,7 @@ impl DspContext {
             hann,
             hann_power_norm: (FRAME_LEN as f64) * hann_sq_sum,
             mel_filters,
+            dct_matrix,
             samples: Vec::with_capacity((CONTEXT_WINDOW_MS as usize) * SAMPLES_PER_MS),
             norm_frame: [0.0; FRAME_LEN],
             mel_fft_buf: vec![Complex::default(); FRAME_LEN],
@@ -594,6 +606,18 @@ impl DspContext {
             voiced_f0s: Vec::with_capacity(96),
             voiced_centroids: Vec::with_capacity(96),
         }
+    }
+
+    fn compute_mfcc_c1_to_c12(&self, log_mel_mean: &[f64; NUM_MEL_BANDS]) -> [f64; NUM_MFCC_COEFFS] {
+        let mut mfcc = [0.0_f64; NUM_MFCC_COEFFS];
+        for (k_idx, row) in self.dct_matrix.iter().enumerate() {
+            let mut sum = 0.0_f64;
+            for (&w, &e) in row.iter().zip(log_mel_mean.iter()) {
+                sum += w * e;
+            }
+            mfcc[k_idx] = sum;
+        }
+        mfcc
     }
 
     /// Estimates fundamental frequency `F0` in `75..=350 Hz` via zero-padded FFT
@@ -784,6 +808,18 @@ fn build_mel_filterbank() -> Vec<Vec<(usize, f64)>> {
     filters
 }
 
+fn build_dct_matrix() -> [[f64; NUM_MEL_BANDS]; NUM_MFCC_COEFFS] {
+    let mut matrix = [[0.0_f64; NUM_MEL_BANDS]; NUM_MFCC_COEFFS];
+    let scale = (2.0 / (NUM_MEL_BANDS as f64)).sqrt();
+    for (k_idx, row) in matrix.iter_mut().enumerate() {
+        let k = (k_idx + 1) as f64; // c1..=c12 (skipping c0 DC loudness)
+        for (m, slot) in row.iter_mut().enumerate() {
+            *slot = scale * (PI * k * ((m as f64) + 0.5) / (NUM_MEL_BANDS as f64)).cos();
+        }
+    }
+    matrix
+}
+
 fn extract_window_features(
     wav: &mut WavPcm16Reader,
     dsp: &mut DspContext,
@@ -874,24 +910,18 @@ fn extract_window_features(
     }
 
     let inv_voiced = 1.0 / (voiced_count as f64);
-    let mut mel_shape = [0.0_f64; NUM_MEL_BANDS];
-    let mut band_mean = 0.0_f64;
-    for (dst, &sum) in mel_shape.iter_mut().zip(voiced_mel_sum.iter()) {
-        let v = sum * inv_voiced;
-        *dst = v;
-        band_mean += v;
+    let mut log_mel_mean = [0.0_f64; NUM_MEL_BANDS];
+    for (dst, &sum) in log_mel_mean.iter_mut().zip(voiced_mel_sum.iter()) {
+        *dst = sum * inv_voiced;
     }
-    band_mean /= NUM_MEL_BANDS as f64;
-    for v in &mut mel_shape {
-        *v -= band_mean;
-    }
+    let mfcc = dsp.compute_mfcc_c1_to_c12(&log_mel_mean);
 
     let median_f0_hz = compute_median(&mut dsp.voiced_f0s);
     let median_centroid_hz = compute_median(&mut dsp.voiced_centroids).unwrap_or(0.0);
 
     Ok(Some(WindowFeatures {
         median_f0_hz,
-        mel_shape,
+        mfcc,
         median_centroid_hz,
         voiced_frames: voiced_count,
     }))
@@ -942,7 +972,7 @@ fn compute_median(values: &mut [f64]) -> Option<f64> {
     }
 }
 
-fn cosine_distance(a: &[f64; NUM_MEL_BANDS], b: &[f64; NUM_MEL_BANDS]) -> f64 {
+fn cosine_distance(a: &[f64], b: &[f64]) -> f64 {
     let mut dot = 0.0_f64;
     let mut norm_a = 0.0_f64;
     let mut norm_b = 0.0_f64;
@@ -959,20 +989,19 @@ fn cosine_distance(a: &[f64; NUM_MEL_BANDS], b: &[f64; NUM_MEL_BANDS]) -> f64 {
     (1.0 - sim).clamp(0.0, 2.0)
 }
 
-fn score_speaker_change(
-    left: &WindowFeatures,
-    right: &WindowFeatures,
-    gap_ms: u64,
-    has_sentence_punct: bool,
-) -> f64 {
+/// Computes pure acoustic speaker divergence combining F0 semitone delta,
+/// DCT MFCC `c2..=c12` formant cosine distance, and spectral centroid octave shift.
+fn acoustic_divergence(left: &WindowFeatures, right: &WindowFeatures) -> f64 {
     let pitch_semitones = match (left.median_f0_hz, right.median_f0_hz) {
         (Some(f_l), Some(f_r)) if f_l > 1.0 && f_r > 1.0 => (12.0 * (f_l / f_r).log2()).abs(),
         _ => 0.0,
     };
-    let pitch_norm = ((pitch_semitones - 1.5).max(0.0) / 5.0).min(1.5);
+    let pitch_norm = ((pitch_semitones - 1.5).max(0.0) / 4.8).min(1.75);
 
-    let mel_dist = cosine_distance(&left.mel_shape, &right.mel_shape);
-    let mel_norm = ((mel_dist - 0.06).max(0.0) / 0.28).min(1.6);
+    // Compare formant cepstral coefficients c2..=c12 (indices 1..NUM_MFCC_COEFFS),
+    // excluding c1 so universal -6 dB/oct glottal spectral tilt does not mask male-to-male turns.
+    let mfcc_dist = cosine_distance(&left.mfcc[1..], &right.mfcc[1..]);
+    let mfcc_norm = ((mfcc_dist - 0.10).max(0.0) / 0.26).min(1.5);
 
     let centroid_oct = if left.median_centroid_hz > 1.0 && right.median_centroid_hz > 1.0 {
         (left.median_centroid_hz / right.median_centroid_hz)
@@ -981,9 +1010,23 @@ fn score_speaker_change(
     } else {
         0.0
     };
-    let centroid_norm = ((centroid_oct - 0.15).max(0.0) / 0.65).min(1.4);
+    let centroid_norm = ((centroid_oct - 0.16).max(0.0) / 0.62).min(1.4);
 
-    let acoustic_score = 0.50 * pitch_norm + 0.50 * mel_norm + 0.25 * centroid_norm;
+    let acoustic_score = 0.50 * pitch_norm + 0.46 * mfcc_norm + 0.24 * centroid_norm;
+    if acoustic_score.is_finite() {
+        acoustic_score
+    } else {
+        0.0
+    }
+}
+
+fn score_speaker_change(
+    left: &WindowFeatures,
+    right: &WindowFeatures,
+    gap_ms: u64,
+    has_sentence_punct: bool,
+) -> f64 {
+    let acoustic_score = acoustic_divergence(left, right);
 
     // Pause duration and sentence punctuation reinforce genuine acoustic divergence,
     // but NEVER cause a split on their own during a single-speaker dramatic pause.
@@ -1003,10 +1046,152 @@ fn score_speaker_change(
     }
 }
 
+/// Estimates the number of distinct speakers (`1`, `2`, or `3`) across one or more sparse
+/// 16 kHz mono PCM16 WAV slices using the same F0 + DCT MFCC `c2..=c12` + centroid voiced-chunk
+/// feature extractor and agglomerative average-linkage clustering (for Workstream 5 `probe.rs`).
+pub fn estimate_speaker_count_from_wav_slices(wav_paths: &[&Path]) -> Result<usize> {
+    if wav_paths.is_empty() {
+        return Ok(1);
+    }
+
+    let mut dsp = DspContext::new();
+    let mut strong_chunks: Vec<WindowFeatures> = Vec::new();
+    let mut fallback_chunks: Vec<WindowFeatures> = Vec::new();
+
+    for &wav_path in wav_paths {
+        let mut wav = WavPcm16Reader::open(wav_path)?;
+        if wav.total_samples < FRAME_LEN {
+            continue;
+        }
+        let dur_ms = wav.duration_ms();
+        if dur_ms < MIN_CLIPPED_WINDOW_MS {
+            continue;
+        }
+
+        let mut cursor = 0u64;
+        while cursor < dur_ms && fallback_chunks.len() < PROBE_MAX_CHUNKS {
+            let remaining = dur_ms.saturating_sub(cursor);
+            let chunk_end = if remaining < PROBE_CHUNK_MS + MIN_CLIPPED_WINDOW_MS {
+                dur_ms
+            } else {
+                cursor.saturating_add(PROBE_CHUNK_MS)
+            };
+
+            if chunk_end.saturating_sub(cursor) >= MIN_CLIPPED_WINDOW_MS {
+                if let Some(feats) = extract_window_features(&mut wav, &mut dsp, cursor, chunk_end, &[])?
+                {
+                    if feats.voiced_frames >= 6 && strong_chunks.len() < PROBE_MAX_CHUNKS {
+                        strong_chunks.push(feats.clone());
+                    }
+                    fallback_chunks.push(feats);
+                }
+            }
+            if chunk_end >= dur_ms {
+                break;
+            }
+            cursor = chunk_end;
+        }
+    }
+
+    let chunks = if strong_chunks.len() >= 2 {
+        strong_chunks
+    } else {
+        fallback_chunks
+    };
+
+    if chunks.len() <= 1 {
+        return Ok(1);
+    }
+
+    let n = chunks.len();
+    let mut dist = vec![vec![0.0_f64; n]; n];
+    for i in 0..n {
+        for j in (i + 1)..n {
+            let d = acoustic_divergence(&chunks[i], &chunks[j]);
+            dist[i][j] = d;
+            dist[j][i] = d;
+        }
+    }
+
+    let mut clusters: Vec<Vec<usize>> = (0..n).map(|i| vec![i]).collect();
+
+    loop {
+        if clusters.len() <= 1 {
+            break;
+        }
+        let mut best_pair: Option<(usize, usize, f64)> = None;
+        for i in 0..clusters.len() {
+            for j in (i + 1)..clusters.len() {
+                let mut sum = 0.0_f64;
+                let mut cnt = 0usize;
+                for &a in &clusters[i] {
+                    for &b in &clusters[j] {
+                        sum += dist[a][b];
+                        cnt += 1;
+                    }
+                }
+                let avg = if cnt > 0 { sum / (cnt as f64) } else { 0.0 };
+                match best_pair {
+                    Some((_, _, best_d)) if avg >= best_d => {}
+                    _ => best_pair = Some((i, j, avg)),
+                }
+            }
+        }
+
+        let Some((i, j, min_avg)) = best_pair else {
+            break;
+        };
+        if min_avg >= PROBE_CLUSTER_MERGE_THRESHOLD {
+            break;
+        }
+        let merged = clusters.remove(j);
+        clusters[i].extend(merged);
+    }
+
+    let speaker_count = if n < 4 {
+        clusters.len()
+    } else {
+        // Filter out isolated single-chunk acoustic outliers (e.g. brief cough/laughter)
+        // unless strongly separated from every other cluster.
+        let mut supported = 0usize;
+        for (idx, members) in clusters.iter().enumerate() {
+            if members.len() >= 2 {
+                supported += 1;
+                continue;
+            }
+            let min_other_dist = clusters
+                .iter()
+                .enumerate()
+                .filter(|&(other_idx, _)| other_idx != idx)
+                .map(|(_, other_members)| {
+                    let mut sum = 0.0_f64;
+                    let mut cnt = 0usize;
+                    for &a in members {
+                        for &b in other_members {
+                            sum += dist[a][b];
+                            cnt += 1;
+                        }
+                    }
+                    if cnt > 0 {
+                        sum / (cnt as f64)
+                    } else {
+                        0.0
+                    }
+                })
+                .fold(f64::INFINITY, f64::min);
+            if min_other_dist >= PROBE_SINGLETON_STRONG_SEPARATION {
+                supported += 1;
+            }
+        }
+        supported.max(1)
+    };
+
+    Ok(speaker_count.clamp(1, 3))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::f64::consts::PI;
     use std::fs;
     use std::path::PathBuf;
     use std::time::Instant;
@@ -1646,5 +1831,184 @@ mod tests {
         let _ = fs::remove_file(&wav_path);
 
         assert_eq!(boundaries, vec![2]);
+    }
+
+    #[test]
+    fn detects_male_to_male_same_register_turn_via_mfcc_c2_to_c12() {
+        let wav_path = temp_wav_path("male_to_male_mfcc");
+        let total_ms = 5_000usize;
+        let mut pcm = vec![0i16; total_ms * SAMPLES_PER_MS];
+
+        // Two male speakers within ~1.8 semitones (102 Hz vs 113 Hz) with distinct vocal tracts
+        let male_a = VoiceProfile {
+            f0_hz: 102.0,
+            vibrato_depth: 0.025,
+            amplitude: 0.52,
+            formants: [
+                Formant {
+                    center_hz: 410.0,
+                    bandwidth_hz: 115.0,
+                    gain: 1.4,
+                },
+                Formant {
+                    center_hz: 960.0,
+                    bandwidth_hz: 170.0,
+                    gain: 0.95,
+                },
+                Formant {
+                    center_hz: 2_250.0,
+                    bandwidth_hz: 240.0,
+                    gain: 0.3,
+                },
+            ],
+        };
+        let male_b = VoiceProfile {
+            f0_hz: 113.0,
+            vibrato_depth: 0.025,
+            amplitude: 0.50,
+            formants: [
+                Formant {
+                    center_hz: 620.0,
+                    bandwidth_hz: 135.0,
+                    gain: 1.0,
+                },
+                Formant {
+                    center_hz: 1_780.0,
+                    bandwidth_hz: 210.0,
+                    gain: 1.25,
+                },
+                Formant {
+                    center_hz: 2_850.0,
+                    bandwidth_hz: 270.0,
+                    gain: 0.65,
+                },
+            ],
+        };
+
+        render_voiced_segment(&mut pcm, 200, 2_000, male_a);
+        render_voiced_segment(&mut pcm, 2_350, 4_200, male_b);
+        write_standard_16k_wav(&wav_path, &pcm);
+
+        let words = vec![
+            make_word(200, 750, "Question"),
+            make_word(800, 1_350, "from"),
+            make_word(1_400, 2_000, "reporter."),
+            make_word(2_350, 2_900, "Thank"),
+            make_word(2_950, 3_550, "you"),
+            make_word(3_600, 4_200, "sir."),
+        ];
+        let vad = vec![(190, 2_010), (2_340, 4_210)];
+
+        let boundaries = detect_speaker_change_boundaries(&wav_path, &words, &vad).unwrap();
+        let _ = fs::remove_file(&wav_path);
+
+        assert_eq!(
+            boundaries,
+            vec![3],
+            "Expected male-to-male speaker turn at word 3 via MFCC c2..c12"
+        );
+    }
+
+    #[test]
+    fn estimate_speaker_count_from_wav_slices_distinguishes_one_vs_two_speakers() {
+        let s1_a = temp_wav_path("probe_1spk_a");
+        let s1_b = temp_wav_path("probe_1spk_b");
+        let s2_male = temp_wav_path("probe_2spk_male");
+        let s2_female = temp_wav_path("probe_2spk_female");
+        let s3_tenor = temp_wav_path("probe_3spk_tenor");
+        let s_silence = temp_wav_path("probe_silence");
+
+        let bass_95 = VoiceProfile {
+            f0_hz: 95.0,
+            ..DARK_150HZ_PROFILE
+        };
+        let male_120 = VoiceProfile {
+            f0_hz: 120.0,
+            ..MALE_PROFILE
+        };
+        let male_124_louder = VoiceProfile {
+            f0_hz: 124.0,
+            amplitude: 0.72,
+            ..MALE_PROFILE
+        };
+        let female_215 = VoiceProfile {
+            f0_hz: 215.0,
+            ..FEMALE_PROFILE
+        };
+        let soprano_275 = VoiceProfile {
+            f0_hz: 275.0,
+            vibrato_depth: 0.02,
+            amplitude: 0.52,
+            formants: [
+                Formant {
+                    center_hz: 820.0,
+                    bandwidth_hz: 160.0,
+                    gain: 0.9,
+                },
+                Formant {
+                    center_hz: 2_350.0,
+                    bandwidth_hz: 250.0,
+                    gain: 1.45,
+                },
+                Formant {
+                    center_hz: 3_600.0,
+                    bandwidth_hz: 340.0,
+                    gain: 1.1,
+                },
+            ],
+        };
+
+        let mut pcm_1a = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_1a, 100, 3_900, male_120);
+        write_standard_16k_wav(&s1_a, &pcm_1a);
+
+        let mut pcm_1b = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_1b, 100, 3_900, male_124_louder);
+        write_standard_16k_wav(&s1_b, &pcm_1b);
+
+        let mut pcm_2m = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_2m, 100, 3_900, male_120);
+        write_standard_16k_wav(&s2_male, &pcm_2m);
+
+        let mut pcm_2f = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_2f, 100, 3_900, female_215);
+        write_standard_16k_wav(&s2_female, &pcm_2f);
+
+        let s3_bass = temp_wav_path("probe_3spk_bass");
+        let mut pcm_3b = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_3b, 100, 3_900, bass_95);
+        write_standard_16k_wav(&s3_bass, &pcm_3b);
+
+        let mut pcm_3t = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_3t, 100, 3_900, BRIGHT_150HZ_PROFILE);
+        write_standard_16k_wav(&s3_tenor, &pcm_3t);
+
+        let s3_sop = temp_wav_path("probe_3spk_soprano");
+        let mut pcm_3s = vec![0i16; 4_000 * SAMPLES_PER_MS];
+        render_voiced_segment(&mut pcm_3s, 100, 3_900, soprano_275);
+        write_standard_16k_wav(&s3_sop, &pcm_3s);
+
+        let pcm_sil = vec![0i16; 2_000 * SAMPLES_PER_MS];
+        write_standard_16k_wav(&s_silence, &pcm_sil);
+
+        let count_1 = estimate_speaker_count_from_wav_slices(&[&s1_a, &s1_b]).unwrap();
+        assert_eq!(count_1, 1, "Single speaker with mild intonation/loudness shift should cluster to 1");
+
+        let count_2 = estimate_speaker_count_from_wav_slices(&[&s2_male, &s2_female]).unwrap();
+        assert_eq!(count_2, 2, "120 Hz + 215 Hz speakers should cluster to 2");
+
+        let count_3 =
+            estimate_speaker_count_from_wav_slices(&[&s3_bass, &s3_tenor, &s3_sop]).unwrap();
+        assert_eq!(count_3, 3, "Three distinct voice profiles should cluster to 3");
+
+        let count_sil = estimate_speaker_count_from_wav_slices(&[&s_silence]).unwrap();
+        assert_eq!(count_sil, 1, "Silent slice should safely default to 1");
+
+        let count_empty = estimate_speaker_count_from_wav_slices(&[]).unwrap();
+        assert_eq!(count_empty, 1);
+
+        for p in [s1_a, s1_b, s2_male, s2_female, s3_bass, s3_tenor, s3_sop, s_silence] {
+            let _ = fs::remove_file(p);
+        }
     }
 }
