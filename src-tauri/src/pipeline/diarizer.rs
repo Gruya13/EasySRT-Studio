@@ -51,10 +51,21 @@ const HYSTERESIS_TURN_THRESHOLD: f64 = 1.05;
 const MICRO_PEAK_MERGE_MS: u64 = 350;
 const MIN_ACOUSTIC_GATE_FOR_PAUSE_BONUS: f64 = 0.40;
 
-const PROBE_CHUNK_MS: u64 = 4_000;
-const PROBE_MAX_CHUNKS: usize = 32;
-const PROBE_CLUSTER_MERGE_THRESHOLD: f64 = 0.80;
-const PROBE_SINGLETON_STRONG_SEPARATION: f64 = 1.20;
+const PROBE_MEL_BANDS: usize = 24;
+const PROBE_MFCC_COEFFS: usize = 13; // DCT-II c1..=c13; formant comparison uses c2..=c13 (slice [1..])
+const PROBE_PRE_EMPHASIS: f64 = 0.97;
+const PROBE_MIN_PAUSE_FRAMES: usize = 8; // 160 ms at 20 ms hop
+const PROBE_MIN_CHUNK_MS: u64 = 700;
+const PROBE_MAX_CHUNK_MS: u64 = 2_400;
+const PROBE_MAX_SLICE_MS: u64 = 120_000;
+const PROBE_MAX_RAW_CHUNKS: usize = 192;
+const PROBE_MAX_CHUNKS: usize = 64;
+const PROBE_STRONG_VOICED_FRAMES: usize = 6;
+const PROBE_MFCC_STD_FLOOR: f64 = 0.55;
+const PROBE_F0_SIGMA_FLOOR_ST: f64 = 1.0;
+const PROBE_F0_Z_WEIGHT: f64 = 0.45;
+const PROBE_F0_Z_CAP: f64 = 4.5;
+const PROBE_CLUSTER_MERGE_THRESHOLD: f64 = 1.46;
 
 /// Microsoft `KSDATAFORMAT_SUBTYPE_PCM` GUID for `WAVE_FORMAT_EXTENSIBLE` (0xFFFE).
 const KSDATAFORMAT_SUBTYPE_PCM: [u8; 16] = [
@@ -760,9 +771,13 @@ fn mel_to_hz(mel: f64) -> f64 {
 }
 
 fn build_mel_filterbank() -> Vec<Vec<(usize, f64)>> {
+    build_mel_filterbank_with_bands(NUM_MEL_BANDS)
+}
+
+fn build_mel_filterbank_with_bands(num_bands: usize) -> Vec<Vec<(usize, f64)>> {
     let mel_min = hz_to_mel(MEL_MIN_HZ);
     let mel_max = hz_to_mel(MEL_MAX_HZ);
-    let num_points = NUM_MEL_BANDS + 2;
+    let num_points = num_bands + 2;
     let mut hz_points = Vec::with_capacity(num_points);
     for i in 0..num_points {
         let frac = (i as f64) / ((num_points - 1) as f64);
@@ -770,9 +785,9 @@ fn build_mel_filterbank() -> Vec<Vec<(usize, f64)>> {
     }
 
     let bin_hz = SAMPLE_RATE_F64 / (FRAME_LEN as f64);
-    let mut filters = Vec::with_capacity(NUM_MEL_BANDS);
+    let mut filters = Vec::with_capacity(num_bands);
 
-    for m in 0..NUM_MEL_BANDS {
+    for m in 0..num_bands {
         let f_left = hz_points[m];
         let f_center = hz_points[m + 1];
         let f_right = hz_points[m + 2];
@@ -815,6 +830,18 @@ fn build_dct_matrix() -> [[f64; NUM_MEL_BANDS]; NUM_MFCC_COEFFS] {
         let k = (k_idx + 1) as f64; // c1..=c12 (skipping c0 DC loudness)
         for (m, slot) in row.iter_mut().enumerate() {
             *slot = scale * (PI * k * ((m as f64) + 0.5) / (NUM_MEL_BANDS as f64)).cos();
+        }
+    }
+    matrix
+}
+
+fn build_probe_dct_matrix() -> [[f64; PROBE_MEL_BANDS]; PROBE_MFCC_COEFFS] {
+    let mut matrix = [[0.0_f64; PROBE_MEL_BANDS]; PROBE_MFCC_COEFFS];
+    let scale = (2.0 / (PROBE_MEL_BANDS as f64)).sqrt();
+    for (k_idx, row) in matrix.iter_mut().enumerate() {
+        let k = (k_idx + 1) as f64; // c1..=c13 (skipping c0 DC loudness)
+        for (m, slot) in row.iter_mut().enumerate() {
+            *slot = scale * (PI * k * ((m as f64) + 0.5) / (PROBE_MEL_BANDS as f64)).cos();
         }
     }
     matrix
@@ -1046,68 +1073,445 @@ fn score_speaker_change(
     }
 }
 
+#[derive(Debug, Clone)]
+struct ProbeChunkFeatures {
+    f0_st_median: f64,
+    f0_iqr_st: f64,
+    mfcc_mean: [f64; PROBE_MFCC_COEFFS],
+    mfcc_std: [f64; PROBE_MFCC_COEFFS],
+    voiced_frames: usize,
+    voiced_ratio: f64,
+    rms_median: f64,
+    mod_ratio: f64,
+}
+
+struct ProbeDspContext {
+    dsp: DspContext,
+    probe_mel_filters: Vec<Vec<(usize, f64)>>,
+    probe_dct: [[f64; PROBE_MEL_BANDS]; PROBE_MFCC_COEFFS],
+    pre_emph_frame: [f64; FRAME_LEN],
+}
+
+impl ProbeDspContext {
+    fn new() -> Self {
+        Self {
+            dsp: DspContext::new(),
+            probe_mel_filters: build_mel_filterbank_with_bands(PROBE_MEL_BANDS),
+            probe_dct: build_probe_dct_matrix(),
+            pre_emph_frame: [0.0; FRAME_LEN],
+        }
+    }
+
+    /// Computes pre-emphasized 24-band Log-Mel DCT-II MFCC `c1..=c13` from `self.dsp.norm_frame`.
+    fn compute_probe_mfcc(&mut self) -> [f64; PROBE_MFCC_COEFFS] {
+        self.pre_emph_frame[0] = self.dsp.norm_frame[0];
+        for i in 1..FRAME_LEN {
+            self.pre_emph_frame[i] =
+                self.dsp.norm_frame[i] - PROBE_PRE_EMPHASIS * self.dsp.norm_frame[i - 1];
+        }
+
+        let pe_sq: f64 = self.pre_emph_frame.iter().map(|&x| x * x).sum();
+        let inv_pe_rms = 1.0 / (pe_sq / (FRAME_LEN as f64)).max(0.0).sqrt().max(1e-9);
+
+        for i in 0..FRAME_LEN {
+            self.dsp.mel_fft_buf[i] = Complex {
+                re: self.pre_emph_frame[i] * inv_pe_rms * self.dsp.hann[i],
+                im: 0.0,
+            };
+        }
+        self.dsp
+            .fft_mel
+            .transform_in_place(&mut self.dsp.mel_fft_buf, false);
+
+        for k in 1..=HALF_FFT {
+            let c = self.dsp.mel_fft_buf[k];
+            self.dsp.power_spec[k] = (c.re * c.re + c.im * c.im) / self.dsp.hann_power_norm;
+        }
+
+        let mut log_mel = [0.0_f64; PROBE_MEL_BANDS];
+        for (band_idx, filter) in self.probe_mel_filters.iter().enumerate() {
+            let mut band_energy = 0.0_f64;
+            for &(bin, weight) in filter {
+                band_energy += weight * self.dsp.power_spec[bin];
+            }
+            log_mel[band_idx] = band_energy.max(MEL_LOG_FLOOR).ln();
+        }
+
+        let mut mfcc = [0.0_f64; PROBE_MFCC_COEFFS];
+        for (k_idx, row) in self.probe_dct.iter().enumerate() {
+            let mut sum = 0.0_f64;
+            for (&w, &e) in row.iter().zip(log_mel.iter()) {
+                sum += w * e;
+            }
+            mfcc[k_idx] = sum;
+        }
+        mfcc
+    }
+}
+
+fn percentile_sorted(sorted: &[f64], frac: f64) -> f64 {
+    if sorted.is_empty() {
+        return 0.0;
+    }
+    if sorted.len() == 1 {
+        return sorted[0];
+    }
+    let f = frac.clamp(0.0, 1.0);
+    let pos = f * ((sorted.len() - 1) as f64);
+    let lo = pos.floor() as usize;
+    let hi = pos.ceil() as usize;
+    sorted[lo] + (pos - (lo as f64)) * (sorted[hi] - sorted[lo])
+}
+
+/// Splits a 16 kHz mono slice into single-speaker-scale speech spans (`700..=2400 ms`)
+/// along natural inter-phrase pauses (`>= 160 ms`) so short interviewer turns are not smeared.
+fn segment_samples_by_pauses(samples: &[f64]) -> Vec<(usize, usize)> {
+    if samples.len() < FRAME_LEN {
+        return Vec::new();
+    }
+
+    let mut frame_rms: Vec<f64> = Vec::with_capacity(samples.len() / HOP_LEN + 1);
+    let mut peak_rms = 0.0_f64;
+    let inv_n = 1.0 / (FRAME_LEN as f64);
+    let mut off = 0usize;
+    while off.saturating_add(FRAME_LEN) <= samples.len() {
+        let slice = &samples[off..off + FRAME_LEN];
+        let mut sum = 0.0_f64;
+        for &s in slice {
+            sum += s;
+        }
+        let mean = sum * inv_n;
+        let mut sq_sum = 0.0_f64;
+        for &s in slice {
+            let d = s - mean;
+            sq_sum += d * d;
+        }
+        let rms = (sq_sum * inv_n).max(0.0).sqrt();
+        let clean_rms = if rms.is_finite() { rms } else { 0.0 };
+        if clean_rms > peak_rms {
+            peak_rms = clean_rms;
+        }
+        frame_rms.push(clean_rms);
+        off = off.saturating_add(HOP_LEN);
+    }
+
+    if frame_rms.is_empty() || peak_rms < MIN_ABS_RMS {
+        return Vec::new();
+    }
+
+    let mut sorted_rms = frame_rms.clone();
+    sorted_rms.sort_unstable_by(f64::total_cmp);
+    let p95 = percentile_sorted(&sorted_rms, 0.95);
+    let p15 = percentile_sorted(&sorted_rms, 0.15);
+    let gate = MIN_ABS_RMS.max((p95 * 0.14).min((p15 * 2.2).max(p95 * 0.08)));
+
+    let mut runs: Vec<(usize, usize)> = Vec::new();
+    let mut in_run = false;
+    let mut run_start = 0usize;
+    let mut sil_count = 0usize;
+
+    for (i, &rms) in frame_rms.iter().enumerate() {
+        if rms >= gate {
+            if !in_run {
+                in_run = true;
+                run_start = i;
+            }
+            sil_count = 0;
+        } else if in_run {
+            sil_count += 1;
+            if sil_count >= PROBE_MIN_PAUSE_FRAMES {
+                let run_end = i + 1 - sil_count;
+                let s_sample = run_start * HOP_LEN;
+                let e_sample = (run_end * HOP_LEN).saturating_add(FRAME_LEN).min(samples.len());
+                if e_sample > s_sample {
+                    runs.push((s_sample, e_sample));
+                }
+                in_run = false;
+                sil_count = 0;
+            }
+        }
+    }
+
+    if in_run {
+        let run_end = frame_rms.len().saturating_sub(sil_count);
+        let s_sample = run_start * HOP_LEN;
+        let e_sample = (run_end * HOP_LEN).saturating_add(FRAME_LEN).min(samples.len());
+        if e_sample > s_sample {
+            runs.push((s_sample, e_sample));
+        }
+    }
+
+    let mut chunks: Vec<(usize, usize)> = Vec::new();
+    for (s, e) in runs {
+        let dur_ms = ((e - s) / SAMPLES_PER_MS) as u64;
+        if dur_ms < PROBE_MIN_CHUNK_MS {
+            continue;
+        }
+        if dur_ms <= PROBE_MAX_CHUNK_MS {
+            chunks.push((s, e));
+        } else {
+            let n_sub = dur_ms.div_ceil(PROBE_MAX_CHUNK_MS) as usize;
+            let span = e - s;
+            for k in 0..n_sub {
+                let cs = s + (k * span) / n_sub;
+                let ce = s + ((k + 1) * span) / n_sub;
+                if ((ce - cs) / SAMPLES_PER_MS) as u64 >= PROBE_MIN_CHUNK_MS {
+                    chunks.push((cs, ce));
+                }
+            }
+        }
+    }
+
+    if chunks.is_empty() && samples.len() >= (MIN_CLIPPED_WINDOW_MS as usize) * SAMPLES_PER_MS {
+        chunks.push((0, samples.len()));
+    }
+
+    chunks
+}
+
+fn extract_probe_chunk_features(
+    probe_dsp: &mut ProbeDspContext,
+    seg: &[f64],
+) -> Option<ProbeChunkFeatures> {
+    if seg.len() < FRAME_LEN {
+        return None;
+    }
+
+    probe_dsp.dsp.frame_meta.clear();
+    let mut peak_rms = 0.0_f64;
+    collect_frame_energies(seg, 0, seg.len(), &mut probe_dsp.dsp.frame_meta, &mut peak_rms);
+
+    if probe_dsp.dsp.frame_meta.is_empty() || !peak_rms.is_finite() || peak_rms < MIN_ABS_RMS {
+        return None;
+    }
+
+    let mut sorted_chunk_rms: Vec<f64> = probe_dsp
+        .dsp
+        .frame_meta
+        .iter()
+        .map(|&(_, _, rms)| rms)
+        .collect();
+    sorted_chunk_rms.sort_unstable_by(f64::total_cmp);
+    let p90 = percentile_sorted(&sorted_chunk_rms, 0.90);
+    let p10 = percentile_sorted(&sorted_chunk_rms, 0.10);
+    let mod_ratio = p90 / p10.max(1e-6);
+
+    let energy_gate = (peak_rms * REL_RMS_RATIO).max(MIN_ABS_RMS);
+    let mut active_count = 0usize;
+    let mut f0_st_values: Vec<f64> = Vec::new();
+    let mut voiced_rmss: Vec<f64> = Vec::new();
+    let mut frame_mfccs: Vec<[f64; PROBE_MFCC_COEFFS]> = Vec::new();
+
+    let meta_len = probe_dsp.dsp.frame_meta.len();
+    for idx in 0..meta_len {
+        let (off, mean, rms) = probe_dsp.dsp.frame_meta[idx];
+        if rms < energy_gate || !rms.is_finite() {
+            continue;
+        }
+        active_count += 1;
+
+        let inv_rms = 1.0 / rms;
+        for i in 0..FRAME_LEN {
+            probe_dsp.dsp.norm_frame[i] = (seg[off + i] - mean) * inv_rms;
+        }
+
+        if let Some(f0_hz) = probe_dsp.dsp.estimate_pitch_f0() {
+            let f0_st = 12.0 * f0_hz.log2();
+            if f0_st.is_finite() {
+                f0_st_values.push(f0_st);
+                voiced_rmss.push(rms);
+                frame_mfccs.push(probe_dsp.compute_probe_mfcc());
+            }
+        }
+    }
+
+    let voiced_count = frame_mfccs.len();
+    if active_count < MIN_ACTIVE_FRAMES || voiced_count < MIN_VOICED_FRAMES {
+        return None;
+    }
+
+    let inv_voiced = 1.0 / (voiced_count as f64);
+    let mut mfcc_mean = [0.0_f64; PROBE_MFCC_COEFFS];
+    for fm in &frame_mfccs {
+        for (dst, &v) in mfcc_mean.iter_mut().zip(fm.iter()) {
+            *dst += v;
+        }
+    }
+    for m in &mut mfcc_mean {
+        *m *= inv_voiced;
+    }
+
+    let mut mfcc_std = [0.0_f64; PROBE_MFCC_COEFFS];
+    for fm in &frame_mfccs {
+        for ((acc, &v), &mean) in mfcc_std.iter_mut().zip(fm.iter()).zip(mfcc_mean.iter()) {
+            let d = v - mean;
+            *acc += d * d;
+        }
+    }
+    for s in &mut mfcc_std {
+        *s = (*s * inv_voiced).max(0.0).sqrt();
+    }
+
+    f0_st_values.sort_unstable_by(f64::total_cmp);
+    let f0_st_median = percentile_sorted(&f0_st_values, 0.50);
+    let f0_iqr_st =
+        (percentile_sorted(&f0_st_values, 0.75) - percentile_sorted(&f0_st_values, 0.25)).max(0.0);
+    let rms_median = compute_median(&mut voiced_rmss).unwrap_or(0.0);
+    let voiced_ratio = (voiced_count as f64) / (active_count as f64);
+
+    Some(ProbeChunkFeatures {
+        f0_st_median,
+        f0_iqr_st,
+        mfcc_mean,
+        mfcc_std,
+        voiced_frames: voiced_count,
+        voiced_ratio,
+        rms_median,
+        mod_ratio,
+    })
+}
+
+fn average_cluster_distance(a: &[usize], b: &[usize], dist: &[Vec<f64>]) -> f64 {
+    let mut sum = 0.0_f64;
+    let mut cnt = 0usize;
+    for &i in a {
+        for &j in b {
+            sum += dist[i][j];
+            cnt += 1;
+        }
+    }
+    if cnt > 0 {
+        sum / (cnt as f64)
+    } else {
+        0.0
+    }
+}
+
 /// Estimates the number of distinct speakers (`1`, `2`, or `3`) across one or more sparse
-/// 16 kHz mono PCM16 WAV slices using the same F0 + DCT MFCC `c2..=c12` + centroid voiced-chunk
-/// feature extractor and agglomerative average-linkage clustering (for Workstream 5 `probe.rs`).
+/// 16 kHz mono PCM16 WAV slices using pause-aware chunk segmentation, pre-emphasized 24-band
+/// MFCC `c2..=c13` + F0 features normalized by pooled within-chunk dispersion, and average-linkage
+/// agglomerative clustering (for Workstream 5 `probe.rs`).
 pub fn estimate_speaker_count_from_wav_slices(wav_paths: &[&Path]) -> Result<usize> {
     if wav_paths.is_empty() {
         return Ok(1);
     }
 
-    let mut dsp = DspContext::new();
-    let mut strong_chunks: Vec<WindowFeatures> = Vec::new();
-    let mut fallback_chunks: Vec<WindowFeatures> = Vec::new();
+    let mut probe_dsp = ProbeDspContext::new();
+    let mut slice_samples: Vec<f64> = Vec::new();
+    let mut strong_chunks: Vec<ProbeChunkFeatures> = Vec::new();
+    let mut fallback_chunks: Vec<ProbeChunkFeatures> = Vec::new();
 
     for &wav_path in wav_paths {
+        if fallback_chunks.len() >= PROBE_MAX_RAW_CHUNKS {
+            break;
+        }
         let mut wav = WavPcm16Reader::open(wav_path)?;
         if wav.total_samples < FRAME_LEN {
             continue;
         }
-        let dur_ms = wav.duration_ms();
+        let dur_ms = wav.duration_ms().min(PROBE_MAX_SLICE_MS);
         if dur_ms < MIN_CLIPPED_WINDOW_MS {
             continue;
         }
 
-        let mut cursor = 0u64;
-        while cursor < dur_ms && fallback_chunks.len() < PROBE_MAX_CHUNKS {
-            let remaining = dur_ms.saturating_sub(cursor);
-            let chunk_end = if remaining < PROBE_CHUNK_MS + MIN_CLIPPED_WINDOW_MS {
-                dur_ms
-            } else {
-                cursor.saturating_add(PROBE_CHUNK_MS)
-            };
-
-            if chunk_end.saturating_sub(cursor) >= MIN_CLIPPED_WINDOW_MS {
-                if let Some(feats) = extract_window_features(&mut wav, &mut dsp, cursor, chunk_end, &[])?
-                {
-                    if feats.voiced_frames >= 6 && strong_chunks.len() < PROBE_MAX_CHUNKS {
-                        strong_chunks.push(feats.clone());
-                    }
-                    fallback_chunks.push(feats);
-                }
-            }
-            if chunk_end >= dur_ms {
+        wav.read_samples_ms(0, dur_ms, &mut slice_samples)?;
+        let spans = segment_samples_by_pauses(&slice_samples);
+        for (start_s, end_s) in spans {
+            if fallback_chunks.len() >= PROBE_MAX_RAW_CHUNKS {
                 break;
             }
-            cursor = chunk_end;
+            if let Some(feats) =
+                extract_probe_chunk_features(&mut probe_dsp, &slice_samples[start_s..end_s])
+            {
+                if feats.voiced_frames >= PROBE_STRONG_VOICED_FRAMES
+                    && strong_chunks.len() < PROBE_MAX_RAW_CHUNKS
+                {
+                    strong_chunks.push(feats.clone());
+                }
+                fallback_chunks.push(feats);
+            }
         }
     }
 
-    let chunks = if strong_chunks.len() >= 2 {
+    let mut chunks = if strong_chunks.len() >= 2 {
         strong_chunks
     } else {
         fallback_chunks
     };
 
+    if chunks.len() > PROBE_MAX_CHUNKS {
+        let total = chunks.len();
+        let mut sampled = Vec::with_capacity(PROBE_MAX_CHUNKS);
+        for k in 0..PROBE_MAX_CHUNKS {
+            let idx = (k * total) / PROBE_MAX_CHUNKS;
+            sampled.push(chunks[idx].clone());
+        }
+        chunks = sampled;
+    }
+
     if chunks.len() <= 1 {
         return Ok(1);
     }
 
+    if chunks.len() >= 6 {
+        let mut rms_vals: Vec<f64> = chunks.iter().map(|c| c.rms_median).collect();
+        let mut mod_vals: Vec<f64> = chunks.iter().map(|c| c.mod_ratio).collect();
+        let med_rms = compute_median(&mut rms_vals).unwrap_or(0.0);
+        let med_mod = compute_median(&mut mod_vals).unwrap_or(0.0);
+
+        let filtered: Vec<ProbeChunkFeatures> = chunks
+            .iter()
+            .filter(|c| {
+                c.voiced_ratio >= 0.35
+                    && c.rms_median >= 0.25 * med_rms
+                    && !(med_mod >= 7.0 && c.mod_ratio < 4.0)
+            })
+            .cloned()
+            .collect();
+        if filtered.len() >= 2 {
+            chunks = filtered;
+        }
+    }
+
     let n = chunks.len();
+    if n <= 1 {
+        return Ok(1);
+    }
+
+    let mut sigma_mfcc = [PROBE_MFCC_STD_FLOOR; PROBE_MFCC_COEFFS];
+    let mut std_scratch = Vec::with_capacity(n);
+    for (k, slot) in sigma_mfcc.iter_mut().enumerate() {
+        std_scratch.clear();
+        for c in &chunks {
+            std_scratch.push(c.mfcc_std[k]);
+        }
+        *slot = compute_median(&mut std_scratch)
+            .unwrap_or(PROBE_MFCC_STD_FLOOR)
+            .max(PROBE_MFCC_STD_FLOOR);
+    }
+
+    let mut iqr_scratch: Vec<f64> = chunks.iter().map(|c| c.f0_iqr_st).collect();
+    let sigma_f0 = (compute_median(&mut iqr_scratch).unwrap_or(0.0) / 1.35)
+        .max(PROBE_F0_SIGMA_FLOOR_ST);
+
+    let mfcc_dim_count = (PROBE_MFCC_COEFFS - 1) as f64;
     let mut dist = vec![vec![0.0_f64; n]; n];
     for i in 0..n {
         for j in (i + 1)..n {
-            let d = acoustic_divergence(&chunks[i], &chunks[j]);
+            let mut sum_sq = 0.0_f64;
+            for ((&a_k, &b_k), &sig_k) in chunks[i].mfcc_mean[1..]
+                .iter()
+                .zip(chunks[j].mfcc_mean[1..].iter())
+                .zip(sigma_mfcc[1..].iter())
+            {
+                let z = (a_k - b_k) / sig_k;
+                sum_sq += z * z;
+            }
+            let d_mfcc = (sum_sq / mfcc_dim_count).max(0.0).sqrt();
+            let d_f0 =
+                ((chunks[i].f0_st_median - chunks[j].f0_st_median).abs() / sigma_f0).min(PROBE_F0_Z_CAP);
+            let combined = (d_mfcc * d_mfcc + (PROBE_F0_Z_WEIGHT * d_f0).powi(2)).sqrt();
+            let d = if combined.is_finite() { combined } else { 0.0 };
             dist[i][j] = d;
             dist[j][i] = d;
         }
@@ -1122,15 +1526,7 @@ pub fn estimate_speaker_count_from_wav_slices(wav_paths: &[&Path]) -> Result<usi
         let mut best_pair: Option<(usize, usize, f64)> = None;
         for i in 0..clusters.len() {
             for j in (i + 1)..clusters.len() {
-                let mut sum = 0.0_f64;
-                let mut cnt = 0usize;
-                for &a in &clusters[i] {
-                    for &b in &clusters[j] {
-                        sum += dist[a][b];
-                        cnt += 1;
-                    }
-                }
-                let avg = if cnt > 0 { sum / (cnt as f64) } else { 0.0 };
+                let avg = average_cluster_distance(&clusters[i], &clusters[j], &dist);
                 match best_pair {
                     Some((_, _, best_d)) if avg >= best_d => {}
                     _ => best_pair = Some((i, j, avg)),
@@ -1148,38 +1544,34 @@ pub fn estimate_speaker_count_from_wav_slices(wav_paths: &[&Path]) -> Result<usi
         clusters[i].extend(merged);
     }
 
-    let speaker_count = if n < 4 {
+    let speaker_count = if n < 6 {
         clusters.len()
     } else {
-        // Filter out isolated single-chunk acoustic outliers (e.g. brief cough/laughter)
-        // unless strongly separated from every other cluster.
+        clusters.sort_by_key(|a| std::cmp::Reverse(a.len()));
         let mut supported = 0usize;
         for (idx, members) in clusters.iter().enumerate() {
-            if members.len() >= 2 {
+            let min_other_dist = || {
+                clusters
+                    .iter()
+                    .enumerate()
+                    .filter(|&(other_idx, _)| other_idx != idx)
+                    .map(|(_, other_members)| {
+                        average_cluster_distance(members, other_members, &dist)
+                    })
+                    .fold(f64::INFINITY, f64::min)
+            };
+
+            if members.len() >= 3 {
                 supported += 1;
-                continue;
-            }
-            let min_other_dist = clusters
-                .iter()
-                .enumerate()
-                .filter(|&(other_idx, _)| other_idx != idx)
-                .map(|(_, other_members)| {
-                    let mut sum = 0.0_f64;
-                    let mut cnt = 0usize;
-                    for &a in members {
-                        for &b in other_members {
-                            sum += dist[a][b];
-                            cnt += 1;
-                        }
+            } else if members.len() == 2 {
+                if supported < 2 {
+                    if n < 24 || min_other_dist() >= 1.65 {
+                        supported += 1;
                     }
-                    if cnt > 0 {
-                        sum / (cnt as f64)
-                    } else {
-                        0.0
-                    }
-                })
-                .fold(f64::INFINITY, f64::min);
-            if min_other_dist >= PROBE_SINGLETON_STRONG_SEPARATION {
+                } else if n < 20 {
+                    supported += 1;
+                }
+            } else if n < 16 && min_other_dist() >= 2.10 {
                 supported += 1;
             }
         }
@@ -2010,5 +2402,107 @@ mod tests {
         for p in [s1_a, s1_b, s2_male, s2_female, s3_bass, s3_tenor, s3_sop, s_silence] {
             let _ = fs::remove_file(p);
         }
+    }
+
+    #[test]
+    fn estimate_speaker_count_detects_asymmetric_short_interviewer_turns_in_single_wav() {
+        let wav_path = temp_wav_path("probe_asym_interviewer");
+        let total_ms = 30_000usize;
+        let mut pcm = vec![0i16; total_ms * SAMPLES_PER_MS];
+
+        let speaker_a = VoiceProfile {
+            f0_hz: 92.0,
+            ..DARK_150HZ_PROFILE
+        };
+        let speaker_b = VoiceProfile {
+            f0_hz: 118.0,
+            formants: BRIGHT_150HZ_PROFILE.formants,
+            ..MALE_PROFILE
+        };
+
+        // Speaker B asks 2 short ~2.2 s questions; Speaker A answers for ~24 s
+        render_voiced_segment(&mut pcm, 200, 2_400, speaker_b);
+        render_voiced_segment(&mut pcm, 2_620, 14_600, speaker_a);
+        render_voiced_segment(&mut pcm, 14_820, 17_020, speaker_b);
+        render_voiced_segment(&mut pcm, 17_240, 29_500, speaker_a);
+
+        write_standard_16k_wav(&wav_path, &pcm);
+        let count = estimate_speaker_count_from_wav_slices(&[&wav_path]).unwrap();
+        let _ = fs::remove_file(&wav_path);
+
+        assert_eq!(
+            count, 2,
+            "Asymmetric single-WAV interview with short ~2.2 s interviewer turns should detect 2 speakers"
+        );
+    }
+
+    #[test]
+    fn estimate_speaker_count_does_not_false_split_expressive_single_speaker_with_wide_pitch_variation() {
+        let wav_path = temp_wav_path("probe_expressive_1spk");
+        let total_ms = 24_000usize;
+        let mut pcm = vec![0i16; total_ms * SAMPLES_PER_MS];
+
+        // Wide within-phrase vibrato/intonation (vibrato_depth 0.14) and shifting phrase pitch
+        // on the exact same vocal-tract formant profile
+        let f0_shifts = [108.0, 128.0, 114.0, 134.0, 112.0, 130.0, 116.0, 126.0];
+        for (idx, &f0) in f0_shifts.iter().enumerate() {
+            let start = (idx as u64) * 2_900 + 150;
+            let end = start + 2_500;
+            let prof = VoiceProfile {
+                f0_hz: f0,
+                vibrato_depth: 0.14,
+                ..MALE_PROFILE
+            };
+            render_voiced_segment(&mut pcm, start, end, prof);
+        }
+
+        write_standard_16k_wav(&wav_path, &pcm);
+        let count = estimate_speaker_count_from_wav_slices(&[&wav_path]).unwrap();
+        let _ = fs::remove_file(&wav_path);
+
+        assert_eq!(
+            count, 1,
+            "Expressive single speaker with wide pitch modulation should still cluster to 1"
+        );
+    }
+
+    #[test]
+    fn estimate_speaker_count_ignores_stationary_intro_drone_in_single_speaker_audio() {
+        let wav_path = temp_wav_path("probe_drone_1spk");
+        let total_ms = 24_000usize;
+        let mut pcm = vec![0i16; total_ms * SAMPLES_PER_MS];
+
+        // Stationary constant-amplitude intro tone/drone at 240 Hz in 0..2.2 s
+        let drone = VoiceProfile {
+            f0_hz: 240.0,
+            vibrato_depth: 0.0,
+            amplitude: 0.35,
+            formants: FEMALE_PROFILE.formants,
+        };
+        render_voiced_segment(&mut pcm, 100, 2_200, drone);
+
+        // Modulated single-speaker speech bursts (short 90 ms inter-syllable dips < 160 ms pause gate
+        // so each phrase forms one chunk with high p90/p10 modulation ratio)
+        let speaker = VoiceProfile {
+            f0_hz: 118.0,
+            ..MALE_PROFILE
+        };
+        for phrase in 0..7u64 {
+            let base = 2_800 + phrase * 2_900;
+            for syl in 0..5u64 {
+                let s = base + syl * 460;
+                let e = s + 370;
+                render_voiced_segment(&mut pcm, s, e, speaker);
+            }
+        }
+
+        write_standard_16k_wav(&wav_path, &pcm);
+        let count = estimate_speaker_count_from_wav_slices(&[&wav_path]).unwrap();
+        let _ = fs::remove_file(&wav_path);
+
+        assert_eq!(
+            count, 1,
+            "Stationary intro drone plus single modulated speaker should cluster to 1"
+        );
     }
 }

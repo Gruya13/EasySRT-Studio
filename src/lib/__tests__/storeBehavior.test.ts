@@ -812,4 +812,288 @@ describe("appStore v0.4.0 behaviors", () => {
       "too_many_lines",
     ]);
   });
+
+  it("startBatchPipeline('full') preserves cached style on completed files when translating an uncached style", async () => {
+    let transcribeCalls = 0;
+    let runFullCalls = 0;
+    const translatedInputs: SubtitleProject[] = [];
+
+    const formalOnlyProject = makeSampleProject({
+      jobId: "job-formal-01",
+      options: {
+        ...makeSampleProject().options,
+        translationStyle: "formal",
+      },
+      completedTranslationStyle: "formal",
+      completedTranslationBatches: 1,
+      cues: [
+        {
+          id: 1,
+          startMs: 500,
+          endMs: 2500,
+          sourceText: "How did you play?",
+          translatedText: "Kako ste odigrali?",
+          translatedVariants: { formal: "Kako ste odigrali?" },
+          cps: 9.0,
+          warnings: [],
+        },
+      ],
+    });
+
+    const store = createAppStore(
+      makeNoopDeps({
+        transcribeAudio: async () => {
+          transcribeCalls += 1;
+          return formalOnlyProject;
+        },
+        runFullPipeline: async () => {
+          runFullCalls += 1;
+          return formalOnlyProject;
+        },
+        translateProject: async (project) => {
+          translatedInputs.push(project);
+          return {
+            ...project,
+            phase: "completed",
+            completedTranslationBatches: 1,
+            completedTranslationStyle: "natural",
+            cues: project.cues.map((c) => ({
+              ...c,
+              translatedText: "Kako si odigrao?",
+              translatedVariants: {
+                ...(c.translatedVariants ?? {}),
+                natural: "Kako si odigrao?",
+              },
+            })),
+          };
+        },
+      }),
+    );
+
+    store.setState({
+      activeJobId: formalOnlyProject.jobId,
+      activeProject: formalOnlyProject,
+      batchQueue: [
+        {
+          jobId: formalOnlyProject.jobId,
+          audioPath: formalOnlyProject.audioPath,
+          audioFileName: formalOnlyProject.audioFileName,
+          phase: "completed",
+          percent: 100,
+          detail: "completed",
+          project: formalOnlyProject,
+          errorMessage: null,
+        },
+      ],
+    });
+
+    // Switch style to uncached "natural" and click Run ("full")
+    store.getState().switchTranslationStyle("natural");
+    await store.getState().startBatchPipeline("full");
+
+    assert.equal(transcribeCalls, 0);
+    assert.equal(runFullCalls, 0);
+    assert.equal(translatedInputs.length, 1);
+    assert.equal(translatedInputs[0].options.translationStyle, "natural");
+    assert.equal(translatedInputs[0].completedTranslationBatches, 0);
+    assert.equal(
+      translatedInputs[0].cues[0].translatedVariants?.formal,
+      "Kako ste odigrali?",
+    );
+    assert.deepEqual(
+      getTranslationStyleCacheStatus(store.getState().activeProject),
+      { natural: true, formal: true },
+    );
+
+    // Switch back to formal -> instant 0 ms swap without losing formal
+    store.getState().switchTranslationStyle("formal");
+    assert.equal(
+      store.getState().activeProject?.cues[0].translatedText,
+      "Kako ste odigrali?",
+    );
+
+    // Multi-file localLlama batch: both completed files have formal cached, switched to natural
+    const batchLlmInputs: SubtitleProject[][] = [];
+    const projA = makeSampleProject({
+      jobId: "job-batch-a",
+      audioPath: "/media/a.mp3",
+      audioFileName: "a.mp3",
+      options: { ...makeSampleProject().options, translationStyle: "formal" },
+      completedTranslationStyle: "formal",
+      cues: [
+        {
+          id: 1,
+          startMs: 500,
+          endMs: 2500,
+          sourceText: "First",
+          translatedText: "Prvi formalno.",
+          translatedVariants: { formal: "Prvi formalno." },
+          cps: 7.0,
+          warnings: [],
+        },
+      ],
+    });
+    const projB = makeSampleProject({
+      jobId: "job-batch-b",
+      audioPath: "/media/b.mp3",
+      audioFileName: "b.mp3",
+      options: { ...makeSampleProject().options, translationStyle: "formal" },
+      completedTranslationStyle: "formal",
+      cues: [
+        {
+          id: 1,
+          startMs: 500,
+          endMs: 2500,
+          sourceText: "Second",
+          translatedText: "Drugi formalno.",
+          translatedVariants: { formal: "Drugi formalno." },
+          cps: 7.5,
+          warnings: [],
+        },
+      ],
+    });
+    let batchTranscribeCalls = 0;
+    const localBatchStore = createAppStore(
+      makeNoopDeps({
+        transcribeAudio: async () => {
+          batchTranscribeCalls += 1;
+          return projA;
+        },
+        runLocalLlmBatch: async (projects) => {
+          batchLlmInputs.push(projects);
+          return projects.map((p) => ({ ...p, phase: "completed" as const }));
+        },
+      }),
+    );
+    localBatchStore.setState({
+      activeJobId: projA.jobId,
+      activeProject: projA,
+      jobOptions: { ...localBatchStore.getState().jobOptions, translationStyle: "natural" },
+      batchQueue: [
+        {
+          jobId: projA.jobId,
+          audioPath: projA.audioPath,
+          audioFileName: projA.audioFileName,
+          phase: "completed",
+          percent: 100,
+          detail: "completed",
+          project: projA,
+          errorMessage: null,
+        },
+        {
+          jobId: projB.jobId,
+          audioPath: projB.audioPath,
+          audioFileName: projB.audioFileName,
+          phase: "completed",
+          percent: 100,
+          detail: "completed",
+          project: projB,
+          errorMessage: null,
+        },
+      ],
+    });
+
+    await localBatchStore.getState().startBatchPipeline("full");
+    assert.equal(batchTranscribeCalls, 0);
+    assert.equal(batchLlmInputs.length, 1);
+    assert.equal(batchLlmInputs[0].length, 2);
+    assert.equal(batchLlmInputs[0][0].options.translationStyle, "natural");
+    assert.equal(
+      batchLlmInputs[0][0].cues[0].translatedVariants?.formal,
+      "Prvi formalno.",
+    );
+    assert.equal(
+      batchLlmInputs[0][1].cues[0].translatedVariants?.formal,
+      "Drugi formalno.",
+    );
+  });
+
+  it("translateActiveProject locks isRunningBatch, resets batches on completed projects, and keeps resume on failed projects", async () => {
+    let callCount = 0;
+    const seenInputs: SubtitleProject[] = [];
+    const resolveFirstRef: { current: ((p: SubtitleProject) => void) | null } = {
+      current: null,
+    };
+    let firstStartedResolve: (() => void) | null = null;
+    const firstStarted = new Promise<void>((r) => {
+      firstStartedResolve = r;
+    });
+
+    const refreshedProject = makeSampleProject({
+      jobId: "job-lock-01",
+      completedTranslationBatches: 3,
+    });
+
+    const store = createAppStore(
+      makeNoopDeps({
+        listCheckpoints: async () => [refreshedProject],
+        translateProject: async (project) => {
+          callCount += 1;
+          seenInputs.push(project);
+          if (callCount === 1) {
+            firstStartedResolve?.();
+            return new Promise<SubtitleProject>((resolve) => {
+              resolveFirstRef.current = resolve;
+            });
+          }
+          return { ...project, phase: "completed" };
+        },
+      }),
+    );
+
+    const completedProj = makeSampleProject({
+      jobId: "job-lock-01",
+      phase: "completed",
+      completedTranslationStyle: "natural",
+      completedTranslationBatches: 3,
+    });
+    store.setState({
+      activeJobId: completedProj.jobId,
+      activeProject: completedProj,
+      jobOptions: { ...store.getState().jobOptions, translationStyle: "natural" },
+    });
+
+    const p1 = store.getState().translateActiveProject();
+    await firstStarted;
+    assert.equal(store.getState().isRunningBatch, true);
+
+    // Concurrent invocation must be ignored while locked
+    await store.getState().translateActiveProject();
+    assert.equal(callCount, 1);
+    assert.equal(
+      seenInputs[0].completedTranslationBatches,
+      0,
+      "Completed project re-translation must reset completedTranslationBatches to 0",
+    );
+
+    resolveFirstRef.current?.({
+      ...seenInputs[0],
+      phase: "completed",
+      completedTranslationBatches: 3,
+    });
+    await p1;
+    assert.equal(store.getState().isRunningBatch, false);
+    assert.equal(store.getState().checkpoints.length, 1);
+
+    // Failed project on the same style preserves completedTranslationBatches for resume
+    const failedProj = makeSampleProject({
+      jobId: "job-lock-01",
+      phase: "failed",
+      completedTranslationStyle: "natural",
+      completedTranslationBatches: 2,
+    });
+    store.setState({
+      activeJobId: failedProj.jobId,
+      activeProject: failedProj,
+    });
+
+    await store.getState().translateActiveProject();
+    assert.equal(callCount, 2);
+    assert.equal(
+      seenInputs[1].completedTranslationBatches,
+      2,
+      "Failed project resume must preserve completedTranslationBatches",
+    );
+    assert.equal(store.getState().isRunningBatch, false);
+  });
 });

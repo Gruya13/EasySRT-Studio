@@ -31,9 +31,9 @@ use std::sync::{
 };
 use tauri::{AppHandle, Emitter};
 
-const SHORT_CLIP_THRESHOLD_MS: u64 = 60_000;
-const SPARSE_WINDOW_SECS: f64 = 12.0;
-const SPARSE_WINDOW_FRACTIONS: [f64; 4] = [0.05, 0.30, 0.60, 0.85];
+const SHORT_CLIP_THRESHOLD_MS: u64 = 90_000;
+const SPARSE_WINDOW_SECS: f64 = 14.0;
+const SPARSE_WINDOW_FRACTIONS: [f64; 6] = [0.0, 0.16, 0.34, 0.52, 0.70, 0.88];
 const ASR_SNIPPET_WINDOW_SECS: f64 = 35.0;
 const MAX_SNIPPET_WORDS: usize = 120;
 const MIN_SNIPPET_WORDS_FOR_TOPIC: usize = 5;
@@ -68,15 +68,15 @@ impl Drop for TempFileCleanupGuard {
 }
 
 /// Computes sparse `(start_secs, duration_secs)` windows for Stage 1 acoustic probing:
-/// - Clips `< 60 s`: single full-clip window `(0.0, dur_secs)`.
-/// - Clips `>= 60 s`: up to 4 sparse 12-second windows at `5%`, `30%`, `60%`, `85%`.
+/// - Clips `<= 90 s`: single full-clip window `(0.0, dur_secs)`.
+/// - Clips `> 90 s`: up to 6 sparse 14-second windows at `0%`, `16%`, `34%`, `52%`, `70%`, `88%`.
 pub fn compute_probe_window_plan(duration_ms: u64) -> Vec<(f64, f64)> {
     if duration_ms == 0 {
         return vec![(0.0, SPARSE_WINDOW_SECS)];
     }
 
     let dur_secs = (duration_ms as f64) / 1000.0;
-    if duration_ms < SHORT_CLIP_THRESHOLD_MS {
+    if duration_ms <= SHORT_CLIP_THRESHOLD_MS {
         return vec![(0.0, dur_secs.max(0.5))];
     }
 
@@ -334,7 +334,7 @@ pub async fn probe_media_file(
     let mut cleanup = TempFileCleanupGuard::new();
 
     // -----------------------------------------------------------------------
-    // Stage 1: Acoustic & Speaker Probe (FFmpeg duration + sparse 12 s windows)
+    // Stage 1: Acoustic & Speaker Probe (FFmpeg duration + full <= 90 s or sparse 14 s windows)
     // -----------------------------------------------------------------------
     let duration_ms = match ffmpeg::probe_media_duration_ms(&ffmpeg_bin, &canonical_path).await {
         Ok(ms) => ms,
@@ -359,7 +359,7 @@ pub async fn probe_media_file(
     }
 
     let window_plan = compute_probe_window_plan(duration_ms);
-    let mut window_paths: Vec<PathBuf> = Vec::with_capacity(window_plan.len());
+    let mut window_entries: Vec<(f64, PathBuf)> = Vec::with_capacity(window_plan.len());
     for (idx, (start_secs, win_dur)) in window_plan.iter().enumerate() {
         if cancel_flag.load(Ordering::SeqCst) {
             result.stage = "cancelled".to_string();
@@ -379,7 +379,7 @@ pub async fn probe_media_file(
         .await
         {
             Ok(extracted_ms) if extracted_ms > 0 => {
-                window_paths.push(win_path);
+                window_entries.push((*start_secs, win_path));
             }
             Ok(_) => {}
             Err(err) => {
@@ -396,8 +396,8 @@ pub async fn probe_media_file(
         }
     }
 
-    if !window_paths.is_empty() {
-        let paths_for_cpu = window_paths.clone();
+    if !window_entries.is_empty() {
+        let paths_for_cpu: Vec<PathBuf> = window_entries.iter().map(|(_, p)| p.clone()).collect();
         let flag_for_cpu = Arc::clone(&cancel_flag);
         let acoustic_res = tokio::task::spawn_blocking(move || {
             let refs: Vec<&Path> = paths_for_cpu.iter().map(PathBuf::as_path).collect();
@@ -451,9 +451,9 @@ pub async fn probe_media_file(
     if let (Some(whisper_bin), Some(whisper_model), vad_model) = whisper_assets {
         let asr_wav = if duration_ms > 0
             && duration_ms <= (ASR_SNIPPET_WINDOW_SECS as u64) * 1000
-            && window_paths.len() == 1
+            && window_entries.len() == 1
         {
-            Some(window_paths[0].clone())
+            Some(window_entries[0].1.clone())
         } else {
             let asr_dur = if duration_ms > 0 {
                 ASR_SNIPPET_WINDOW_SECS.min((duration_ms as f64 / 1000.0).max(1.0))
@@ -507,6 +507,40 @@ pub async fn probe_media_file(
             .await
             {
                 Ok(whisper_out) => {
+                    if duration_ms > SHORT_CLIP_THRESHOLD_MS
+                        && result.estimated_speakers.unwrap_or(1) <= 1
+                        && !window_entries.is_empty()
+                        && asr_wav_path != window_entries[0].1
+                        && !cancel_flag.load(Ordering::SeqCst)
+                    {
+                        let asr_dur =
+                            ASR_SNIPPET_WINDOW_SECS.min((duration_ms as f64 / 1000.0).max(1.0));
+                        let mut refined_paths = Vec::with_capacity(1 + window_entries.len());
+                        refined_paths.push(asr_wav_path.clone());
+                        for (start_secs, p) in &window_entries {
+                            if *start_secs >= asr_dur - 1.0 {
+                                refined_paths.push(p.clone());
+                            }
+                        }
+                        if let Ok(Ok(refined_spk)) = tokio::task::spawn_blocking(move || {
+                            let refs: Vec<&Path> =
+                                refined_paths.iter().map(PathBuf::as_path).collect();
+                            diarizer::estimate_speaker_count_from_wav_slices(&refs)
+                        })
+                        .await
+                        {
+                            if cancel_flag.load(Ordering::SeqCst) {
+                                result.stage = "cancelled".to_string();
+                                emit_probe_progress(app, &result);
+                                return Ok(result);
+                            }
+                            let refined_u32 = (refined_spk as u32).clamp(1, 3);
+                            if refined_u32 > result.estimated_speakers.unwrap_or(1) {
+                                result.estimated_speakers = Some(refined_u32);
+                            }
+                        }
+                    }
+
                     result.detected_language = whisper_out.detected_language.clone();
                     snippet_text = extract_snippet_text(&whisper_out.words, MAX_SNIPPET_WORDS);
                     result.stage = "asr".to_string();
@@ -633,9 +667,17 @@ pub async fn probe_media_file(
                 }
 
                 match topic_res {
-                    Ok((topic, suggested_style)) => {
-                        result.topic = Some(topic);
-                        result.suggested_style = Some(suggested_style);
+                    Ok(classification) => {
+                        result.topic = Some(classification.topic);
+                        result.suggested_style = Some(classification.suggested_style);
+                        if let Some(llm_speakers) = classification.estimated_speakers {
+                            let merged = result
+                                .estimated_speakers
+                                .unwrap_or(1)
+                                .max(llm_speakers)
+                                .clamp(1, 3);
+                            result.estimated_speakers = Some(merged);
+                        }
                         result.stage = "topic".to_string();
                         emit_probe_progress(app, &result);
                     }
@@ -789,14 +831,17 @@ mod tests {
         assert!((short[0].0 - 0.0).abs() < 1e-6);
         assert!((short[0].1 - 28.0).abs() < 1e-6);
 
+        let medium = compute_probe_window_plan(80_640);
+        assert_eq!(medium.len(), 1);
+        assert!((medium[0].0 - 0.0).abs() < 1e-6);
+        assert!((medium[0].1 - 80.64).abs() < 1e-6);
+
         let long = compute_probe_window_plan(600_000); // 10 minutes
-        assert_eq!(long.len(), 4);
-        assert!((long[0].0 - 30.0).abs() < 1e-6); // 5%
-        assert!((long[1].0 - 180.0).abs() < 1e-6); // 30%
-        assert!((long[2].0 - 360.0).abs() < 1e-6); // 60%
-        assert!((long[3].0 - 510.0).abs() < 1e-6); // 85%
-        for (_, dur) in long {
-            assert!((dur - 12.0).abs() < 1e-6);
+        assert_eq!(long.len(), 6);
+        let expected_starts = [0.0, 96.0, 204.0, 312.0, 420.0, 528.0];
+        for ((start, dur), exp_start) in long.into_iter().zip(expected_starts) {
+            assert!((start - exp_start).abs() < 1e-6);
+            assert!((dur - 14.0).abs() < 1e-6);
         }
     }
 
@@ -904,6 +949,84 @@ mod tests {
         assert!(aborted.is_err());
         assert!(t1.elapsed() < Duration::from_millis(100));
 
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[tokio::test]
+    #[ignore = "Manual real-audio probe verification via EASYSRT_VERIFY_PROBE_FILES"]
+    async fn verify_real_media_probe_from_env() {
+        let Ok(raw_list) = std::env::var("EASYSRT_VERIFY_PROBE_FILES") else {
+            return;
+        };
+        let ffmpeg_bin = std::env::var_os("PATH")
+            .and_then(|paths| {
+                std::env::split_paths(&paths)
+                    .map(|dir| {
+                        dir.join(if cfg!(windows) {
+                            "ffmpeg.exe"
+                        } else {
+                            "ffmpeg"
+                        })
+                    })
+                    .find(|p| p.is_file())
+            })
+            .expect("ffmpeg binary must be present in PATH");
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_real_probe_verify_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+        let cancel = Arc::new(AtomicBool::new(false));
+        let mut cleanup = TempFileCleanupGuard::new();
+
+        for (file_idx, raw_path) in raw_list
+            .split(';')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .enumerate()
+        {
+            let media_path = ffmpeg::validate_approved_media_file(raw_path).unwrap();
+            let dur_ms = ffmpeg::probe_media_duration_ms(&ffmpeg_bin, &media_path)
+                .await
+                .unwrap();
+            let plan = compute_probe_window_plan(dur_ms);
+            let mut wav_paths = Vec::with_capacity(plan.len());
+
+            for (win_idx, (start_secs, win_dur)) in plan.iter().enumerate() {
+                let win_wav = temp_dir.join(format!("real_{file_idx}_{win_idx}.wav"));
+                cleanup.track(win_wav.clone());
+                let extracted = ffmpeg::extract_pcm16_window_wav(
+                    &ffmpeg_bin,
+                    &media_path,
+                    &win_wav,
+                    *start_secs,
+                    *win_dur,
+                    &cancel,
+                )
+                .await
+                .unwrap();
+                if extracted > 0 {
+                    wav_paths.push(win_wav);
+                }
+            }
+
+            let t0 = Instant::now();
+            let refs: Vec<&Path> = wav_paths.iter().map(PathBuf::as_path).collect();
+            let (speakers, speech_ratio) = analyze_acoustic_wav_slices(&refs, &cancel).unwrap();
+            let cpu_ms = t0.elapsed().as_millis();
+
+            let file_name = media_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(raw_path);
+            println!(
+                "{file_name} | dur_ms={dur_ms} | windows={} | speakers={speakers} | speech_ratio={speech_ratio:.3} | cpu_ms={cpu_ms}",
+                wav_paths.len()
+            );
+        }
+
+        drop(cleanup);
         let _ = fs::remove_dir_all(&temp_dir);
     }
 }

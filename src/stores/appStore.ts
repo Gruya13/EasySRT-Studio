@@ -2242,6 +2242,60 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
             return null;
           };
 
+          const canReuseExistingForStyleLlm = (
+            item: BatchQueueItem,
+            options: JobOptions,
+          ): {
+            project: SubtitleProject;
+            stagePhase: "translating" | "polishing";
+          } | null => {
+            if (
+              mode !== "full" ||
+              item.phase !== "completed" ||
+              !item.project ||
+              item.project.cues.length === 0
+            ) {
+              return null;
+            }
+            const seeded = seedProjectTranslatedVariants(item.project);
+            const targetStyle = normalizeTranslationStyle(
+              options.translationStyle,
+            );
+            const styleCache = getTranslationStyleCacheStatus(seeded);
+            if (styleCache[targetStyle]) {
+              return null;
+            }
+            const stagePhase = classifyLlmStage(seeded, options);
+            if (!stagePhase) {
+              return null;
+            }
+            const topicContext =
+              seeded.topicContext ??
+              get().probeResults[item.jobId]?.topic?.trim() ??
+              null;
+            const shouldResetBatches =
+              seeded.completedTranslationStyle !== targetStyle ||
+              seeded.phase === "completed";
+            return {
+              stagePhase,
+              project: {
+                ...seeded,
+                options: {
+                  ...seeded.options,
+                  ...options,
+                  translationStyle: targetStyle,
+                  segmentRules: seeded.options.segmentRules,
+                },
+                completedTranslationBatches: shouldResetBatches
+                  ? 0
+                  : seeded.completedTranslationBatches,
+                topicContext,
+                phase: stagePhase,
+                errorMessage: null,
+              },
+            };
+          };
+
           if (canPipelineCloud) {
             // Pipeline GPU Whisper transcription (sequential on GPU) with
             // async cloud LLM translation/polishing across queued files.
@@ -2252,6 +2306,45 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                 break;
               }
               const currentOptions = { ...get().jobOptions };
+              const reuse = canReuseExistingForStyleLlm(item, currentOptions);
+              if (reuse) {
+                set((s) => ({
+                  batchQueue: s.batchQueue.map((q) =>
+                    q.jobId === item.jobId
+                      ? {
+                          ...q,
+                          phase: reuse.stagePhase,
+                          percent: 55,
+                          errorMessage: null,
+                        }
+                      : q,
+                  ),
+                }));
+                syncProjectIntoQueueAndState(reuse.project);
+                const cloudTask = (async () => {
+                  try {
+                    const finished =
+                      reuse.stagePhase === "translating"
+                        ? await deps.translateProject(reuse.project)
+                        : await deps.polishProject(reuse.project);
+                    if (get().queueCancelRequested) {
+                      await handleJobError(
+                        item.jobId,
+                        item.audioFileName,
+                        new Error("Job cancelled"),
+                        finished,
+                      );
+                      return;
+                    }
+                    syncProjectIntoQueueAndState(finished);
+                  } catch (err) {
+                    await handleJobError(item.jobId, item.audioFileName, err);
+                  }
+                })();
+                pendingCloudTasks.push(cloudTask);
+                continue;
+              }
+
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
@@ -2347,6 +2440,16 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                 break;
               }
               const currentOptions = { ...get().jobOptions };
+              const reuse = canReuseExistingForStyleLlm(item, currentOptions);
+              if (reuse) {
+                syncProjectIntoQueueAndState(reuse.project);
+                transcribedEntries.push({
+                  project: reuse.project,
+                  options: currentOptions,
+                });
+                continue;
+              }
+
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
@@ -2464,6 +2567,45 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                 break;
               }
               const currentOptions = { ...get().jobOptions };
+              const reuse = canReuseExistingForStyleLlm(item, currentOptions);
+              if (reuse) {
+                set((s) => ({
+                  batchQueue: s.batchQueue.map((q) =>
+                    q.jobId === item.jobId
+                      ? {
+                          ...q,
+                          phase: reuse.stagePhase,
+                          percent: 55,
+                          errorMessage: null,
+                        }
+                      : q,
+                  ),
+                }));
+                syncProjectIntoQueueAndState(reuse.project);
+                try {
+                  const finished =
+                    reuse.stagePhase === "translating"
+                      ? await deps.translateProject(reuse.project)
+                      : await deps.polishProject(reuse.project);
+                  if (get().queueCancelRequested) {
+                    await handleJobError(
+                      item.jobId,
+                      item.audioFileName,
+                      new Error("Job cancelled"),
+                      finished,
+                    );
+                    break;
+                  }
+                  syncProjectIntoQueueAndState(finished);
+                } catch (err) {
+                  await handleJobError(item.jobId, item.audioFileName, err);
+                  if (get().queueCancelRequested) {
+                    break;
+                  }
+                }
+                continue;
+              }
+
               set((s) => ({
                 batchQueue: s.batchQueue.map((q) =>
                   q.jobId === item.jobId
@@ -2615,117 +2757,156 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
     },
 
     translateActiveProject: () => {
-      const { activeProject, jobOptions } = get();
-      if (!activeProject) {
+      const { activeProject, jobOptions, isRunningBatch } = get();
+      if (!activeProject || activeProject.cues.length === 0 || isRunningBatch) {
         return Promise.resolve();
       }
       return withOnlineGuard(true, "Translate Project", async () => {
-        set({ queueCancelRequested: false });
-        await flushCheckpointAutosave();
-        await preemptActiveProbe();
-        const latestProject = get().activeProject ?? activeProject;
-        const targetStyle = normalizeTranslationStyle(
-          jobOptions.translationStyle ?? latestProject.options.translationStyle,
-        );
-        const topicContext =
-          latestProject.topicContext ??
-          get().probeResults[latestProject.jobId]?.topic ??
-          null;
-        const isSwitchingStyle =
-          latestProject.completedTranslationStyle !== targetStyle;
-        const projectWithUpdatedOptions: SubtitleProject = {
-          ...latestProject,
-          options: {
-            ...latestProject.options,
-            ...jobOptions,
-            translationStyle: targetStyle,
-            targetLanguage:
-              jobOptions.targetLanguage === "none"
-                ? "sr"
-                : jobOptions.targetLanguage,
-          },
-          completedTranslationBatches: isSwitchingStyle
-            ? 0
-            : latestProject.completedTranslationBatches,
-          topicContext,
-          phase: "translating",
-        };
-        syncProjectIntoQueueAndState(projectWithUpdatedOptions);
+        set({ isRunningBatch: true, queueCancelRequested: false });
         try {
-          const translated = await deps.translateProject(
-            projectWithUpdatedOptions,
+          await flushCheckpointAutosave();
+          await preemptActiveProbe();
+          const latestProject = seedProjectTranslatedVariants(
+            get().activeProject ?? activeProject,
           );
-          syncProjectIntoQueueAndState(translated);
-        } catch (err) {
-          const cancelled =
-            get().queueCancelRequested || isCancellationError(err);
-          const msg = err instanceof Error ? err.message : String(err);
-          syncProjectIntoQueueAndState({
-            ...projectWithUpdatedOptions,
-            phase: cancelled ? "cancelled" : "failed",
-            errorMessage: cancelled ? null : msg,
-          });
-          if (!cancelled) {
+          const targetStyle = normalizeTranslationStyle(
+            jobOptions.translationStyle ??
+              latestProject.options.translationStyle,
+          );
+          const topicContext =
+            latestProject.topicContext ??
+            get().probeResults[latestProject.jobId]?.topic ??
+            null;
+          const isSwitchingStyle =
+            latestProject.completedTranslationStyle !== targetStyle;
+          const shouldResetBatches =
+            isSwitchingStyle || latestProject.phase === "completed";
+          const projectWithUpdatedOptions: SubtitleProject = {
+            ...latestProject,
+            options: {
+              ...latestProject.options,
+              ...jobOptions,
+              translationStyle: targetStyle,
+              targetLanguage:
+                jobOptions.targetLanguage === "none"
+                  ? "sr"
+                  : jobOptions.targetLanguage,
+            },
+            completedTranslationBatches: shouldResetBatches
+              ? 0
+              : latestProject.completedTranslationBatches,
+            topicContext,
+            phase: "translating",
+            errorMessage: null,
+          };
+          syncProjectIntoQueueAndState(projectWithUpdatedOptions);
+          try {
+            const translated = await deps.translateProject(
+              projectWithUpdatedOptions,
+            );
+            syncProjectIntoQueueAndState(translated);
+            const rawCheckpoints = await deps
+              .listCheckpoints()
+              .catch(() => get().checkpoints);
             set({
-              banner: {
-                type: "error",
-                message: msg,
-              },
+              checkpoints: rawCheckpoints.map(seedProjectTranslatedVariants),
             });
+          } catch (err) {
+            const cancelled =
+              get().queueCancelRequested || isCancellationError(err);
+            const msg = err instanceof Error ? err.message : String(err);
+            syncProjectIntoQueueAndState({
+              ...projectWithUpdatedOptions,
+              phase: cancelled ? "cancelled" : "failed",
+              errorMessage: cancelled ? null : msg,
+            });
+            if (!cancelled) {
+              set({
+                banner: {
+                  type: "error",
+                  message: msg,
+                },
+              });
+            }
           }
         } finally {
-          set({ queueCancelRequested: false });
+          set({ isRunningBatch: false, queueCancelRequested: false });
         }
       });
     },
 
     polishActiveProject: () => {
-      const { activeProject, jobOptions } = get();
-      if (!activeProject) {
+      const { activeProject, jobOptions, isRunningBatch } = get();
+      if (!activeProject || activeProject.cues.length === 0 || isRunningBatch) {
         return Promise.resolve();
       }
       return withOnlineGuard(true, "Polish Serbian Transcript", async () => {
-        set({ queueCancelRequested: false });
-        await flushCheckpointAutosave();
-        await preemptActiveProbe();
-        const latestProject = get().activeProject ?? activeProject;
-        const topicContext =
-          latestProject.topicContext ??
-          get().probeResults[latestProject.jobId]?.topic ??
-          null;
-        const projectWithUpdatedOptions: SubtitleProject = {
-          ...latestProject,
-          options: {
-            ...latestProject.options,
-            ...jobOptions,
-            polishSerbian: true,
-          },
-          topicContext,
-          phase: "polishing",
-        };
-        syncProjectIntoQueueAndState(projectWithUpdatedOptions);
+        set({ isRunningBatch: true, queueCancelRequested: false });
         try {
-          const polished = await deps.polishProject(projectWithUpdatedOptions);
-          syncProjectIntoQueueAndState(polished);
-        } catch (err) {
-          const cancelled =
-            get().queueCancelRequested || isCancellationError(err);
-          const msg = err instanceof Error ? err.message : String(err);
-          syncProjectIntoQueueAndState({
-            ...projectWithUpdatedOptions,
-            phase: cancelled ? "cancelled" : "failed",
-            errorMessage: cancelled ? null : msg,
-          });
-          if (!cancelled) {
+          await flushCheckpointAutosave();
+          await preemptActiveProbe();
+          const latestProject = seedProjectTranslatedVariants(
+            get().activeProject ?? activeProject,
+          );
+          const targetStyle = normalizeTranslationStyle(
+            jobOptions.translationStyle ??
+              latestProject.options.translationStyle,
+          );
+          const topicContext =
+            latestProject.topicContext ??
+            get().probeResults[latestProject.jobId]?.topic ??
+            null;
+          const isSwitchingStyle =
+            latestProject.completedTranslationStyle !== targetStyle;
+          const shouldResetBatches =
+            isSwitchingStyle || latestProject.phase === "completed";
+          const projectWithUpdatedOptions: SubtitleProject = {
+            ...latestProject,
+            options: {
+              ...latestProject.options,
+              ...jobOptions,
+              translationStyle: targetStyle,
+              polishSerbian: true,
+            },
+            completedTranslationBatches: shouldResetBatches
+              ? 0
+              : latestProject.completedTranslationBatches,
+            topicContext,
+            phase: "polishing",
+            errorMessage: null,
+          };
+          syncProjectIntoQueueAndState(projectWithUpdatedOptions);
+          try {
+            const polished = await deps.polishProject(
+              projectWithUpdatedOptions,
+            );
+            syncProjectIntoQueueAndState(polished);
+            const rawCheckpoints = await deps
+              .listCheckpoints()
+              .catch(() => get().checkpoints);
             set({
-              banner: {
-                type: "error",
-                message: msg,
-              },
+              checkpoints: rawCheckpoints.map(seedProjectTranslatedVariants),
             });
+          } catch (err) {
+            const cancelled =
+              get().queueCancelRequested || isCancellationError(err);
+            const msg = err instanceof Error ? err.message : String(err);
+            syncProjectIntoQueueAndState({
+              ...projectWithUpdatedOptions,
+              phase: cancelled ? "cancelled" : "failed",
+              errorMessage: cancelled ? null : msg,
+            });
+            if (!cancelled) {
+              set({
+                banner: {
+                  type: "error",
+                  message: msg,
+                },
+              });
+            }
           }
         } finally {
-          set({ queueCancelRequested: false });
+          set({ isRunningBatch: false, queueCancelRequested: false });
         }
       });
     },

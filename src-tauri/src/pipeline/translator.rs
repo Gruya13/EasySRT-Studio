@@ -784,14 +784,35 @@ fn sanitize_topic_context(raw: &str) -> Option<String> {
 fn build_serbian_style_guidelines(formal_style: bool, remove_fillers: bool) -> String {
     let register_rule = if formal_style {
         "REGISTER & STYLE (Formal broadcast/documentary Serbian — standardni književni stil): \
-         Use polished, clear formal Serbian and consistent formal 'Vi' address across \
-         `context_before`, `translate_cues`, and `context_after`. Avoid slang while staying \
-         genuinely idiomatic Serbian (u duhu srpskog jezika) without stiff English calques."
+         Strictly use formal 'Vi' address ('rekli ste', 'šta smatrate', 'kako biste ocenili') or \
+         impersonal standard constructions ('potrebno je voditi računa', 'neophodno je') instead of \
+         generic 'ti', keeping register consistent across `context_before`, `translate_cues`, and \
+         `context_after`. Use refined broadcast/journalistic/literary Serbian ('smatrati', 'oceniti', \
+         'neophodno', 'izuzetno', 'nesumnjivo', 'pretrpeti poraz', 'u redu'), prefer clean infinitive \
+         complements where natural ('moramo voditi računa', 'možemo izvući pouku'), and strictly avoid \
+         colloquialisms, casual particles, and slang ('baš', 'skroz', 'fali', 'okej', 'važi', 'brate', \
+         'super', 'i tako to') while staying genuinely idiomatic Serbian (u duhu srpskog jezika) without \
+         stiff English calques.\n\
+         - FORMAL STYLE EXAMPLES:\n\
+           * \"What do you feel you did wrong?\" -> \"Šta smatrate da ste pogrešili?\" (NOT \"Šta misliš da si pogrešio?\")\n\
+           * \"You got to take care of your bodies.\" -> \"Neophodno je voditi računa o telu.\" / \"Morate voditi računa o svom telu.\" (NOT \"Moraš da paziš na telo.\")\n\
+           * \"It's super tough, we needed a ton of energy.\" -> \"Izuzetno je teško, bilo nam je neophodno mnogo više energije.\" (NOT \"Baš je teško, falilo nam je mnogo energije.\")\n\
+           * \"Three words, okay.\" -> \"Tri reči, u redu.\" (NOT \"Tri reči, važi.\")"
     } else {
         "REGISTER & STYLE (Natural contemporary spoken Serbian — prirodan govorni srpski): \
-         Write fluid, conversational Serbian matching the speaker's tone. Maintain consistent \
-         formal ('Vi') vs informal ('ti') address across `context_before`, `translate_cues`, \
-         and `context_after`."
+         Default to direct, informal 'ti' address ('rekao si', 'šta misliš', 'kako bi opisao'; generic \
+         'you' -> 'moraš', 'treba ti') rather than stiff formal 'Vi' (reserve 'Vi' only when the speaker \
+         explicitly addresses a formal title/dignitary), staying consistent across `context_before`, \
+         `translate_cues`, and `context_after`. Use lively everyday spoken Serbian ('baš', 'stvarno', \
+         'fali', 'treba nam', 'važi', 'dobro', 'idemo dalje', 'teška utakmica'), prefer spoken \
+         'da' + present constructions ('moramo da vodimo računa', 'možemo da naučimo') over bookish \
+         infinitives, and avoid stiff newspaper/bureaucratic wording ('smatrate', 'neophodno je', \
+         'izuzetno', 'adekvatno', 'realizovati'). Keep it authentic everyday speech, never forced caricature slang.\n\
+         - NATURAL SPOKEN STYLE EXAMPLES:\n\
+           * \"What do you feel you did wrong?\" -> \"Šta misliš da si pogrešio?\" (NOT \"Šta smatrate da ste pogrešili?\")\n\
+           * \"You got to take care of your bodies.\" -> \"Moraš da paziš na telo.\" / \"Treba da čuvamo telo.\" (NOT \"Neophodno je voditi računa o svom telu.\")\n\
+           * \"It's super tough, we needed a ton of energy.\" -> \"Baš je teško, falilo nam je mnogo energije.\" (NOT \"Izuzetno je teško, bilo nam je neophodno mnogo više energije.\")\n\
+           * \"Three words, okay.\" -> \"Tri reči, važi.\" (NOT \"Tri reči, u redu.\")"
     };
 
     let idioms_rule = if remove_fillers {
@@ -873,10 +894,15 @@ pub fn build_system_prompt_with_options(
     let mut prompt = match operation {
         BatchOperation::Translate => {
             let target_instructions = if target_is_sr {
-                "Translate into natural, idiomatic Serbian (u duhu srpskog jezika, strict Ekavian standard). \
-                 If any cue is already in Serbian (e.g., a Serbian host intro before a foreign-language interview), \
-                 keep it in Serbian and polish any minor ASR errors into natural Ekavian Serbian. \
-                 Keep subtitle phrasing concise for comfortable reading speed."
+                if opts.formal_style {
+                    "Translate into polished formal broadcast and literary Serbian (standardni književni stil, u duhu srpskog jezika, strict Ekavian standard). \
+                     If any cue is already in Serbian, refine it into formal standard Ekavian Serbian and fix any ASR errors. \
+                     Keep subtitle phrasing concise for comfortable reading speed."
+                } else {
+                    "Translate into lively, everyday contemporary spoken Serbian (prirodan govorni srpski, u duhu srpskog jezika, strict Ekavian standard) — the way real people naturally speak in Serbia today. \
+                     If any cue is already in Serbian, keep it in natural spoken Ekavian Serbian and fix minor ASR errors. \
+                     Keep subtitle phrasing concise for comfortable reading speed."
+                }
             } else {
                 "Translate accurately, idiomatically, and concisely into the target language for subtitles."
             };
@@ -1348,6 +1374,13 @@ async fn call_chat_completions(
     Ok(content)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MediaTopicClassification {
+    pub topic: String,
+    pub suggested_style: TranslationStyle,
+    pub estimated_speakers: Option<u32>,
+}
+
 #[derive(Debug, Deserialize)]
 struct TopicClassificationResponse {
     topic: String,
@@ -1358,17 +1391,25 @@ struct TopicClassificationResponse {
         alias = "style"
     )]
     suggested_style: Option<String>,
+    #[serde(
+        default,
+        alias = "estimatedSpeakers",
+        alias = "estimated_speakers",
+        alias = "speakers"
+    )]
+    estimated_speakers: Option<u32>,
 }
 
-/// Classifies a short media transcript snippet into a concise topic/domain summary and
-/// recommended Serbian translation register (`Natural` vs `Formal`).
+/// Classifies a short media transcript snippet into a concise topic/domain summary,
+/// recommended Serbian translation register (`Natural` vs `Formal`), and conservative
+/// transcript-based speaker count estimate (`1..=3` when clearly evidenced).
 /// Enforces `SEC-H2` URL validation, zero redirects, and a short 15-second timeout.
 pub async fn classify_media_topic(
     endpoint: &LlmEndpointConfig,
     snippet: &str,
     detected_language: Option<&str>,
     cancel_flag: &Arc<AtomicBool>,
-) -> Result<(String, TranslationStyle)> {
+) -> Result<MediaTopicClassification> {
     if cancel_flag.load(Ordering::SeqCst) {
         return Err(anyhow!("Job cancelled"));
     }
@@ -1384,11 +1425,14 @@ pub async fn classify_media_topic(
     let client = build_http_client(Duration::from_secs(15))?;
 
     let system_prompt = "You classify audio/video transcript snippets for a subtitle translation studio.\n\
-         Output ONLY a strict compact JSON object with exactly two keys:\n\
-         {\"topic\": \"<concise 3-7 word topic/domain summary>\", \"suggestedStyle\": \"natural\" | \"formal\"}\n\
+         Output ONLY a strict compact JSON object with exactly three keys:\n\
+         {\"topic\": \"<concise 3-7 word topic/domain summary>\", \"suggestedStyle\": \"natural\" | \"formal\", \"estimatedSpeakers\": 1 | 2 | 3}\n\
          RULES:\n\
          - Use \"natural\" for podcasts, interviews, vlogs, dialogue, gaming, comedy, or everyday conversational speech.\n\
          - Use \"formal\" for documentaries, news broadcasts, academic/scientific lectures, legal/medical/corporate presentations, or official speeches.\n\
+         - For `estimatedSpeakers`: use 1 for monologues, narrations, single-anchor news reports, lectures, tutorials, poetry, or storytelling (including rhetorical questions or quotes spoken by one narrator).\n\
+         - Use 2 ONLY when the snippet unmistakably shows back-and-forth exchange between two distinct people (e.g., an interviewer asking a question and an interviewee answering, or two people greeting/conversing).\n\
+         - Use 3 ONLY when 3 or more distinct speakers clearly participate in the snippet.\n\
          - Keep `topic` concise (3-7 words, no line breaks, no markdown fences, no commentary).";
 
     let user_payload = serde_json::json!({
@@ -1414,9 +1458,14 @@ pub async fn classify_media_topic(
                         "suggestedStyle": {
                             "type": "string",
                             "enum": ["natural", "formal"]
+                        },
+                        "estimatedSpeakers": {
+                            "type": "integer",
+                            "minimum": 1,
+                            "maximum": 3
                         }
                     },
-                    "required": ["topic", "suggestedStyle"],
+                    "required": ["topic", "suggestedStyle", "estimatedSpeakers"],
                     "additionalProperties": false
                 }
             }
@@ -1446,7 +1495,7 @@ pub async fn classify_media_topic(
     let topic = sanitize_topic_context(&parsed.topic)
         .ok_or_else(|| anyhow!("Media topic classification returned an empty topic"))?;
 
-    let style = match parsed
+    let suggested_style = match parsed
         .suggested_style
         .as_deref()
         .map(|s| s.trim().to_lowercase())
@@ -1458,7 +1507,16 @@ pub async fn classify_media_topic(
         _ => TranslationStyle::Natural,
     };
 
-    Ok((topic, style))
+    let estimated_speakers = parsed
+        .estimated_speakers
+        .filter(|&n| n >= 1)
+        .map(|n| n.clamp(1, 3));
+
+    Ok(MediaTopicClassification {
+        topic,
+        suggested_style,
+        estimated_speakers,
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2744,6 +2802,32 @@ mod tests {
     }
 
     #[test]
+    fn serbian_natural_and_formal_prompts_have_distinct_openings_and_examples() {
+        let glossary = BTreeMap::new();
+        let natural_prompt =
+            build_system_prompt_with_style(BatchOperation::Translate, "en", "sr", &glossary, false, false);
+        let formal_prompt =
+            build_system_prompt_with_style(BatchOperation::Translate, "en", "sr", &glossary, false, true);
+
+        // Style-specific opening instructions
+        assert!(natural_prompt.contains("everyday contemporary spoken Serbian (prirodan govorni srpski"));
+        assert!(!natural_prompt.contains("standardni književni stil"));
+        assert!(formal_prompt.contains("polished formal broadcast and literary Serbian (standardni književni stil"));
+        assert!(!formal_prompt.contains("prirodan govorni srpski"));
+
+        // Distinct register rules and paired Serbian contrast examples
+        assert!(natural_prompt.contains("NATURAL SPOKEN STYLE EXAMPLES"));
+        assert!(natural_prompt.contains("'da' + present"));
+        assert!(natural_prompt.contains("Šta misliš da si pogrešio?"));
+        assert!(natural_prompt.contains("Tri reči, važi."));
+
+        assert!(formal_prompt.contains("FORMAL STYLE EXAMPLES"));
+        assert!(formal_prompt.contains("Strictly use formal 'Vi' address"));
+        assert!(formal_prompt.contains("Šta smatrate da ste pogrešili?"));
+        assert!(formal_prompt.contains("Tri reči, u redu."));
+    }
+
+    #[test]
     fn non_serbian_prompts_do_not_inject_serbian_stylistic_rules() {
         let mut glossary = BTreeMap::new();
         glossary.insert("Belgrade".to_string(), "Belgrade".to_string());
@@ -3673,7 +3757,7 @@ mod tests {
 
         let server = tokio::spawn(async move {
             let responses = [
-                "<think>Podcast style</think>\n```json\n{\"topic\": \"Tehnološki podkast o veštačkoj inteligenciji\", \"suggestedStyle\": \"natural\"}\n```",
+                "<think>Podcast style</think>\n```json\n{\"topic\": \"Tehnološki podkast o veštačkoj inteligenciji\", \"suggestedStyle\": \"natural\", \"estimatedSpeakers\": 2}\n```",
                 "{\"topic\": \"Istorijski dokumentarac o Nikoli Tesli\", \"suggestedStyle\": \"formal\"}",
             ];
             for content in responses {
@@ -3742,7 +3826,7 @@ mod tests {
         };
         let cancel = Arc::new(AtomicBool::new(false));
 
-        let (topic_nat, style_nat) = classify_media_topic(
+        let cls_nat = classify_media_topic(
             &endpoint,
             "Hey guys, welcome back to the show, today we talk about local LLMs and GPUs!",
             Some("en"),
@@ -3750,10 +3834,11 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(topic_nat, "Tehnološki podkast o veštačkoj inteligenciji");
-        assert_eq!(style_nat, TranslationStyle::Natural);
+        assert_eq!(cls_nat.topic, "Tehnološki podkast o veštačkoj inteligenciji");
+        assert_eq!(cls_nat.suggested_style, TranslationStyle::Natural);
+        assert_eq!(cls_nat.estimated_speakers, Some(2));
 
-        let (topic_for, style_for) = classify_media_topic(
+        let cls_for = classify_media_topic(
             &endpoint,
             "In 1884, Nikola Tesla arrived in New York carrying a letter of recommendation.",
             Some("en"),
@@ -3761,8 +3846,9 @@ mod tests {
         )
         .await
         .unwrap();
-        assert_eq!(topic_for, "Istorijski dokumentarac o Nikoli Tesli");
-        assert_eq!(style_for, TranslationStyle::Formal);
+        assert_eq!(cls_for.topic, "Istorijski dokumentarac o Nikoli Tesli");
+        assert_eq!(cls_for.suggested_style, TranslationStyle::Formal);
+        assert_eq!(cls_for.estimated_speakers, None);
 
         server.await.unwrap();
 
@@ -3771,6 +3857,9 @@ mod tests {
             assert_eq!(fmts.len(), 2);
             assert_eq!(fmts[0]["type"], "json_schema");
             assert_eq!(fmts[0]["json_schema"]["strict"], true);
+            assert!(fmts[0]["json_schema"]["schema"]["properties"]
+                .get("estimatedSpeakers")
+                .is_some());
         }
 
         // Insecure remote HTTP endpoint must fail URL policy BEFORE making a network call

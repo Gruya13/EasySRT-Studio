@@ -595,6 +595,7 @@ export function DualEditorBand() {
                 id="btn-style-natural"
                 type="button"
                 className={`ec-style-btn${activeStyle === "natural" ? " active" : ""}`}
+                disabled={isRunningBatch}
                 aria-pressed={activeStyle === "natural"}
                 title={t.workspace.translationStyleNaturalHint}
                 onMouseDown={(e) => e.preventDefault()}
@@ -607,6 +608,7 @@ export function DualEditorBand() {
                 id="btn-style-formal"
                 type="button"
                 className={`ec-style-btn${activeStyle === "formal" ? " active" : ""}`}
+                disabled={isRunningBatch}
                 aria-pressed={activeStyle === "formal"}
                 title={t.workspace.translationStyleFormalHint}
                 onMouseDown={(e) => e.preventDefault()}
@@ -675,17 +677,23 @@ export function DualEditorBand() {
           }}
         >
           {showUncachedStyleBadge && (
-            <div
+            <button
+              id="btn-translate-uncached-style"
+              type="button"
               className="ec-style-uncached-badge"
-              role="status"
-              onClick={(e) => e.stopPropagation()}
+              disabled={!hasCues || isRunningBatch}
+              onMouseDown={(e) => e.preventDefault()}
+              onClick={(e) => {
+                e.stopPropagation();
+                void translateActiveProject();
+              }}
             >
               <span>
                 {activeStyle === "formal"
                   ? t.editor.styleFormalNotGenerated
                   : t.editor.styleNaturalNotGenerated}
               </span>
-            </div>
+            </button>
           )}
 
           <textarea
