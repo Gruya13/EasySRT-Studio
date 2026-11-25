@@ -90,11 +90,26 @@ Spot inspection across the generated `.sr.srt` tracks revealed clear behavioral 
 
 ## 5. Planned Engineering Roadmap
 
-### Priority 1 — Linux GPU (`Vulkan` / `CUDA`) Catalog Registration (`catalog.json`)
+### Priority 1 — Windows Frameless Titlebar Fix (`decorations: false`) (`docs/V0.5.0_PLAN.md`)
+- Set `"decorations": false` in `src-tauri/tauri.conf.json` so Windows 10/11 does not render a duplicate native OS titlebar above EasySRT Studio's custom `TopBar` (`#titlebar` with `data-tauri-drag-region`), and verify maximized Windows taskbar work-area bounds, titlebar drag/double-click maximize, and unmaximized edge resizing.
+
+### Priority 2 — Linux GPU (`Vulkan` / `CUDA`) Catalog Registration (`catalog.json`)
 - Register the published `whisper-bin-ubuntu-vulkan-x64.tar.gz` SHA-256 checksum in `src-tauri/resources/catalog.json` (plus an optional Linux CUDA tarball) so Linux Setup Wizard auto-selects GPU Whisper out of the box.
 
-### Priority 2 — Standalone Source-Only ASR Proofreading (`target_language == "none"`)
+### Priority 3 — Standalone Source-Only ASR Proofreading (`target_language == "none"`)
 - Extend `correct_source_asr` to support a standalone non-Serbian source proofreading pass when `target_language == "none"` (no translation selected).
 
-### Priority 3 — Speaker Diarization & Multi-Speaker Labels
+### Priority 4 — Speaker Diarization & Multi-Speaker Labels
 - Evaluate optional lightweight speaker change detection / diarization markers (`[Govornik 1]`) between Silero VAD speech segments on top of the interactive timeline.
+
+### Priority 5 — Serbian Linguistic & Translation Quality Engine (`docs/LINGUISTIC_TRANSLATION_PLAN.md`)
+- Decouple polite/informal address (`Auto` / `Vi` / `ti`) from spoken vs. formal stylistic tone so broadcast/press interviews naturally combine polite *Vi* with living spoken Serbian (`da` + present) instead of forcing *ti* or bureaucratic prose.
+- Remove test-clip-specific prompt examples in `translator.rs` in favor of domain-agnostic linguistic guidelines, anti-calque / anti-pleonasm rules (*challenged us*, *I feel like*, stacked adverbs), and Serbian punctuation hygiene (eliminating English `I, ` / `Tako da, ` conjunction-comma calques while preserving valid parentheticals).
+- Extend `Background Media Intake Probe` (`probe.rs`, `classify_media_topic`) for domain-aware Serbian terminology and automatic address-register hints, backed by a multi-genre human-reference evaluation rubric.
+- See full specification in [`docs/LINGUISTIC_TRANSLATION_PLAN.md`](LINGUISTIC_TRANSLATION_PLAN.md).
+
+### Priority 6 — Privacy-First Telemetry & Automated AI-vs-Human Learning Engine (`docs/TELEMETRY_AND_LEARNING_PLAN.md`)
+- Introduce GDPR / Serbian ZZPL compliant explicit Opt-In consent in `SetupWizard` and `SettingsPanel` (with live JSON payload preview, 1-click revocation, `DO_NOT_TRACK=1` / `EASYSRT_TELEMETRY_URL=off` support, and `PRIVACY.md`).
+- Snapshot initial AI cues (`ai_baseline_cues`) and run a zero-click local diff engine (`pipeline::telemetry_diff`) at **Export** time to measure hardware RTF, edit rates, timeline trims, splits/merges, and Serbian grammatical fix categories (enclitics, possessives, passive calques, boundary orphan shifts) without sending user text.
+- Extract strictly lowercase, proper-noun-free `1–3` word lexical diffs into a **Cloudflare D1** K-anonymity vault (`k >= 5` distinct monthly cohorts, 30-day TTL purge, zero IP logging) on `easysrt-telemetry.ig-systems.rs`, alongside an optional separate AI-training edit-pair donation toggle.
+- See full specification in [`docs/TELEMETRY_AND_LEARNING_PLAN.md`](TELEMETRY_AND_LEARNING_PLAN.md).
