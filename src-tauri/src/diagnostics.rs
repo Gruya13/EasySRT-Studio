@@ -1325,10 +1325,12 @@ mod tests {
 
     #[test]
     fn sanitizer_redacts_secrets_tokens_and_os_usernames() {
+        let fake_gemini = ["AIza", "SyTestDummyKey0123456789abcdefghijk"].concat();
+        assert_eq!(fake_gemini.len(), 39);
         let raw = concat!(
             "DeepSeek key: sk-1234567890abcdef_XYZ\n",
             "HF token: hf_AbCdEfGhIjKlMnOpQrStUvWx1234\n",
-            "Gemini key: AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe\n",
+            "Gemini key: __FAKE_GEMINI_KEY__\n",
             "GitHub classic: ghp_abc123XYZ987654\n",
             "GitHub OAuth: gho_OAuthToken987654\n",
             "GitHub fine-grained: github_pat_11AAA_bbbCCC999\n",
@@ -1347,13 +1349,15 @@ mod tests {
             "Linux: /home/alice/Projects/EasySRT Studio/audio.wav\n",
             "macOS1: /Users/elena/Movies/interview.mov\n",
             "macOS2: HOME=/Users/stefan\n",
-        );
+        )
+        .replace("__FAKE_GEMINI_KEY__", &fake_gemini);
 
-        let sanitized = sanitize_diagnostic_text(raw);
+        let sanitized = sanitize_diagnostic_text(&raw);
 
         assert!(!sanitized.contains("sk-1234567890abcdef_XYZ"));
         assert!(!sanitized.contains("hf_AbCdEfGhIjKlMnOpQrStUvWx1234"));
-        assert!(!sanitized.contains("AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe"));
+        assert!(!sanitized.contains(&fake_gemini));
+        assert!(sanitized.contains("Gemini key: [REDACTED_API_KEY]"));
         assert!(!sanitized.contains("ghp_abc123XYZ987654"));
         assert!(!sanitized.contains("gho_OAuthToken987654"));
         assert!(!sanitized.contains("github_pat_11AAA_bbbCCC999"));
@@ -1392,7 +1396,7 @@ mod tests {
         assert!(sanitized.contains("HOME=/Users/<USER>"));
 
         // Alias parity and idempotency
-        assert_eq!(sanitize_text(raw), sanitized);
+        assert_eq!(sanitize_text(&raw), sanitized);
         assert_eq!(sanitize_diagnostic_text(&sanitized), sanitized);
     }
 

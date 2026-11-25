@@ -15,6 +15,8 @@ const TEST_ENV: Env = {
   GITHUB_ISSUES_TOKEN: "test-placeholder-token-not-real",
 };
 
+const SYNTHETIC_GEMINI_KEY = ["AIza", "SyTestDummyKey0123456789abcdefghijk"].join("");
+
 const originalFetch = globalThis.fetch;
 const originalCaches = (globalThis as { caches?: unknown }).caches;
 
@@ -207,11 +209,12 @@ describe("Health, Routing, and Origin / CORS Policy", () => {
 
 describe("Server-side Sanitization & Mention Neutralization", () => {
   it("redacts API keys, HF/Gemini/GitHub tokens, Bearer tokens, x-api-key, URL userinfo, and Win/Linux/macOS user paths", () => {
+    assert.equal(SYNTHETIC_GEMINI_KEY.length, 39);
     const input = [
       "OpenAI key: sk-proj_abc123456789XYZ",
       "DeepSeek key: sk-1234567890abcdef",
       "HF token: hf_AbCdEfGhIjKlMnOpQrStUvWx1234",
-      "Gemini key: AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe",
+      `Gemini key: ${SYNTHETIC_GEMINI_KEY}`,
       "GH classic: ghp_AbCdEf0123456789xyz",
       "GH fine-grained: github_pat_11ABCDEF_secretToken99",
       "Header: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig",
@@ -233,7 +236,8 @@ describe("Server-side Sanitization & Mention Neutralization", () => {
     assert.ok(!clean.includes("sk-proj_abc123456789XYZ"));
     assert.ok(!clean.includes("sk-1234567890abcdef"));
     assert.ok(!clean.includes("hf_AbCdEfGhIjKlMnOpQrStUvWx1234"));
-    assert.ok(!clean.includes("AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe"));
+    assert.ok(!clean.includes(SYNTHETIC_GEMINI_KEY));
+    assert.ok(clean.includes("Gemini key: [REDACTED_API_KEY]"));
     assert.ok(!clean.includes("ghp_AbCdEf0123456789xyz"));
     assert.ok(!clean.includes("github_pat_11ABCDEF_secretToken99"));
     assert.ok(!clean.includes("eyJhbGciOiJIUzI1NiJ9"));
@@ -379,7 +383,7 @@ describe("POST /v1/report/bug", () => {
         appVersion: "0.4.0",
         title: "Crash when @octocat exports /Users/elena/clip.mp4",
         description:
-          "Ping @torvalds and @org/maintainers. Also hf_TokenAbCdEf123456 and AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe",
+          `Ping @torvalds and @org/maintainers. Also hf_TokenAbCdEf123456 and ${SYNTHETIC_GEMINI_KEY}`,
         steps: "1. Notify @alice\n2. Check https://bob:secret@api.example.com/v1",
         contact: "reporter@example.com (@reporter)",
         diagnostics: "LOG: @maintainer x-api-key: secretHeader999",
@@ -408,7 +412,7 @@ describe("POST /v1/report/bug", () => {
     assert.ok(ghBody.body.includes("@\u200Balice"));
     assert.ok(ghBody.body.includes("reporter@example.com"));
     assert.ok(!ghBody.body.includes("hf_TokenAbCdEf123456"));
-    assert.ok(!ghBody.body.includes("AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe"));
+    assert.ok(!ghBody.body.includes(SYNTHETIC_GEMINI_KEY));
     assert.ok(!ghBody.body.includes("bob:secret"));
     assert.ok(!ghBody.body.includes("secretHeader999"));
   });
