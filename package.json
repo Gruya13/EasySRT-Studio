@@ -9,6 +9,7 @@
     "build": "tsc --noEmit && vite build",
     "typecheck": "tsc --noEmit",
     "test": "node --test src/lib/__tests__/*.test.ts scripts/__tests__/*.test.mjs",
+    "docs:check": "node scripts/docs-check.mjs",
     "version:check": "node scripts/release.mjs check",
     "release:prepare": "node scripts/release.mjs prepare",
     "release:notes": "node scripts/release.mjs notes",

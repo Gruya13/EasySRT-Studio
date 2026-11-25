@@ -26,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Dependencies & CI/CD Supply Chain:** Upgraded `zip` to `9.8.1` and `cookie` to `0.18.3` to resolve RustSec advisories, pinned GitHub Actions to commit SHAs and LunarG Vulkan SDK with SHA-256 verification, added `cargo audit` in CI, and hardened telemetry worker CORS/sanitization and UI link safety (`5e4ddbe`, `aa11c33`).
 
 ### Maintenance
-- **Release Tooling & Roadmap:** Added the `staging` → `main` release workflow, automated changelog/version tooling (`scripts/release.mjs`), dynamic version propagation, roadmap plans (`v0.5.0`, Serbian linguistics, privacy-first telemetry), and dynamically assembled synthetic test fixtures (`a89198c`, `496da7c`, `eb573be`).
+- **Release Tooling & Automated Quality Gates:** Added the `staging` → `main` release workflow, automated changelog and manifest version synchronization (`scripts/release.mjs`), dynamic runtime version propagation, and sanitized test fixtures (`a89198c`, `eb573be`).
 
 ## [0.3.2] - 2026-11-24
 
