@@ -10,6 +10,7 @@ import {
   computeSafeCanvasSize,
   computeWheelZoomPct,
   formatRulerTimestamp,
+  inferAudioMimeType,
   resolveTimelineMediaState,
 } from "../timelineUtils.ts";
 
@@ -195,5 +196,30 @@ describe("timelineUtils", () => {
         isSubtitleOnly: true,
       },
     );
+  });
+
+  it("infers MIME types from RIFF/ID3/OggS/fLaC magic headers and falls back to extensions", () => {
+    const wavBytes = new Uint8Array([
+      0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+    ]);
+    // Transcoded WAV payload from an .mp4 or .mkv path must resolve to audio/wav
+    assert.equal(inferAudioMimeType("/tmp/video.mp4", wavBytes.buffer), "audio/wav");
+    assert.equal(inferAudioMimeType("/tmp/clip.mkv", wavBytes), "audio/wav");
+
+    const id3Bytes = new Uint8Array([0x49, 0x44, 0x33, 0x04]);
+    assert.equal(inferAudioMimeType("unknown.bin", id3Bytes), "audio/mpeg");
+
+    const oggBytes = new Uint8Array([0x4f, 0x67, 0x67, 0x53]);
+    assert.equal(inferAudioMimeType("voice.opus", oggBytes), "audio/ogg");
+
+    const flacBytes = new Uint8Array([0x66, 0x4c, 0x61, 0x43]);
+    assert.equal(inferAudioMimeType("track.dat", flacBytes), "audio/flac");
+
+    // Extension fallbacks
+    assert.equal(inferAudioMimeType("/a/b/speech.MP3"), "audio/mpeg");
+    assert.equal(inferAudioMimeType("/a/b/speech.wav"), "audio/wav");
+    assert.equal(inferAudioMimeType("/a/b/podcast.m4a"), "audio/mp4");
+    assert.equal(inferAudioMimeType("/a/b/clip.aac"), "audio/aac");
+    assert.equal(inferAudioMimeType("/a/b/clip.webm"), "audio/webm");
   });
 });

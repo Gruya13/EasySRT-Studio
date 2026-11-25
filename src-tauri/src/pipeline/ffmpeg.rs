@@ -24,6 +24,11 @@ const BYTES_PER_SECOND_16KHZ_MONO_S16LE: u64 = SAMPLE_RATE_16KHZ * 2;
 const FFMPEG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WAVEFORM_BUCKETS: usize = 16_384;
 
+/// Maximum raw audio file size (`48 MiB`) served directly without FFmpeg downsampling.
+pub const MAX_DIRECT_PLAYBACK_AUDIO_BYTES: u64 = 48 * 1024 * 1024;
+/// Maximum transcoded 16 kHz mono PCM16 payload (`64 MiB` ≈ 34 min) buffered for Web Audio playback.
+pub const MAX_TRANSCODED_PLAYBACK_PCM_BYTES: usize = 64 * 1024 * 1024;
+
 /// Approved audio/video file extensions accepted by `prepare_audio_waveform` and `probe_media_file`.
 pub const APPROVED_MEDIA_EXTENSIONS: &[&str] = &[
     "mp3", "wav", "m4a", "mp4", "mkv", "mov", "webm", "ogg", "flac", "aac", "wma", "opus", "avi",
@@ -767,6 +772,148 @@ pub async fn extract_waveform_peaks(
     Ok(acc.finish())
 }
 
+/// Wraps raw 16 kHz mono 16-bit signed little-endian PCM bytes in a valid 44-byte RIFF/WAVE
+/// container with exact chunk sizes (safe for WebKitGTK / WebView2 `decodeAudioData`).
+pub fn wrap_pcm16_mono_16khz_as_wav(pcm_bytes: &[u8]) -> Result<Vec<u8>> {
+    let pcm_len = pcm_bytes.len() & !1;
+    let max_payload = (u32::MAX as usize).saturating_sub(36);
+    if pcm_len > max_payload {
+        return Err(anyhow!("PCM audio exceeds maximum 4 GiB RIFF/WAVE size"));
+    }
+
+    let data_size = pcm_len as u32;
+    let riff_size = data_size + 36;
+    let mut wav = Vec::with_capacity(44 + pcm_len);
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&riff_size.to_le_bytes());
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes());
+    wav.extend_from_slice(&(SAMPLE_RATE_16KHZ as u32).to_le_bytes());
+    wav.extend_from_slice(&(BYTES_PER_SECOND_16KHZ_MONO_S16LE as u32).to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes());
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_size.to_le_bytes());
+    wav.extend_from_slice(&pcm_bytes[..pcm_len]);
+    Ok(wav)
+}
+
+/// Decodes any supported media container to compact 16 kHz mono PCM16 WAV bytes in memory
+/// (capped at `MAX_TRANSCODED_PLAYBACK_PCM_BYTES`) with concurrent stderr draining.
+pub async fn extract_playback_wav_bytes(
+    ffmpeg_bin: &Path,
+    input_path: &Path,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<Vec<u8>> {
+    if cancel_flag.load(Ordering::SeqCst) {
+        return Err(anyhow!("Job cancelled"));
+    }
+
+    let canonical_input = validate_and_canonicalize_media_input(input_path)?;
+
+    let mut cmd = Command::new(ffmpeg_bin);
+    configure_command_env(&mut cmd, ffmpeg_bin);
+    cmd.kill_on_drop(true)
+        .arg("-nostdin")
+        .arg("-hide_banner")
+        .arg("-loglevel")
+        .arg("error")
+        .arg("-i")
+        .arg(&canonical_input)
+        .arg("-vn")
+        .arg("-ac")
+        .arg("1")
+        .arg("-ar")
+        .arg("16000")
+        .arg("-f")
+        .arg("s16le")
+        .arg("pipe:1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn().with_context(|| {
+        format!(
+            "Failed to spawn ffmpeg binary at {}",
+            ffmpeg_bin.to_string_lossy()
+        )
+    })?;
+
+    let mut stdout_pipe = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow!("Failed to capture ffmpeg stdout pipe for playback audio"))?;
+    let stderr_pipe = child.stderr.take();
+    let stderr_task = tokio::spawn(async move {
+        let mut buf = Vec::new();
+        if let Some(mut pipe) = stderr_pipe {
+            let _ = pipe.read_to_end(&mut buf).await;
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+
+    let mut pcm_buf = Vec::new();
+    let mut read_buf = vec![0u8; 64 * 1024];
+
+    loop {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(anyhow!("Job cancelled"));
+        }
+
+        let n = match tokio::time::timeout(
+            Duration::from_millis(100),
+            stdout_pipe.read(&mut read_buf),
+        )
+        .await
+        {
+            Ok(Ok(0)) => break,
+            Ok(Ok(n)) => n,
+            Ok(Err(err)) => {
+                let _ = child.kill().await;
+                let _ = child.wait().await;
+                stderr_task.abort();
+                return Err(err).context("Failed reading playback PCM stream from ffmpeg");
+            }
+            Err(_) => continue,
+        };
+
+        if pcm_buf.len().saturating_add(n) > MAX_TRANSCODED_PLAYBACK_PCM_BYTES {
+            let _ = child.kill().await;
+            let _ = child.wait().await;
+            stderr_task.abort();
+            return Err(anyhow!(
+                "Transcoded playback audio exceeds {} MiB limit; streaming fallback required",
+                MAX_TRANSCODED_PLAYBACK_PCM_BYTES / (1024 * 1024)
+            ));
+        }
+
+        pcm_buf.extend_from_slice(&read_buf[..n]);
+    }
+
+    drop(stdout_pipe);
+    let status = child
+        .wait()
+        .await
+        .context("Failed waiting for ffmpeg playback transcode process")?;
+    let stderr_buf = stderr_task.await.unwrap_or_default();
+
+    if !status.success() {
+        return Err(anyhow!(
+            "FFmpeg playback audio extraction failed (status {}): {}",
+            status,
+            stderr_buf.trim()
+        ));
+    }
+
+    wrap_pcm16_mono_16khz_as_wav(&pcm_buf)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,6 +947,26 @@ mod tests {
         let dir = std::env::temp_dir();
         assert!(validate_and_canonicalize_media_input(&dir).is_err());
         assert!(validate_and_canonicalize_media_input(Path::new("-flag-looking-file")).is_err());
+    }
+
+    #[test]
+    fn wrap_pcm16_mono_16khz_as_wav_builds_valid_header_and_trims_odd_byte() {
+        let wav = wrap_pcm16_mono_16khz_as_wav(&[1, 2, 3, 4, 5]).unwrap();
+        assert_eq!(wav.len(), 48);
+        assert_eq!(&wav[0..4], b"RIFF");
+        assert_eq!(u32::from_le_bytes(wav[4..8].try_into().unwrap()), 40);
+        assert_eq!(&wav[8..12], b"WAVE");
+        assert_eq!(&wav[12..16], b"fmt ");
+        assert_eq!(u32::from_le_bytes(wav[16..20].try_into().unwrap()), 16);
+        assert_eq!(u16::from_le_bytes(wav[20..22].try_into().unwrap()), 1);
+        assert_eq!(u16::from_le_bytes(wav[22..24].try_into().unwrap()), 1);
+        assert_eq!(u32::from_le_bytes(wav[24..28].try_into().unwrap()), 16_000);
+        assert_eq!(u32::from_le_bytes(wav[28..32].try_into().unwrap()), 32_000);
+        assert_eq!(u16::from_le_bytes(wav[32..34].try_into().unwrap()), 2);
+        assert_eq!(u16::from_le_bytes(wav[34..36].try_into().unwrap()), 16);
+        assert_eq!(&wav[36..40], b"data");
+        assert_eq!(u32::from_le_bytes(wav[40..44].try_into().unwrap()), 4);
+        assert_eq!(&wav[44..48], &[1, 2, 3, 4]);
     }
 
     fn write_synthetic_wav(path: &Path, samples: &[i16]) {
@@ -916,6 +1083,22 @@ mod tests {
         assert!(
             second_half_avg > 0.75,
             "Expected loud second half > 0.75, got {second_half_avg}"
+        );
+
+        // 5. Playback WAV extraction (valid RIFF/WAVE header + exact 2.0s PCM16 payload)
+        let playback_wav = extract_playback_wav_bytes(ffmpeg_path, &src_audio, &cancel)
+            .await
+            .unwrap();
+        assert!(playback_wav.len() > 44);
+        assert_eq!(&playback_wav[0..4], b"RIFF");
+        assert_eq!(&playback_wav[8..12], b"WAVE");
+        let riff_len = u32::from_le_bytes(playback_wav[4..8].try_into().unwrap()) as usize;
+        let data_len = u32::from_le_bytes(playback_wav[40..44].try_into().unwrap()) as usize;
+        assert_eq!(riff_len + 8, playback_wav.len());
+        assert_eq!(data_len + 44, playback_wav.len());
+        assert!(
+            (1960..=2040).contains(&compute_pcm16_mono_16khz_duration_ms(playback_wav.len() as u64)),
+            "expected ~2000ms playback wav duration"
         );
 
         let _ = fs::remove_dir_all(&temp_dir);

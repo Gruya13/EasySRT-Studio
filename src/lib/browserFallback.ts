@@ -1138,6 +1138,33 @@ export const browserFallback = {
     };
   },
 
+  async readAudioPlaybackBytes(_audioPath: string): Promise<ArrayBuffer> {
+    const sampleRate = 16000;
+    const numSamples = 16000; // 1s minimal valid silent RIFF/WAVE
+    const dataSize = numSamples * 2;
+    const buffer = new ArrayBuffer(44 + dataSize);
+    const view = new DataView(buffer);
+    const writeAscii = (offset: number, text: string) => {
+      for (let i = 0; i < text.length; i += 1) {
+        view.setUint8(offset + i, text.charCodeAt(i));
+      }
+    };
+    writeAscii(0, "RIFF");
+    view.setUint32(4, 36 + dataSize, true);
+    writeAscii(8, "WAVE");
+    writeAscii(12, "fmt ");
+    view.setUint32(16, 16, true);
+    view.setUint16(20, 1, true);
+    view.setUint16(22, 1, true);
+    view.setUint32(24, sampleRate, true);
+    view.setUint32(28, sampleRate * 2, true);
+    view.setUint16(32, 2, true);
+    view.setUint16(34, 16, true);
+    writeAscii(36, "data");
+    view.setUint32(40, dataSize, true);
+    return buffer;
+  },
+
   async probeMediaFile(
     jobId: string,
     audioPath: string,

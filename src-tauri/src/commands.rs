@@ -9,7 +9,7 @@ use crate::models::{
 };
 use crate::pipeline::{self, PipelineState};
 use crate::{diagnostics, setup_manager, storage};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicBool, Arc};
 use tauri::{AppHandle, Manager, State};
 
@@ -305,6 +305,83 @@ pub async fn export_subtitles(
     run_blocking(move || pipeline::export_subtitles(&app, project, options)).await
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlaybackBytesStrategy {
+    DirectRawBytes,
+    TranscodeCompactWav,
+}
+
+pub fn select_audio_playback_strategy(path: &Path, file_size: u64) -> PlaybackBytesStrategy {
+    let ext = path
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    let direct_audio_ext = matches!(
+        ext.as_str(),
+        "mp3" | "wav" | "ogg" | "flac" | "m4a" | "aac" | "opus"
+    );
+
+    if direct_audio_ext && file_size <= pipeline::ffmpeg::MAX_DIRECT_PLAYBACK_AUDIO_BYTES {
+        PlaybackBytesStrategy::DirectRawBytes
+    } else {
+        PlaybackBytesStrategy::TranscodeCompactWav
+    }
+}
+
+/// Validates that `audio_path` resolves to an approved media file and streams raw bytes directly
+/// to the WebView via Tauri v2 raw binary IPC (`Vec<u8>` -> `ArrayBuffer`, zero Base64/JSON).
+/// Video containers or files > 48 MiB are decoded cleanly into compact 16 kHz mono WAV bytes.
+#[tauri::command]
+pub async fn read_audio_playback_bytes(
+    app: AppHandle,
+    audio_path: String,
+) -> Result<tauri::ipc::Response, String> {
+    let (canonical_path, file_size) = run_blocking(move || {
+        let canonical = pipeline::ffmpeg::validate_approved_media_file(&audio_path)?;
+        let meta = std::fs::metadata(&canonical).map_err(|e| {
+            anyhow::anyhow!(
+                "Failed to inspect media file metadata for {}: {e}",
+                canonical.display()
+            )
+        })?;
+        Ok((canonical, meta.len()))
+    })
+    .await?;
+
+    match select_audio_playback_strategy(&canonical_path, file_size) {
+        PlaybackBytesStrategy::DirectRawBytes => {
+            let bytes = run_blocking(move || {
+                std::fs::read(&canonical_path).map_err(|e| {
+                    anyhow::anyhow!(
+                        "Failed to read audio file {}: {e}",
+                        canonical_path.display()
+                    )
+                })
+            })
+            .await?;
+            Ok(tauri::ipc::Response::new(bytes))
+        }
+        PlaybackBytesStrategy::TranscodeCompactWav => {
+            let app_for_resolve = app.clone();
+            let ffmpeg_bin = run_blocking(move || {
+                setup_manager::resolve_binary_path(&app_for_resolve, CatalogItemKind::Ffmpeg)
+            })
+            .await?;
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let wav_bytes = pipeline::ffmpeg::extract_playback_wav_bytes(
+                &ffmpeg_bin,
+                &canonical_path,
+                &cancel_flag,
+            )
+            .await
+            .map_err(map_err)?;
+            Ok(tauri::ipc::Response::new(wav_bytes))
+        }
+    }
+}
+
 /// Validates that `audio_path` resolves to a regular file with an approved media extension,
 /// computes bounded-RAM waveform peaks via FFmpeg, and dynamically grants read-only access
 /// to ONLY that canonical file on Tauri's `asset://` protocol scope (`SEC-H1`, WS6).
@@ -467,8 +544,10 @@ pub async fn save_diagnostics_local(app: AppHandle) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use crate::pipeline::ffmpeg::validate_approved_media_file;
+    use super::{select_audio_playback_strategy, PlaybackBytesStrategy};
+    use crate::pipeline::ffmpeg::{validate_approved_media_file, MAX_DIRECT_PLAYBACK_AUDIO_BYTES};
     use std::fs;
+    use std::path::Path;
 
     #[test]
     fn media_allowlist_rejects_sensitive_files_directories_and_non_media_symlinks() {
@@ -542,5 +621,36 @@ mod tests {
         }
 
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn select_audio_playback_strategy_handles_formats_and_size_bounds() {
+        for ext in ["mp3", "MP3", "wav", "ogg", "flac", "m4a", "aac", "opus"] {
+            let p = Path::new("/tmp").join(format!("clip.{ext}"));
+            assert_eq!(
+                select_audio_playback_strategy(&p, 2 * 1024 * 1024),
+                PlaybackBytesStrategy::DirectRawBytes,
+                "expected DirectRawBytes for small .{ext}"
+            );
+            assert_eq!(
+                select_audio_playback_strategy(&p, MAX_DIRECT_PLAYBACK_AUDIO_BYTES),
+                PlaybackBytesStrategy::DirectRawBytes,
+                "expected DirectRawBytes at exact limit for .{ext}"
+            );
+            assert_eq!(
+                select_audio_playback_strategy(&p, MAX_DIRECT_PLAYBACK_AUDIO_BYTES + 1),
+                PlaybackBytesStrategy::TranscodeCompactWav,
+                "expected TranscodeCompactWav over limit for .{ext}"
+            );
+        }
+
+        for ext in ["mp4", "mkv", "mov", "webm", "wma", "avi"] {
+            let p = Path::new("/tmp").join(format!("video.{ext}"));
+            assert_eq!(
+                select_audio_playback_strategy(&p, 1024 * 1024),
+                PlaybackBytesStrategy::TranscodeCompactWav,
+                "expected TranscodeCompactWav for container/legacy .{ext}"
+            );
+        }
     }
 }

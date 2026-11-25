@@ -309,6 +309,22 @@ export function exportSubtitles(
   return invoke<ExportResult>("export_subtitles", { project, options });
 }
 
+export async function readAudioPlaybackBytes(
+  audioPath: string,
+): Promise<ArrayBuffer> {
+  if (!isTauriRuntime()) {
+    return browserFallback.readAudioPlaybackBytes(audioPath);
+  }
+  const raw = await invoke<ArrayBuffer | number[]>(
+    "read_audio_playback_bytes",
+    { audioPath },
+  );
+  if (raw instanceof ArrayBuffer) {
+    return raw;
+  }
+  return new Uint8Array(raw).buffer;
+}
+
 export function prepareAudioWaveform(
   audioPath: string,
   targetBuckets?: number,

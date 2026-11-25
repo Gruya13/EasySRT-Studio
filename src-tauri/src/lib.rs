@@ -62,6 +62,7 @@ pub fn run() {
             commands::cancel_job,
             commands::convert_cues_script,
             commands::export_subtitles,
+            commands::read_audio_playback_bytes,
             commands::prepare_audio_waveform,
             commands::probe_media_file,
             commands::cancel_media_probe,
