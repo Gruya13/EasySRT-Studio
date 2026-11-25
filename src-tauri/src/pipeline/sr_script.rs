@@ -46,6 +46,20 @@ pub fn convert_script(text: &str, target: SerbianScript) -> String {
     }
 }
 
+/// Converts every non-empty string yielded by `values` in place to the target Serbian
+/// script (`Latin` or `Cyrillic`). Keeps multi-style translation variant maps in sync
+/// with the project's active script regardless of map key type.
+pub fn convert_script_values<'a>(
+    values: impl Iterator<Item = &'a mut String>,
+    script: SerbianScript,
+) {
+    for value in values {
+        if !value.is_empty() {
+            *value = convert_script(value, script);
+        }
+    }
+}
+
 /// Converts Serbian Cyrillic text to Serbian Latin.
 ///
 /// Smart-cases uppercase digraphs (`Љ`, `Њ`, `Џ`):
@@ -1330,5 +1344,38 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn converts_script_values_in_place_across_variant_maps() {
+        use std::collections::BTreeMap;
+
+        let mut variants = BTreeMap::from([
+            ("natural", "Đorđe gleda film u Nišu na https://example.com/ljubav.".to_string()),
+            ("formal", "Gospodin Đorđe prisustvuje projekciji u Nišu.".to_string()),
+            ("empty", String::new()),
+        ]);
+
+        convert_script_values(variants.values_mut(), SerbianScript::Cyrillic);
+        assert_eq!(
+            variants.get("natural").map(String::as_str),
+            Some("Ђорђе гледа филм у Нишу на https://example.com/ljubav.")
+        );
+        assert_eq!(
+            variants.get("formal").map(String::as_str),
+            Some("Господин Ђорђе присуствује пројекцији у Нишу.")
+        );
+        assert_eq!(variants.get("empty").map(String::as_str), Some(""));
+
+        convert_script_values(variants.values_mut(), SerbianScript::Latin);
+        assert_eq!(
+            variants.get("natural").map(String::as_str),
+            Some("Đorđe gleda film u Nišu na https://example.com/ljubav.")
+        );
+        assert_eq!(
+            variants.get("formal").map(String::as_str),
+            Some("Gospodin Đorđe prisustvuje projekciji u Nišu.")
+        );
+        assert_eq!(variants.get("empty").map(String::as_str), Some(""));
     }
 }
