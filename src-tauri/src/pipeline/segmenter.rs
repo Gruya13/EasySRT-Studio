@@ -2,6 +2,9 @@
 
 use crate::models::{SegmentPreset, SegmentRules, SubtitleCue, TimedWord};
 
+/// Minimum breathing gap between consecutive subtitle cues (2 frames @ 25 fps).
+pub const MIN_INTER_CUE_GAP_MS: u64 = 80;
+
 const INTER_SEGMENT_PAUSE_MS: u64 = 200;
 const HARD_PAUSE_MS: u64 = 500;
 const SOFT_PAUSE_THRESHOLD_MS: u64 = 150;
@@ -10,6 +13,8 @@ const SHORT_SILENCE_BRIDGE_REELS_MS: u64 = 350;
 const POST_SPEECH_HOLD_MS: u64 = 350;
 const POST_SPEECH_HOLD_REELS_MS: u64 = 250;
 const MIN_PAUSE_CLEAR_GAP_MS: u64 = 200;
+const MIN_GAP_PULLBACK_DURATION_MS: u64 = 300;
+const MIN_GAP_SPLIT_DURATION_MS: u64 = 160;
 const COMMA_EARLY_SPLIT_MIN_PREFIX_CHARS: usize = 22;
 const COMMA_EARLY_SPLIT_MIN_REM_CHARS: usize = 12;
 const CLAUSE_PUNCT_SPLIT_BONUS: isize = 24;
@@ -101,7 +106,10 @@ fn ends_with_sentence_punct(word: &str) -> bool {
     }
     // Avoid splitting after common short Serbian/English abbreviations like "dr.", "g.", "br."
     let lower = trimmed.to_lowercase();
-    for abbr in ["dr.", "mr.", "sv.", "br.", "st.", "prof.", "tj.", "npr."] {
+    for abbr in [
+        "dr.", "mr.", "sv.", "br.", "st.", "prof.", "tj.", "npr.", "др.", "мр.", "св.", "бр.",
+        "проф.", "тј.", "нпр.",
+    ] {
         if lower == abbr {
             return false;
         }
@@ -119,6 +127,86 @@ fn ends_with_clause_punct(word: &str) -> bool {
         || trimmed.ends_with(':')
         || trimmed.ends_with('—')
         || trimmed.ends_with('–')
+}
+
+fn is_vocal_hesitation(word: &str) -> bool {
+    let clean = word
+        .trim_matches(|c: char| !c.is_alphanumeric())
+        .to_lowercase();
+    matches!(
+        clean.as_str(),
+        "uh" | "um" | "erm" | "er" | "hmm" | "mm" | "uhm"
+    )
+}
+
+fn is_standalone_comma(word: &str) -> bool {
+    let trimmed = word.trim();
+    !trimmed.is_empty() && trimmed.chars().all(|c| c == ',')
+}
+
+/// Strips unambiguous non-lexical vocal hesitations (`"uh"`, `"um"`, `"erm"`, `"er"`,
+/// `"hmm"`, `"mm"`, `"uhm"`) before segmentation, propagating `speaker_change` onto the
+/// next surviving word and cleaning up adjacent orphan or doubled commas.
+pub fn strip_vocal_hesitations(words: &[TimedWord]) -> Vec<TimedWord> {
+    let mut out: Vec<TimedWord> = Vec::with_capacity(words.len());
+    let mut pending_speaker_change = false;
+    let mut just_stripped = false;
+
+    for w in words {
+        let trimmed = w.text.trim();
+        if trimmed.is_empty() {
+            pending_speaker_change |= w.speaker_change;
+            continue;
+        }
+
+        if is_vocal_hesitation(trimmed) {
+            pending_speaker_change |= w.speaker_change;
+            while out.last().is_some_and(|prev| is_standalone_comma(&prev.text)) {
+                if let Some(popped) = out.pop() {
+                    pending_speaker_change |= popped.speaker_change;
+                }
+            }
+            if let Some(prev) = out.last_mut() {
+                while prev.text.ends_with(",,") {
+                    prev.text.pop();
+                }
+            }
+            just_stripped = true;
+            continue;
+        }
+
+        if is_standalone_comma(trimmed)
+            && (just_stripped
+                || out.is_empty()
+                || out.last().is_some_and(|prev| {
+                    ends_with_clause_punct(&prev.text) || ends_with_sentence_punct(&prev.text)
+                }))
+        {
+            pending_speaker_change |= w.speaker_change;
+            continue;
+        }
+
+        let mut kept = w.clone();
+        kept.text = trimmed.to_string();
+        if just_stripped {
+            let cleaned_leading = kept.text.trim_start_matches([',', ' ', '\t']);
+            if cleaned_leading.is_empty() {
+                pending_speaker_change |= kept.speaker_change;
+                continue;
+            }
+            if cleaned_leading.len() != kept.text.len() {
+                kept.text = cleaned_leading.to_string();
+            }
+        }
+        if pending_speaker_change {
+            kept.speaker_change = true;
+            pending_speaker_change = false;
+        }
+        out.push(kept);
+        just_stripped = false;
+    }
+
+    out
 }
 
 fn is_dangling_function_word(word: &str) -> bool {
@@ -161,6 +249,11 @@ fn is_dangling_function_word(word: &str) -> bool {
             | "well"
             | "which"
             | "that"
+            | "what"
+            | "why"
+            | "how"
+            | "if"
+            | "whether"
             | "who"
             | "whom"
             | "whose"
@@ -236,6 +329,25 @@ fn is_dangling_function_word(word: &str) -> bool {
             | "čija"
             | "čije"
             | "što"
+            | "šta"
+            | "sta"
+            | "ko"
+            | "koga"
+            | "kom"
+            | "kome"
+            | "čemu"
+            | "cemu"
+            | "zašto"
+            | "zasto"
+            | "kako"
+            | "gde"
+            | "gdje"
+            | "kuda"
+            | "odakle"
+            | "otkud"
+            | "koliko"
+            | "zar"
+            | "li"
             | "jer"
             | "ako"
             | "dok"
@@ -255,6 +367,61 @@ fn is_dangling_function_word(word: &str) -> bool {
             | "те"
             | "јер"
             | "него"
+            | "шта"
+            | "ко"
+            | "кога"
+            | "ком"
+            | "коме"
+            | "чему"
+            | "зашто"
+            | "како"
+            | "где"
+            | "гдје"
+            | "куда"
+            | "одакле"
+            | "откуд"
+            | "колико"
+            | "зар"
+            | "ли"
+            | "кад"
+            | "када"
+            | "док"
+            | "ако"
+            | "у"
+            | "на"
+            | "за"
+            | "од"
+            | "до"
+            | "са"
+            | "с"
+            | "из"
+            | "кроз"
+            | "о"
+            | "по"
+            | "при"
+            | "ка"
+            | "к"
+            | "је"
+            | "су"
+            | "сам"
+            | "смо"
+            | "сте"
+            | "ћу"
+            | "ће"
+            | "би"
+            | "не"
+            | "који"
+            | "која"
+            | "које"
+            | "којег"
+            | "којем"
+            | "којим"
+            | "чији"
+            | "чија"
+            | "чије"
+            | "што"
+            | "већ"
+            | "нити"
             | "moj"
             | "tvoj"
             | "njegov"
@@ -590,6 +757,74 @@ fn merge_isolated_leading_conjunction_cues(
     cues
 }
 
+/// Enforces at least `MIN_INTER_CUE_GAP_MS` (80 ms / 2 frames @ 25 fps) between
+/// consecutive cues so back-to-back subtitles remain visually distinct on screen.
+pub fn enforce_min_inter_cue_gap(cues: &mut [SubtitleCue], rules: &SegmentRules) {
+    if cues.len() < 2 {
+        return;
+    }
+
+    for k in 0..(cues.len() - 1) {
+        let curr_start = cues[k].start_ms;
+        let curr_end = cues[k].end_ms;
+        let next_start = cues[k + 1].start_ms;
+        let next_end = cues[k + 1].end_ms;
+
+        if next_start >= curr_end && next_start - curr_end >= MIN_INTER_CUE_GAP_MS {
+            continue;
+        }
+
+        let mut curr_changed = false;
+        let mut next_changed = false;
+
+        let target_curr_end = next_start.saturating_sub(MIN_INTER_CUE_GAP_MS);
+        if next_start >= MIN_INTER_CUE_GAP_MS
+            && target_curr_end >= curr_start.saturating_add(MIN_GAP_PULLBACK_DURATION_MS)
+        {
+            if cues[k].end_ms != target_curr_end {
+                cues[k].end_ms = target_curr_end;
+                curr_changed = true;
+            }
+        } else {
+            let needed = if next_start >= curr_end {
+                MIN_INTER_CUE_GAP_MS - (next_start - curr_end)
+            } else {
+                (curr_end - next_start).saturating_add(MIN_INTER_CUE_GAP_MS)
+            };
+
+            let curr_dur = curr_end.saturating_sub(curr_start);
+            let next_dur = next_end.saturating_sub(next_start);
+            let left_slack = curr_dur.saturating_sub(MIN_GAP_SPLIT_DURATION_MS);
+            let right_slack = next_dur.saturating_sub(MIN_GAP_SPLIT_DURATION_MS);
+
+            let half = needed / 2;
+            let mut left_cut = half.min(left_slack);
+            let rem_after_left = needed.saturating_sub(left_cut);
+            let right_cut = rem_after_left.min(right_slack);
+            let rem_after_right = needed.saturating_sub(left_cut).saturating_sub(right_cut);
+            if rem_after_right > 0 {
+                left_cut = left_cut.saturating_add(rem_after_right.min(left_slack - left_cut));
+            }
+
+            if left_cut > 0 {
+                cues[k].end_ms = curr_end.saturating_sub(left_cut);
+                curr_changed = true;
+            }
+            if right_cut > 0 {
+                cues[k + 1].start_ms = next_start.saturating_add(right_cut);
+                next_changed = true;
+            }
+        }
+
+        if curr_changed {
+            compute_cue_metrics(&mut cues[k], rules);
+        }
+        if next_changed {
+            compute_cue_metrics(&mut cues[k + 1], rules);
+        }
+    }
+}
+
 /// Groups `TimedWord`s into readable `SubtitleCue`s according to `rules`.
 pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleCue> {
     let speaker_change_indices: Vec<usize> = words
@@ -597,11 +832,12 @@ pub fn segment_words(words: &[TimedWord], rules: &SegmentRules) -> Vec<SubtitleC
         .enumerate()
         .filter_map(|(idx, word)| word.speaker_change.then_some(idx))
         .collect();
-    segment_words_with_speaker_changes(
+    segment_words_with_options(
         words,
         rules,
         &speaker_change_indices,
         rules.split_on_speaker_change,
+        false,
     )
 }
 
@@ -613,27 +849,75 @@ pub fn segment_words_with_speaker_changes(
     speaker_change_indices: &[usize],
     split_on_speaker_change: bool,
 ) -> Vec<SubtitleCue> {
+    segment_words_with_options(
+        words,
+        rules,
+        speaker_change_indices,
+        split_on_speaker_change,
+        false,
+    )
+}
+
+/// Groups `TimedWord`s into readable `SubtitleCue`s according to `rules`, optionally
+/// forcing immediate cue breaks at `speaker_change_indices` (0-based indices into `words`)
+/// and optionally stripping non-lexical vocal hesitations (`remove_fillers`) before
+/// mapping speaker-turn boundaries so speaker indices stay aligned.
+pub fn segment_words_with_options(
+    words: &[TimedWord],
+    rules: &SegmentRules,
+    speaker_change_indices: &[usize],
+    split_on_speaker_change: bool,
+    remove_fillers: bool,
+) -> Vec<SubtitleCue> {
     let rules = normalize_rules(rules);
 
-    let mut raw_speaker_changes = vec![false; words.len()];
-    if split_on_speaker_change {
-        for &idx in speaker_change_indices {
-            if idx < raw_speaker_changes.len() {
-                raw_speaker_changes[idx] = true;
+    let (working_words, raw_speaker_changes): (Vec<TimedWord>, Vec<bool>) = if remove_fillers {
+        let mut tagged = words.to_vec();
+        if split_on_speaker_change {
+            for &idx in speaker_change_indices {
+                if let Some(w) = tagged.get_mut(idx) {
+                    w.speaker_change = true;
+                }
+            }
+        } else {
+            for w in &mut tagged {
+                w.speaker_change = false;
             }
         }
-    }
+        let stripped = strip_vocal_hesitations(&tagged);
+        let breaks = if split_on_speaker_change {
+            stripped.iter().map(|w| w.speaker_change).collect()
+        } else {
+            vec![false; stripped.len()]
+        };
+        (stripped, breaks)
+    } else {
+        let mut breaks = vec![false; words.len()];
+        if split_on_speaker_change {
+            for (idx, w) in words.iter().enumerate() {
+                if w.speaker_change {
+                    breaks[idx] = true;
+                }
+            }
+            for &idx in speaker_change_indices {
+                if idx < breaks.len() {
+                    breaks[idx] = true;
+                }
+            }
+        }
+        (words.to_vec(), breaks)
+    };
 
-    let mut cleaned_words = Vec::with_capacity(words.len());
-    let mut effective_speaker_breaks = Vec::with_capacity(words.len());
+    let mut cleaned_words = Vec::with_capacity(working_words.len());
+    let mut effective_speaker_breaks = Vec::with_capacity(working_words.len());
     let mut pending_speaker_change = false;
-    for (orig_idx, w) in words.iter().enumerate() {
+    for (orig_idx, w) in working_words.into_iter().enumerate() {
         pending_speaker_change |= raw_speaker_changes[orig_idx];
-        let t = w.text.trim();
-        if !t.is_empty() {
-            let mut cleaned = w.clone();
+        let trimmed = w.text.trim().to_string();
+        if !trimmed.is_empty() {
+            let mut cleaned = w;
             cleaned.end_ms = cleaned.end_ms.max(cleaned.start_ms);
-            cleaned.text = t.to_string();
+            cleaned.text = trimmed;
             cleaned_words.push(cleaned);
             effective_speaker_breaks.push(pending_speaker_change);
             pending_speaker_change = false;
@@ -681,8 +965,8 @@ pub fn segment_words_with_speaker_changes(
             let next_word = turn_words.get(i + 1);
             let gap = next_word.map_or(0, |nw| nw.start_ms.saturating_sub(turn_words[i].end_ms));
 
-            // Workstream 2: Suppress premature break when cue consists solely of one
-            // leading conjunction/filler followed within the hesitation window by a
+            // Suppress premature break when cue consists solely of one leading
+            // conjunction/filler followed within the hesitation window by a
             // same-speaker continuation.
             if i == start_idx && is_leading_conjunction_or_filler(&turn_words[i].text) {
                 if let Some(nw) = next_word {
@@ -746,6 +1030,24 @@ pub fn segment_words_with_speaker_changes(
                         hit_hard_limit = false;
                         break;
                     }
+                }
+
+                // If a hard pause follows a trailing unpunctuated clause/question starter
+                // immediately after sentence/clause punctuation (e.g. "Okay, alright, what" + 520ms),
+                // roll back cleanly to the punctuation boundary so the starter opens the next cue.
+                if is_dangling_function_word(&turn_words[i].text)
+                    && gap >= HARD_PAUSE_MS
+                    && i > start_idx
+                    && !(i == start_idx + 1 && attached_leading_conj.is_some())
+                    && (ends_with_sentence_punct(&turn_words[i - 1].text)
+                        || ends_with_clause_punct(&turn_words[i - 1].text))
+                    && !ends_with_sentence_punct(&turn_words[i].text)
+                    && !ends_with_clause_punct(&turn_words[i].text)
+                    && slice_char_len(&turn_words[start_idx..=(i - 1)]) >= 4
+                {
+                    last_fit_idx = i - 1;
+                    hit_hard_limit = false;
+                    break;
                 }
 
                 if !is_dangling_function_word(&turn_words[i].text)
@@ -874,6 +1176,22 @@ pub fn segment_words_with_speaker_changes(
             }
         }
 
+        // General Structural Rollback Rule: never strand a single unpunctuated word after
+        // sentence/clause punctuation at the tail of a cue when speech continues in the same turn.
+        // Complete closing vocatives (e.g. "Hvala ti, brate.") remain intact because the trailing
+        // word carries terminal punctuation.
+        if end_idx > start_idx
+            && end_idx + 1 < turn_end
+            && !(end_idx == start_idx + 1 && attached_leading_conj.is_some())
+            && (ends_with_sentence_punct(&cleaned_words[end_idx - 1].text)
+                || ends_with_clause_punct(&cleaned_words[end_idx - 1].text))
+            && !ends_with_sentence_punct(&cleaned_words[end_idx].text)
+            && !ends_with_clause_punct(&cleaned_words[end_idx].text)
+            && slice_char_len(&cleaned_words[start_idx..=(end_idx - 1)]) >= 4
+        {
+            end_idx -= 1;
+        }
+
         let raw_text = if end_idx > start_idx {
             if let Some(ref cleaned_conj) = attached_leading_conj {
                 let mut parts = Vec::with_capacity(end_idx - start_idx + 1);
@@ -922,8 +1240,9 @@ pub fn segment_words_with_speaker_changes(
         let end_ms = if let Some(next_word) = cleaned_words.get(end_idx + 1) {
             let silence_gap_ms = next_word.start_ms.saturating_sub(speech_end_ms);
             if silence_gap_ms <= bridge_threshold_ms {
-                // Short silence: bridge the end of this cue directly to the start of the next cue
-                next_word.start_ms.min(max_allowed_end).max(speech_end_ms)
+                // Short silence: bridge while keeping at least MIN_INTER_CUE_GAP_MS (80 ms) clearance
+                let bridge_cap = next_word.start_ms.saturating_sub(MIN_INTER_CUE_GAP_MS);
+                bridge_cap.min(max_allowed_end).max(speech_end_ms)
             } else {
                 // Longer pause: extend by post-speech comfort hold / min_duration, then leave a clear blank gap before the next cue
                 let safe_cap = next_word
@@ -955,11 +1274,780 @@ pub fn segment_words_with_speaker_changes(
         start_idx = end_idx + 1;
     }
 
-    merge_isolated_leading_conjunction_cues(cues_with_meta, &rules, max_total_chars)
+    let mut cues =
+        merge_isolated_leading_conjunction_cues(cues_with_meta, &rules, max_total_chars);
+    enforce_min_inter_cue_gap(&mut cues, &rules);
+    cues
 }
 
-/// Balances text into at most `max_lines` lines (preferring 1 line if it fits within
-/// `max_chars_per_line`, or splitting into 2 balanced lines at a word/punctuation boundary).
+fn normalize_wrap_token(word: &str) -> String {
+    word.trim_matches(|c: char| !c.is_alphanumeric())
+        .replace('’', "'")
+        .to_lowercase()
+}
+
+fn starts_with_uppercase_alpha(word: &str) -> bool {
+    let trimmed = word.trim_start_matches(['"', '\'', '„', '“', '‘', '«', '(', '[']);
+    trimmed
+        .chars()
+        .next()
+        .is_some_and(|c| c.is_alphabetic() && c.is_uppercase())
+}
+
+fn is_wrap_negation(clean: &str) -> bool {
+    matches!(
+        clean,
+        "ne" | "ni"
+            | "niti"
+            | "nije"
+            | "nisam"
+            | "nisi"
+            | "nismo"
+            | "niste"
+            | "nisu"
+            | "neću"
+            | "necu"
+            | "nećeš"
+            | "neces"
+            | "neće"
+            | "nece"
+            | "nećemo"
+            | "necemo"
+            | "nećete"
+            | "necete"
+            | "nemoj"
+            | "nemojte"
+            | "nemam"
+            | "nema"
+            | "nemaju"
+            | "не"
+            | "ни"
+            | "нити"
+            | "није"
+            | "нисам"
+            | "ниси"
+            | "нисмо"
+            | "нисте"
+            | "нису"
+            | "нећу"
+            | "нећеш"
+            | "неће"
+            | "нећемо"
+            | "нећете"
+            | "немој"
+            | "немојте"
+            | "немам"
+            | "нема"
+            | "немају"
+            | "not"
+            | "no"
+            | "never"
+            | "don't"
+            | "doesn't"
+            | "didn't"
+            | "won't"
+            | "wouldn't"
+            | "can't"
+            | "cannot"
+            | "couldn't"
+            | "shouldn't"
+            | "isn't"
+            | "aren't"
+            | "wasn't"
+            | "weren't"
+            | "haven't"
+            | "hasn't"
+            | "hadn't"
+    )
+}
+
+fn is_wrap_preposition_or_article(clean: &str) -> bool {
+    matches!(
+        clean,
+        "u" | "na"
+            | "za"
+            | "sa"
+            | "s"
+            | "od"
+            | "do"
+            | "iz"
+            | "o"
+            | "po"
+            | "pri"
+            | "ka"
+            | "k"
+            | "uz"
+            | "niz"
+            | "nad"
+            | "pod"
+            | "pred"
+            | "među"
+            | "medju"
+            | "kroz"
+            | "kod"
+            | "bez"
+            | "osim"
+            | "prema"
+            | "protiv"
+            | "oko"
+            | "posle"
+            | "pre"
+            | "у"
+            | "на"
+            | "за"
+            | "са"
+            | "с"
+            | "од"
+            | "до"
+            | "из"
+            | "о"
+            | "по"
+            | "при"
+            | "ка"
+            | "к"
+            | "уз"
+            | "низ"
+            | "над"
+            | "под"
+            | "пред"
+            | "међу"
+            | "кроз"
+            | "код"
+            | "без"
+            | "осим"
+            | "према"
+            | "против"
+            | "око"
+            | "после"
+            | "пре"
+            | "a"
+            | "an"
+            | "the"
+            | "in"
+            | "on"
+            | "at"
+            | "to"
+            | "of"
+            | "for"
+            | "with"
+            | "from"
+            | "by"
+            | "into"
+            | "onto"
+            | "upon"
+            | "about"
+            | "against"
+            | "between"
+            | "through"
+            | "during"
+            | "without"
+            | "within"
+            | "under"
+            | "over"
+    )
+}
+
+fn is_wrap_auxiliary_or_enclitic(clean: &str) -> bool {
+    matches!(
+        clean,
+        "sam" | "si"
+            | "je"
+            | "smo"
+            | "ste"
+            | "su"
+            | "ću"
+            | "cu"
+            | "ćeš"
+            | "ces"
+            | "će"
+            | "ce"
+            | "ćemo"
+            | "cemo"
+            | "ćete"
+            | "cete"
+            | "bih"
+            | "bi"
+            | "bismo"
+            | "biste"
+            | "se"
+            | "li"
+            | "bio"
+            | "bila"
+            | "bilo"
+            | "bili"
+            | "bile"
+            | "сам"
+            | "си"
+            | "је"
+            | "смо"
+            | "сте"
+            | "су"
+            | "ћу"
+            | "ћеш"
+            | "ће"
+            | "ћемо"
+            | "ћете"
+            | "бих"
+            | "би"
+            | "бисмо"
+            | "бисте"
+            | "се"
+            | "ли"
+            | "био"
+            | "била"
+            | "било"
+            | "били"
+            | "биле"
+            | "is"
+            | "am"
+            | "are"
+            | "was"
+            | "were"
+            | "be"
+            | "been"
+            | "being"
+            | "has"
+            | "have"
+            | "had"
+            | "do"
+            | "does"
+            | "did"
+            | "will"
+            | "would"
+            | "shall"
+            | "should"
+            | "can"
+            | "could"
+            | "may"
+            | "might"
+            | "must"
+    )
+}
+
+fn is_wrap_conjunction(clean: &str) -> bool {
+    matches!(
+        clean,
+        "i" | "a"
+            | "ali"
+            | "ili"
+            | "da"
+            | "pa"
+            | "te"
+            | "jer"
+            | "što"
+            | "sto"
+            | "ako"
+            | "dok"
+            | "kad"
+            | "kada"
+            | "nego"
+            | "već"
+            | "vec"
+            | "kako"
+            | "gde"
+            | "gdje"
+            | "koji"
+            | "koja"
+            | "koje"
+            | "čiji"
+            | "ciji"
+            | "и"
+            | "а"
+            | "али"
+            | "или"
+            | "да"
+            | "па"
+            | "те"
+            | "јер"
+            | "што"
+            | "ако"
+            | "док"
+            | "кад"
+            | "када"
+            | "него"
+            | "већ"
+            | "како"
+            | "где"
+            | "гдје"
+            | "који"
+            | "која"
+            | "које"
+            | "чији"
+            | "and"
+            | "or"
+            | "but"
+            | "so"
+            | "yet"
+            | "nor"
+            | "that"
+            | "which"
+            | "who"
+            | "whom"
+            | "whose"
+            | "where"
+            | "when"
+            | "while"
+            | "because"
+            | "although"
+            | "since"
+            | "until"
+            | "unless"
+            | "if"
+            | "whether"
+    )
+}
+
+fn is_wrap_pronoun(clean: &str) -> bool {
+    matches!(
+        clean,
+        "ja" | "ti"
+            | "on"
+            | "ona"
+            | "ono"
+            | "mi"
+            | "vi"
+            | "oni"
+            | "one"
+            | "moj"
+            | "moja"
+            | "moje"
+            | "tvoj"
+            | "tvoja"
+            | "tvoje"
+            | "njegov"
+            | "njen"
+            | "naš"
+            | "nas"
+            | "vaš"
+            | "vas"
+            | "njihov"
+            | "svoj"
+            | "svoja"
+            | "svoje"
+            | "ovaj"
+            | "ova"
+            | "ovo"
+            | "taj"
+            | "ta"
+            | "to"
+            | "onaj"
+            | "mu"
+            | "joj"
+            | "ga"
+            | "ih"
+            | "nam"
+            | "vam"
+            | "ја"
+            | "ти"
+            | "он"
+            | "она"
+            | "оно"
+            | "ми"
+            | "ви"
+            | "они"
+            | "оне"
+            | "мој"
+            | "моја"
+            | "моје"
+            | "твој"
+            | "твоја"
+            | "твоје"
+            | "његов"
+            | "њен"
+            | "наш"
+            | "ваш"
+            | "њихов"
+            | "свој"
+            | "своја"
+            | "своје"
+            | "овај"
+            | "ова"
+            | "ово"
+            | "тај"
+            | "та"
+            | "то"
+            | "онај"
+            | "му"
+            | "јој"
+            | "га"
+            | "их"
+            | "нам"
+            | "вам"
+            | "i"
+            | "you"
+            | "he"
+            | "she"
+            | "it"
+            | "we"
+            | "they"
+            | "my"
+            | "your"
+            | "his"
+            | "her"
+            | "its"
+            | "our"
+            | "their"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+    )
+}
+
+fn is_sentence_opening_non_name(clean: &str) -> bool {
+    matches!(
+        clean,
+        "danas"
+            | "sada"
+            | "sad"
+            | "ovde"
+            | "ovdje"
+            | "tamo"
+            | "tada"
+            | "tad"
+            | "kada"
+            | "kad"
+            | "ali"
+            | "međutim"
+            | "medjutim"
+            | "ipak"
+            | "dakle"
+            | "zato"
+            | "potom"
+            | "zatim"
+            | "onda"
+            | "juče"
+            | "juce"
+            | "sutra"
+            | "uvek"
+            | "uvijek"
+            | "nikad"
+            | "nikada"
+            | "možda"
+            | "mozda"
+            | "naravno"
+            | "zapravo"
+            | "inače"
+            | "inace"
+            | "dok"
+            | "ako"
+            | "pošto"
+            | "posto"
+            | "iako"
+            | "čim"
+            | "cim"
+            | "već"
+            | "vec"
+            | "samo"
+            | "čak"
+            | "cak"
+            | "baš"
+            | "bas"
+            | "i"
+            | "a"
+            | "pa"
+            | "da"
+            | "ne"
+            | "ovaj"
+            | "ova"
+            | "ovo"
+            | "taj"
+            | "ta"
+            | "to"
+            | "onaj"
+            | "ona"
+            | "ono"
+            | "on"
+            | "mi"
+            | "vi"
+            | "oni"
+            | "one"
+            | "ja"
+            | "ti"
+            | "svi"
+            | "sve"
+            | "neko"
+            | "niko"
+            | "šta"
+            | "sta"
+            | "ko"
+            | "kako"
+            | "zašto"
+            | "zasto"
+            | "gde"
+            | "gdje"
+            | "koliko"
+            | "данас"
+            | "сада"
+            | "сад"
+            | "овде"
+            | "овдје"
+            | "тамо"
+            | "тада"
+            | "тад"
+            | "када"
+            | "кад"
+            | "али"
+            | "међутим"
+            | "ипак"
+            | "дакле"
+            | "зато"
+            | "потом"
+            | "затим"
+            | "онда"
+            | "јуче"
+            | "сутра"
+            | "увек"
+            | "увијек"
+            | "никад"
+            | "никада"
+            | "можда"
+            | "наравно"
+            | "заправо"
+            | "иначе"
+            | "док"
+            | "ако"
+            | "пошто"
+            | "иако"
+            | "чим"
+            | "већ"
+            | "само"
+            | "чак"
+            | "баш"
+            | "и"
+            | "а"
+            | "па"
+            | "да"
+            | "не"
+            | "овај"
+            | "ова"
+            | "ово"
+            | "тај"
+            | "та"
+            | "то"
+            | "онај"
+            | "она"
+            | "оно"
+            | "он"
+            | "ми"
+            | "ви"
+            | "они"
+            | "оне"
+            | "ја"
+            | "ти"
+            | "сви"
+            | "све"
+            | "неко"
+            | "нико"
+            | "шта"
+            | "ко"
+            | "како"
+            | "зашто"
+            | "где"
+            | "гдје"
+            | "колико"
+            | "when"
+            | "today"
+            | "tomorrow"
+            | "yesterday"
+            | "here"
+            | "there"
+            | "then"
+            | "now"
+            | "however"
+            | "therefore"
+            | "meanwhile"
+            | "otherwise"
+            | "suddenly"
+            | "actually"
+            | "maybe"
+            | "perhaps"
+            | "always"
+            | "never"
+            | "often"
+            | "sometimes"
+            | "already"
+            | "still"
+            | "just"
+            | "only"
+            | "even"
+            | "also"
+            | "but"
+            | "and"
+            | "or"
+            | "so"
+            | "yet"
+            | "because"
+            | "although"
+            | "though"
+            | "while"
+            | "since"
+            | "until"
+            | "unless"
+            | "if"
+            | "whether"
+            | "after"
+            | "before"
+            | "during"
+            | "why"
+            | "how"
+            | "what"
+            | "where"
+            | "who"
+            | "this"
+            | "that"
+            | "these"
+            | "those"
+            | "they"
+            | "we"
+            | "he"
+            | "she"
+            | "it"
+            | "you"
+            | "everyone"
+            | "someone"
+            | "nobody"
+            | "finally"
+            | "first"
+            | "next"
+            | "later"
+    )
+}
+
+fn is_proper_name_pair(words: &[&str], k: usize, prev_clean: &str) -> bool {
+    if k == 0 || k >= words.len() {
+        return false;
+    }
+    if !starts_with_uppercase_alpha(words[k - 1]) || !starts_with_uppercase_alpha(words[k]) {
+        return false;
+    }
+    let is_sentence_start = k == 1 || ends_with_sentence_punct(words[k - 2]);
+    !(is_sentence_start && is_sentence_opening_non_name(prev_clean))
+}
+
+fn linguistic_split_penalty(words: &[&str], k: usize) -> i64 {
+    if k == 0 || k >= words.len() {
+        return 0;
+    }
+    let prev = words[k - 1];
+    if ends_with_sentence_punct(prev) || ends_with_clause_punct(prev) {
+        return 0;
+    }
+    let clean = normalize_wrap_token(prev);
+    let mut penalty: i64 = 0;
+    if is_wrap_negation(&clean) {
+        penalty = penalty.max(42);
+    }
+    if is_wrap_preposition_or_article(&clean) {
+        penalty = penalty.max(38);
+    }
+    if is_proper_name_pair(words, k, &clean) {
+        penalty = penalty.max(36);
+    }
+    if is_wrap_auxiliary_or_enclitic(&clean) {
+        penalty = penalty.max(34);
+    }
+    if is_wrap_conjunction(&clean) {
+        penalty = penalty.max(30);
+    }
+    if is_wrap_pronoun(&clean) {
+        penalty = penalty.max(28);
+    }
+    penalty
+}
+
+fn punct_break_bonus(word: &str) -> i64 {
+    if ends_with_sentence_punct(word) {
+        14
+    } else if ends_with_clause_punct(word) {
+        10
+    } else {
+        0
+    }
+}
+
+fn solve_exact_line_count_dp(
+    prefix_chars: &[usize],
+    boundary_costs: &[i64],
+    total_single_line_chars: usize,
+    max_chars: usize,
+    line_count: usize,
+) -> (i64, Vec<usize>) {
+    let n = prefix_chars.len() - 1;
+    let l = line_count as i64;
+    let total_lines_chars = (total_single_line_chars - (line_count - 1)) as i64;
+    let max_chars_i64 = max_chars as i64;
+
+    let line_len = |a: usize, b: usize| -> i64 {
+        ((prefix_chars[b] - prefix_chars[a]) + (b - a - 1)) as i64
+    };
+
+    let inf_ov = i64::MAX / 4;
+    let inf_sc = i64::MAX / 4;
+
+    // dp_ov[r][i], dp_sc[r][i]: optimal (total_overflow, scaled_score) for words[i..n] in r lines.
+    let mut dp_ov = vec![vec![inf_ov; n + 1]; line_count + 1];
+    let mut dp_sc = vec![vec![inf_sc; n + 1]; line_count + 1];
+    let mut next_split = vec![vec![n; n + 1]; line_count + 1];
+
+    // Base case: r = 1 (words[i..n] on a single line)
+    for i in 0..n {
+        let len = line_len(i, n);
+        let ov = (len - max_chars_i64).max(0);
+        let balance = (l * len - total_lines_chars).abs();
+        dp_ov[1][i] = ov;
+        dp_sc[1][i] = ov * 1000 * l + balance;
+        next_split[1][i] = n;
+    }
+
+    // Transitions: r = 2..=line_count
+    for r in 2..=line_count {
+        let i_start = if r == line_count { 0 } else { 1 };
+        let i_end = if r == line_count { 0 } else { n - r };
+        for i in i_start..=i_end {
+            let mut best_ov = inf_ov;
+            let mut best_sc = inf_sc;
+            let mut best_k = i + 1;
+
+            for k in (i + 1)..=(n - (r - 1)) {
+                let tail_ov = dp_ov[r - 1][k];
+                if tail_ov >= inf_ov {
+                    continue;
+                }
+                let len = line_len(i, k);
+                let ov = (len - max_chars_i64).max(0);
+                let balance = (l * len - total_lines_chars).abs();
+                let cand_ov = ov + tail_ov;
+                let cand_sc = ov * 1000 * l + balance + boundary_costs[k] * l + dp_sc[r - 1][k];
+
+                if cand_ov < best_ov || (cand_ov == best_ov && cand_sc < best_sc) {
+                    best_ov = cand_ov;
+                    best_sc = cand_sc;
+                    best_k = k;
+                }
+            }
+
+            dp_ov[r][i] = best_ov;
+            dp_sc[r][i] = best_sc;
+            next_split[r][i] = best_k;
+        }
+    }
+
+    let mut splits = Vec::with_capacity(line_count - 1);
+    let mut cur = 0usize;
+    for r in (2..=line_count).rev() {
+        let k = next_split[r][cur];
+        splits.push(k);
+        cur = k;
+    }
+
+    (dp_ov[line_count][0], splits)
+}
+
+/// Balances text into at most `max_lines` (`1..=4`) linguistically-clean lines using
+/// exact dynamic programming (minimizing overflow first, then smallest feasible line count,
+/// then length balance + linguistic split penalties - punctuation break bonuses).
+/// Behaviorally 1:1 identical to TypeScript `wrapBalancedLines`.
 pub fn wrap_balanced_lines(text: &str, max_chars_per_line: u32, max_lines: u32) -> String {
     let words: Vec<&str> = text.split_whitespace().collect();
     if words.is_empty() {
@@ -967,60 +2055,72 @@ pub fn wrap_balanced_lines(text: &str, max_chars_per_line: u32, max_lines: u32) 
     }
 
     let single_line = words.join(" ");
+    let single_line_chars = single_line.chars().count();
     let max_chars = max_chars_per_line.max(1) as usize;
+    let clamped_max_lines = max_lines.clamp(1, 4) as usize;
 
-    if max_lines <= 1 || single_line.chars().count() <= max_chars || words.len() == 1 {
+    if clamped_max_lines <= 1 || single_line_chars <= max_chars || words.len() == 1 {
         return single_line;
     }
 
-    // Find optimal 2-line split near the visual midpoint
-    let mut best_split = 1;
-    let mut best_score = isize::MAX;
+    let n = words.len();
+    let effective_max_lines = clamped_max_lines.min(n);
 
-    for k in 1..words.len() {
-        let line1 = words[..k].join(" ");
-        let line2 = words[k..].join(" ");
-        let len1 = line1.chars().count();
-        let len2 = line2.chars().count();
+    let mut prefix_chars = Vec::with_capacity(n + 1);
+    prefix_chars.push(0usize);
+    for w in &words {
+        let prev = *prefix_chars.last().unwrap_or(&0);
+        prefix_chars.push(prev + w.chars().count());
+    }
 
-        let overflow1 = len1.saturating_sub(max_chars) as isize;
-        let overflow2 = len2.saturating_sub(max_chars) as isize;
-        let overflow_penalty = (overflow1 + overflow2) * 1000;
+    let mut boundary_costs = vec![0i64; n];
+    for k in 1..n {
+        boundary_costs[k] = linguistic_split_penalty(&words, k) - punct_break_bonus(words[k - 1]);
+    }
 
-        let diff = (len1 as isize - len2 as isize).abs();
-        let punct_bonus = if ends_with_clause_punct(words[k - 1])
-            || ends_with_sentence_punct(words[k - 1])
-        {
-            6
-        } else {
-            0
-        };
+    let mut best_overflow = i64::MAX;
+    let mut best_splits: Vec<usize> = Vec::new();
 
-        let score = overflow_penalty + diff - punct_bonus;
-        if score < best_score {
-            best_score = score;
-            best_split = k;
+    for line_count in 2..=effective_max_lines {
+        let (ov, splits) = solve_exact_line_count_dp(
+            &prefix_chars,
+            &boundary_costs,
+            single_line_chars,
+            max_chars,
+            line_count,
+        );
+        if ov < best_overflow {
+            best_overflow = ov;
+            best_splits = splits;
+            if ov == 0 {
+                break;
+            }
         }
     }
 
-    let line1 = words[..best_split].join(" ");
-    let line2 = words[best_split..].join(" ");
-    format!("{line1}\n{line2}")
+    let mut lines = Vec::with_capacity(best_splits.len() + 1);
+    let mut start = 0usize;
+    for end in best_splits {
+        lines.push(words[start..end].join(" "));
+        start = end;
+    }
+    lines.push(words[start..].join(" "));
+    lines.join("\n")
 }
 
-/// Computes `cue.cps` (rounded to 1 decimal place) and populates `cue.warnings`
-/// (`"high_cps"`, `"line_too_long"`, `"duration_too_short"`, `"duration_too_long"`).
+/// Computes `cue.cps` (rounded to 1 decimal place) and populates `cue.warnings` using
+/// the canonical warning IDs (`"critical_cps"`, `"high_cps"`, `"line_too_long"`,
+/// `"too_many_lines"`, `"duration_too_short"`, `"duration_too_long"`).
 pub fn compute_cue_metrics(cue: &mut SubtitleCue, rules: &SegmentRules) {
-    let visible = if !cue.translated_text.trim().is_empty() {
+    let raw_visible = if !cue.translated_text.trim().is_empty() {
         cue.translated_text.as_str()
     } else {
         cue.source_text.as_str()
     };
+    let normalized = raw_visible.replace("\r\n", "\n").replace('\r', "\n");
+    let visible = normalized.trim();
 
-    let char_count = visible
-        .chars()
-        .filter(|&c| c != '\n' && c != '\r')
-        .count();
+    let char_count = visible.chars().filter(|&c| c != '\n').count();
     let duration_ms = cue.end_ms.saturating_sub(cue.start_ms);
 
     let cps = if duration_ms == 0 {
@@ -1036,22 +2136,28 @@ pub fn compute_cue_metrics(cue: &mut SubtitleCue, rules: &SegmentRules) {
     cue.cps = cps;
 
     let mut warnings = Vec::new();
-    if cps > rules.max_cps {
+    if cps > rules.max_cps + 4.0 {
+        warnings.push("critical_cps".to_string());
+    } else if cps > rules.max_cps {
         warnings.push("high_cps".to_string());
     }
 
     let max_chars = rules.max_chars_per_line as usize;
-    let lines: Vec<&str> = visible.lines().collect();
-    if lines.len() > rules.max_lines as usize
-        || lines.iter().any(|l| l.chars().count() > max_chars)
-    {
+    let lines: Vec<&str> = if visible.is_empty() {
+        Vec::new()
+    } else {
+        visible.split('\n').collect()
+    };
+    if lines.iter().any(|l| l.chars().count() > max_chars) {
         warnings.push("line_too_long".to_string());
     }
-
-    if duration_ms < rules.min_duration_ms {
-        warnings.push("duration_too_short".to_string());
+    if lines.len() > rules.max_lines as usize {
+        warnings.push("too_many_lines".to_string());
     }
-    if duration_ms > rules.max_duration_ms {
+
+    if duration_ms < rules.min_duration_ms && char_count > 0 {
+        warnings.push("duration_too_short".to_string());
+    } else if duration_ms > rules.max_duration_ms {
         warnings.push("duration_too_long".to_string());
     }
 
@@ -1157,23 +2263,56 @@ mod tests {
 
     #[test]
     fn compute_cue_metrics_flags_high_cps_and_line_too_long() {
-        let rules = SegmentRules::default(); // max_cps = 17.0, max_chars_per_line = 42
-        let mut cue = SubtitleCue {
+        let rules = SegmentRules::default(); // max_cps = 17.0, max_chars_per_line = 42, max_lines = 2
+        let mut critical_cue = SubtitleCue {
             id: 1,
             start_ms: 0,
-            end_ms: 500, // 0.5s -> duration_too_short & high_cps
+            end_ms: 500, // 0.5s -> duration_too_short & critical_cps
             source_text: "Kratko".to_string(),
             translated_text:
-                "Ово је превод који је превише дугачак за једну линију од четрдесет два карактера."
+                "Ово је превод који је превише дугачак за једну линију од четрдесет два карактера.\nДруги ред.\nТрећи ред."
                     .to_string(),
             cps: 0.0,
             warnings: Vec::new(),
         };
-        compute_cue_metrics(&mut cue, &rules);
-        assert!(cue.cps > 17.0);
-        assert!(cue.warnings.contains(&"high_cps".to_string()));
-        assert!(cue.warnings.contains(&"line_too_long".to_string()));
-        assert!(cue.warnings.contains(&"duration_too_short".to_string()));
+        compute_cue_metrics(&mut critical_cue, &rules);
+        assert!(critical_cue.cps > rules.max_cps + 4.0);
+        assert!(critical_cue.warnings.contains(&"critical_cps".to_string()));
+        assert!(!critical_cue.warnings.contains(&"high_cps".to_string()));
+        assert!(critical_cue.warnings.contains(&"line_too_long".to_string()));
+        assert!(critical_cue
+            .warnings
+            .contains(&"too_many_lines".to_string()));
+        assert!(critical_cue
+            .warnings
+            .contains(&"duration_too_short".to_string()));
+
+        // High (non-critical) CPS: 38 chars over 2.0s = 19.0 CPS (17 < 19 <= 21)
+        let mut high_cue = SubtitleCue {
+            id: 2,
+            start_ms: 0,
+            end_ms: 2000,
+            source_text: "Ovo je malo brži titl sa trideset osam".to_string(),
+            translated_text: String::new(),
+            cps: 0.0,
+            warnings: Vec::new(),
+        };
+        compute_cue_metrics(&mut high_cue, &rules);
+        assert_eq!(high_cue.cps, 19.0);
+        assert_eq!(high_cue.warnings, vec!["high_cps".to_string()]);
+
+        // Long duration (> 7000ms)
+        let mut long_cue = SubtitleCue {
+            id: 3,
+            start_ms: 0,
+            end_ms: 8500,
+            source_text: "Dugačak prikaz na ekranu.".to_string(),
+            translated_text: String::new(),
+            cps: 0.0,
+            warnings: Vec::new(),
+        };
+        compute_cue_metrics(&mut long_cue, &rules);
+        assert_eq!(long_cue.warnings, vec!["duration_too_long".to_string()]);
     }
 
     #[test]
@@ -1235,13 +2374,13 @@ mod tests {
     #[test]
     fn bridges_short_silence_and_adds_comfort_hold_before_longer_pause() {
         let words = vec![
-            // Cue 1: 0..1400ms, followed by 320ms silence (<= 500ms -> should bridge to 1720ms)
+            // Cue 1: 0..1400ms, followed by 320ms silence (<= 500ms -> bridges to 1720 - 80 = 1640ms)
             word(0, 700, "Prva"),
             word(700, 1400, "rečenica."),
-            // Cue 2: 1720..3200ms, followed by 1100ms pause (> 500ms -> should hold +350ms to 3550ms)
+            // Cue 2: 1720..3200ms, followed by 1100ms pause (> 500ms -> holds +350ms to 3550ms)
             word(1720, 2400, "Druga"),
             word(2400, 3200, "rečenica."),
-            // Cue 3: 4300..5600ms (final cue -> should hold +350ms to 5950ms)
+            // Cue 3: 4300..5600ms (final cue -> holds +350ms to 5950ms)
             word(4300, 4900, "Treća"),
             word(4900, 5600, "rečenica."),
         ];
@@ -1250,8 +2389,12 @@ mod tests {
 
         assert_eq!(cues.len(), 3);
         assert_eq!(cues[0].start_ms, 0);
-        assert_eq!(cues[0].end_ms, 1720);
+        assert_eq!(cues[0].end_ms, 1640);
         assert_eq!(cues[1].start_ms, 1720);
+        assert!(
+            cues[1].start_ms - cues[0].end_ms >= MIN_INTER_CUE_GAP_MS,
+            "expected >= 80ms breathing gap"
+        );
         assert_eq!(cues[1].end_ms, 3550);
         assert_eq!(cues[2].start_ms, 4300);
         assert_eq!(cues[2].end_ms, 5950);
@@ -1784,5 +2927,576 @@ mod tests {
             merged_cues
         );
         assert_eq!(merged_cues[0].source_text, "Mislim da jeste tako.");
+    }
+
+    #[test]
+    fn strip_vocal_hesitations_removes_non_lexical_fillers_and_cleans_punctuation() {
+        // Standalone hesitations with mixed case/punctuation are stripped, while lexical tokens stay intact.
+        let words = vec![
+            word(0, 200, "Um,"),
+            word(250, 500, "we"),
+            word(500, 800, "were,"),
+            word(800, 1000, "uh,"),
+            word(1000, 1200, "erm..."),
+            word(1200, 1400, "ER?"),
+            word(1400, 1600, "(hmm)"),
+            word(1600, 1800, "mm,"),
+            word(1800, 2000, "Uhm,"),
+            word(2000, 2400, "going"),
+            word(2400, 2800, "home"),
+            word(2800, 3200, "umesto"),
+            word(3200, 3600, "summer"),
+            word(3600, 4000, "error"),
+            word(4000, 4400, "uh-huh."),
+        ];
+        let stripped = strip_vocal_hesitations(&words);
+        let tokens: Vec<&str> = stripped.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(
+            tokens,
+            vec!["we", "were,", "going", "home", "umesto", "summer", "error", "uh-huh."]
+        );
+
+        // Orphan standalone commas before/after hesitations and doubled commas are cleaned cleanly.
+        let orphan_commas = vec![
+            word(0, 200, "We"),
+            word(200, 400, "went"),
+            word(400, 450, ","),
+            word(450, 600, "um"),
+            word(600, 650, ","),
+            word(650, 900, "home."),
+        ];
+        let cleaned_orphans: Vec<String> = strip_vocal_hesitations(&orphan_commas)
+            .into_iter()
+            .map(|w| w.text)
+            .collect();
+        assert_eq!(cleaned_orphans, vec!["We", "went", "home."]);
+
+        // Doubled trailing comma + leading comma on next surviving word
+        let doubled = vec![
+            word(0, 200, "Well,,"),
+            word(200, 400, "uh,"),
+            word(400, 700, ",okay."),
+        ];
+        let cleaned_doubled: Vec<String> = strip_vocal_hesitations(&doubled)
+            .into_iter()
+            .map(|w| w.text)
+            .collect();
+        assert_eq!(cleaned_doubled, vec!["Well,", "okay."]);
+
+        // All-hesitation input yields empty vector
+        let only_fillers = vec![word(0, 200, "Um,"), word(250, 500, "uh...")];
+        assert!(strip_vocal_hesitations(&only_fillers).is_empty());
+    }
+
+    #[test]
+    fn strip_vocal_hesitations_propagates_speaker_change_and_aligns_segment_options() {
+        let rules = SegmentRules::default();
+
+        // Speaker change marked directly on a stripped hesitation propagates to next surviving word.
+        let mut tagged_words = vec![
+            word(0, 300, "Zdravo"),
+            word(300, 600, "svima"),
+            word(650, 850, "um,"),
+            word(900, 1200, "dobro"),
+            word(1200, 1500, "veče."),
+        ];
+        tagged_words[2].speaker_change = true;
+
+        let stripped = strip_vocal_hesitations(&tagged_words);
+        assert_eq!(stripped.len(), 4);
+        assert_eq!(stripped[2].text, "dobro");
+        assert!(
+            stripped[2].speaker_change,
+            "speaker_change from stripped hesitation must propagate to next surviving word"
+        );
+
+        let cues_removed = segment_words_with_options(&tagged_words, &rules, &[], true, true);
+        assert_eq!(cues_removed.len(), 2);
+        assert_eq!(cues_removed[0].source_text, "Zdravo svima");
+        assert_eq!(cues_removed[1].source_text, "dobro veče.");
+
+        // Explicit speaker_change_indices pointing AFTER a stripped hesitation must stay aligned.
+        let plain_words = vec![
+            word(0, 300, "Zdravo"),
+            word(300, 500, "uh,"),
+            word(550, 850, "svima"),
+            word(900, 1200, "dobro"),
+            word(1200, 1500, "veče."),
+        ];
+        let cues_idx_after =
+            segment_words_with_options(&plain_words, &rules, &[3], true, true);
+        assert_eq!(cues_idx_after.len(), 2);
+        assert_eq!(cues_idx_after[0].source_text, "Zdravo svima");
+        assert_eq!(cues_idx_after[1].source_text, "dobro veče.");
+
+        // Explicit speaker_change_indices pointing ON the stripped hesitation propagates forward too.
+        let cues_idx_on = segment_words_with_options(&plain_words, &rules, &[1], true, true);
+        assert_eq!(cues_idx_on.len(), 2);
+        assert_eq!(cues_idx_on[0].source_text, "Zdravo");
+        assert_eq!(cues_idx_on[1].source_text, "svima dobro veče.");
+
+        // remove_fillers == false preserves the hesitation verbatim.
+        let cues_verbatim = segment_words_with_options(&plain_words, &rules, &[3], true, false);
+        assert_eq!(cues_verbatim.len(), 2);
+        assert_eq!(cues_verbatim[0].source_text, "Zdravo uh, svima");
+        assert_eq!(cues_verbatim[1].source_text, "dobro veče.");
+    }
+
+    #[test]
+    fn eliminates_trailing_orphan_interrogatives_and_rolls_back_unpunctuated_starters() {
+        let rules = SegmentRules::default();
+
+        // Workstream 2 plan test #1: "Okay, alright, what" + 520 ms pause + "are we doing now?"
+        let en_words = vec![
+            word(0, 300, "Okay,"),
+            word(300, 650, "alright,"),
+            word(650, 900, "what"),
+            word(1420, 1620, "are"),
+            word(1620, 1800, "we"),
+            word(1800, 2100, "doing"),
+            word(2100, 2400, "now?"),
+        ];
+        let en_cues = segment_words(&en_words, &rules);
+        assert_eq!(en_cues.len(), 2, "expected clean split: {:?}", en_cues);
+        assert_eq!(en_cues[0].source_text, "Okay, alright,");
+        assert_eq!(en_cues[1].source_text, "what are we doing now?");
+        assert_eq!(en_cues[1].start_ms, 650);
+        assert!(en_cues[1].start_ms - en_cues[0].end_ms >= MIN_INTER_CUE_GAP_MS);
+
+        // Serbian Latin & Cyrillic interrogatives ("šta", "шта")
+        let sr_lat = vec![
+            word(0, 350, "Dobro,"),
+            word(350, 500, "u"),
+            word(500, 800, "redu,"),
+            word(800, 1050, "šta"),
+            word(1570, 1850, "ćemo"),
+            word(1850, 2100, "sada"),
+            word(2100, 2300, "da"),
+            word(2300, 2650, "radimo?"),
+        ];
+        let sr_lat_cues = segment_words(&sr_lat, &rules);
+        assert_eq!(sr_lat_cues.len(), 2);
+        assert_eq!(sr_lat_cues[0].source_text, "Dobro, u redu,");
+        assert_eq!(sr_lat_cues[1].source_text, "šta ćemo sada da radimo?");
+
+        let sr_cyr = vec![
+            word(0, 350, "Добро,"),
+            word(350, 500, "у"),
+            word(500, 800, "реду,"),
+            word(800, 1050, "шта"),
+            word(1570, 1850, "ћемо"),
+            word(1850, 2100, "сада"),
+            word(2100, 2300, "да"),
+            word(2300, 2650, "радимо?"),
+        ];
+        let sr_cyr_cues = segment_words(&sr_cyr, &rules);
+        assert_eq!(sr_cyr_cues.len(), 2);
+        assert_eq!(sr_cyr_cues[0].source_text, "Добро, у реду,");
+        assert_eq!(sr_cyr_cues[1].source_text, "шта ћемо сада да радимо?");
+
+        // Workstream 2 plan test #2: General Structural Rollback on non-function starter "danas"
+        let rollback_words = vec![
+            word(0, 400, "Završili"),
+            word(400, 650, "smo"),
+            word(650, 900, "to,"),
+            word(900, 1200, "danas"),
+            word(1720, 2100, "krećemo"),
+            word(2100, 2600, "ispočetka."),
+        ];
+        let rollback_cues = segment_words(&rollback_words, &rules);
+        assert_eq!(rollback_cues.len(), 2, "expected structural rollback: {:?}", rollback_cues);
+        assert_eq!(rollback_cues[0].source_text, "Završili smo to,");
+        assert_eq!(rollback_cues[1].source_text, "danas krećemo ispočetka.");
+        assert_eq!(rollback_cues[1].start_ms, 900);
+        assert!(rollback_cues[1].start_ms - rollback_cues[0].end_ms >= MIN_INTER_CUE_GAP_MS);
+
+        // Complete closing vocative with terminal punctuation stays intact!
+        let vocative_words = vec![
+            word(0, 350, "Hvala"),
+            word(350, 600, "ti,"),
+            word(600, 950, "brate."),
+            word(1500, 1850, "Vidimo"),
+            word(1850, 2050, "se"),
+            word(2050, 2400, "sutra."),
+        ];
+        let vocative_cues = segment_words(&vocative_words, &rules);
+        assert_eq!(vocative_cues.len(), 2);
+        assert_eq!(vocative_cues[0].source_text, "Hvala ti, brate.");
+        assert_eq!(vocative_cues[1].source_text, "Vidimo se sutra.");
+
+        // Verify expanded interrogative/starter coverage (EN + SR Latin + SR Cyrillic)
+        for token in [
+            "what", "why", "how", "if", "whether", "who", "where", "when", "šta", "sta", "ko",
+            "koga", "kom", "kome", "čemu", "cemu", "zašto", "zasto", "kako", "gde", "gdje", "kuda",
+            "odakle", "otkud", "koliko", "zar", "li", "kad", "kada", "dok", "ako", "шта", "ко",
+            "кога", "ком", "коме", "чему", "зашто", "како", "где", "гдје", "куда", "одакле",
+            "откуд", "колико", "зар", "ли", "кад", "када", "док", "ако",
+        ] {
+            assert!(
+                is_dangling_function_word(token),
+                "expected '{token}' to be recognized as dangling function word"
+            );
+        }
+    }
+
+    #[test]
+    fn enforces_min_80ms_inter_cue_gap_across_0ms_40ms_and_250ms_boundaries() {
+        let rules = SegmentRules::default();
+        let words = vec![
+            // Cue 1: 0..1000ms -> 0ms gap to Cue 2
+            word(0, 500, "Prva"),
+            word(500, 1000, "rečenica."),
+            // Cue 2: 1000..2000ms -> 40ms gap to Cue 3
+            word(1000, 1500, "Druga"),
+            word(1500, 2000, "rečenica."),
+            // Cue 3: 2040..3000ms -> 250ms gap to Cue 4
+            word(2040, 2500, "Treća"),
+            word(2500, 3000, "rečenica."),
+            // Cue 4: 3250..4200ms
+            word(3250, 3700, "Četvrta"),
+            word(3700, 4200, "rečenica."),
+        ];
+
+        let cues = segment_words(&words, &rules);
+        assert_eq!(cues.len(), 4);
+        for k in 0..(cues.len() - 1) {
+            assert!(
+                cues[k].end_ms > cues[k].start_ms,
+                "cue {} must have positive duration",
+                k + 1
+            );
+            let gap = cues[k + 1].start_ms.saturating_sub(cues[k].end_ms);
+            assert!(
+                gap >= MIN_INTER_CUE_GAP_MS,
+                "expected >= 80ms gap between cue {} ({}..{}) and cue {} ({}..{}), got {}ms",
+                k + 1,
+                cues[k].start_ms,
+                cues[k].end_ms,
+                k + 2,
+                cues[k + 1].start_ms,
+                cues[k + 1].end_ms,
+                gap
+            );
+        }
+        assert!(cues.last().unwrap().end_ms > cues.last().unwrap().start_ms);
+    }
+
+    #[test]
+    fn enforce_min_inter_cue_gap_handles_short_cues_symmetrically_without_zero_length() {
+        let rules = SegmentRules::default();
+        let mk = |id: u32, start_ms: u64, end_ms: u64, text: &str| {
+            let mut cue = SubtitleCue {
+                id,
+                start_ms,
+                end_ms,
+                source_text: text.to_string(),
+                translated_text: String::new(),
+                cps: 0.0,
+                warnings: Vec::new(),
+            };
+            compute_cue_metrics(&mut cue, &rules);
+            cue
+        };
+
+        // 1. Short Cue 1 (0..260ms, pulling back 80ms would drop below 300ms) -> symmetric -40/+40 split
+        let mut sym = vec![mk(1, 0, 260, "Da."), mk(2, 260, 700, "Idemo.")];
+        enforce_min_inter_cue_gap(&mut sym, &rules);
+        assert_eq!(sym[0].end_ms, 220);
+        assert_eq!(sym[1].start_ms, 300);
+        assert_eq!(sym[1].start_ms - sym[0].end_ms, MIN_INTER_CUE_GAP_MS);
+        assert!(sym[0].end_ms - sym[0].start_ms >= MIN_GAP_SPLIT_DURATION_MS);
+        assert!(sym[1].end_ms - sym[1].start_ms >= MIN_GAP_SPLIT_DURATION_MS);
+
+        // 2. Tight Cue 1 (0..180ms, only 20ms slack above 160ms) -> takes 20ms from left, 60ms from right
+        let mut asym = vec![mk(1, 0, 180, "Da."), mk(2, 180, 700, "Idemo.")];
+        enforce_min_inter_cue_gap(&mut asym, &rules);
+        assert_eq!(asym[0].end_ms, 160);
+        assert_eq!(asym[1].start_ms, 240);
+        assert_eq!(asym[1].start_ms - asym[0].end_ms, MIN_INTER_CUE_GAP_MS);
+
+        // 3. Ultra-short cues (< 160ms each) never shrink to zero-length or invert
+        let mut tiny = vec![mk(1, 0, 120, "A."), mk(2, 120, 240, "B.")];
+        enforce_min_inter_cue_gap(&mut tiny, &rules);
+        assert_eq!(tiny[0].start_ms, 0);
+        assert_eq!(tiny[0].end_ms, 120);
+        assert_eq!(tiny[1].start_ms, 120);
+        assert_eq!(tiny[1].end_ms, 240);
+    }
+
+    #[test]
+    fn wrap_balanced_lines_guards_negations_prepositions_auxiliaries_and_proper_names() {
+        // Negation guard: never leave "ne" at end of Line 1
+        let neg = wrap_balanced_lines("Rekao mi je da ne dolazim sutra na posao.", 28, 2);
+        let neg_lines: Vec<&str> = neg.lines().collect();
+        assert_eq!(neg_lines.len(), 2);
+        assert_ne!(
+            neg_lines[0].split_whitespace().last().unwrap_or("").to_lowercase(),
+            "ne"
+        );
+        assert_ne!(
+            neg_lines[0].split_whitespace().last().unwrap_or("").to_lowercase(),
+            "da"
+        );
+
+        // Preposition & auxiliary guard: never end Line 1 on "sa", "smo", or "o"
+        assert_eq!(
+            wrap_balanced_lines("Danas smo razgovarali sa našim kolegama o planu.", 42, 2),
+            "Danas smo razgovarali\nsa našim kolegama o planu."
+        );
+
+        // Proper-name pair guard keeps "Nikola Tesla" intact on one line
+        let proper = wrap_balanced_lines(
+            "Ovaj projekat predvodi Nikola Tesla u glavnoj laboratoriji.",
+            42,
+            2,
+        );
+        assert!(
+            proper.contains("Nikola Tesla"),
+            "expected 'Nikola Tesla' intact on one line, got: {proper:?}"
+        );
+
+        // Sentence-opening adverb exclusion vs genuine proper-name pair
+        assert_eq!(
+            wrap_balanced_lines("Međutim Marko radi.", 14, 2),
+            "Međutim\nMarko radi."
+        );
+        assert_eq!(
+            wrap_balanced_lines("Aleksandar Tesla radi.", 18, 2),
+            "Aleksandar Tesla\nradi."
+        );
+
+        // Hard line-width limit (overflow_penalty = 1000/char) wins when unavoidable
+        assert_eq!(
+            wrap_balanced_lines(
+                "Danas Marko dolazi ranije u kancelariju da završi izveštaj.",
+                30,
+                2
+            ),
+            "Danas Marko dolazi ranije u\nkancelariju da završi izveštaj."
+        );
+    }
+
+    #[test]
+    fn parity_corpus_15_sentences_and_canonical_warnings_match_typescript() {
+        let corpus: [(&str, u32, [&str; 4]); 15] = [
+            (
+                "Rekao mi je da ne dolazim sutra na posao.",
+                28,
+                [
+                    "Rekao mi je da ne dolazim sutra na posao.",
+                    "Rekao mi je da ne dolazim\nsutra na posao.",
+                    "Rekao mi je da ne dolazim\nsutra na posao.",
+                    "Rekao mi je da ne dolazim\nsutra na posao.",
+                ],
+            ),
+            (
+                "Danas smo razgovarali sa našim kolegama o planu.",
+                42,
+                [
+                    "Danas smo razgovarali sa našim kolegama o planu.",
+                    "Danas smo razgovarali\nsa našim kolegama o planu.",
+                    "Danas smo razgovarali\nsa našim kolegama o planu.",
+                    "Danas smo razgovarali\nsa našim kolegama o planu.",
+                ],
+            ),
+            (
+                "Ovaj projekat predvodi Nikola Tesla u glavnoj laboratoriji.",
+                38,
+                [
+                    "Ovaj projekat predvodi Nikola Tesla u glavnoj laboratoriji.",
+                    "Ovaj projekat predvodi Nikola Tesla\nu glavnoj laboratoriji.",
+                    "Ovaj projekat predvodi Nikola Tesla\nu glavnoj laboratoriji.",
+                    "Ovaj projekat predvodi Nikola Tesla\nu glavnoj laboratoriji.",
+                ],
+            ),
+            (
+                "Danas Marko dolazi ranije u kancelariju da završi izveštaj.",
+                30,
+                [
+                    "Danas Marko dolazi ranije u kancelariju da završi izveštaj.",
+                    "Danas Marko dolazi ranije u\nkancelariju da završi izveštaj.",
+                    "Danas Marko dolazi\nranije u kancelariju\nda završi izveštaj.",
+                    "Danas Marko dolazi\nranije u kancelariju\nda završi izveštaj.",
+                ],
+            ),
+            (
+                "Овај пројекат предводи Никола Тесла у главној лабораторији у Београду.",
+                34,
+                [
+                    "Овај пројекат предводи Никола Тесла у главној лабораторији у Београду.",
+                    "Овај пројекат предводи Никола Тесла\nу главној лабораторији у Београду.",
+                    "Овај пројекат предводи\nНикола Тесла у главној\nлабораторији у Београду.",
+                    "Овај пројекат предводи\nНикола Тесла у главној\nлабораторији у Београду.",
+                ],
+            ),
+            (
+                "Нисам сигуран да нећемо морати да кренемо раније него што смо планирали.",
+                30,
+                [
+                    "Нисам сигуран да нећемо морати да кренемо раније него што смо планирали.",
+                    "Нисам сигуран да нећемо морати\nда кренемо раније него што смо планирали.",
+                    "Нисам сигуран да нећемо морати\nда кренемо раније\nнего што смо планирали.",
+                    "Нисам сигуран да нећемо морати\nда кренемо раније\nнего што смо планирали.",
+                ],
+            ),
+            (
+                "We didn't expect to meet San Francisco engineers at the conference today.",
+                30,
+                [
+                    "We didn't expect to meet San Francisco engineers at the conference today.",
+                    "We didn't expect to meet San Francisco\nengineers at the conference today.",
+                    "We didn't expect to meet\nSan Francisco engineers\nat the conference today.",
+                    "We didn't expect to meet\nSan Francisco engineers\nat the conference today.",
+                ],
+            ),
+            (
+                "Today John arrives early, because he wants to review the entire draft before noon.",
+                30,
+                [
+                    "Today John arrives early, because he wants to review the entire draft before noon.",
+                    "Today John arrives early, because he wants\nto review the entire draft before noon.",
+                    "Today John arrives early,\nbecause he wants to review\nthe entire draft before noon.",
+                    "Today John arrives early,\nbecause he wants to review\nthe entire draft before noon.",
+                ],
+            ),
+            (
+                "First sentence ends here. Second sentence opens cleanly! Third part wraps onto line three.",
+                36,
+                [
+                    "First sentence ends here. Second sentence opens cleanly! Third part wraps onto line three.",
+                    "First sentence ends here. Second sentence opens\ncleanly! Third part wraps onto line three.",
+                    "First sentence ends here.\nSecond sentence opens cleanly!\nThird part wraps onto line three.",
+                    "First sentence ends here.\nSecond sentence opens cleanly!\nThird part wraps onto line three.",
+                ],
+            ),
+            (
+                "Profesor dr. Marko Petrović je objasnio zašto ne smemo da preskočimo ovaj važan korak u analizi podataka.",
+                32,
+                [
+                    "Profesor dr. Marko Petrović je objasnio zašto ne smemo da preskočimo ovaj važan korak u analizi podataka.",
+                    "Profesor dr. Marko Petrović je objasnio zašto ne smemo\nda preskočimo ovaj važan korak u analizi podataka.",
+                    "Profesor dr. Marko Petrović je objasnio\nzašto ne smemo da preskočimo ovaj\nvažan korak u analizi podataka.",
+                    "Profesor dr. Marko Petrović\nje objasnio zašto ne smemo\nda preskočimo ovaj važan\nkorak u analizi podataka.",
+                ],
+            ),
+            (
+                "Када смо стигли у Нови Сад, одмах смо отишли на састанак са колегама из централног тима за развој софтвера.",
+                32,
+                [
+                    "Када смо стигли у Нови Сад, одмах смо отишли на састанак са колегама из централног тима за развој софтвера.",
+                    "Када смо стигли у Нови Сад, одмах смо отишли на састанак\nса колегама из централног тима за развој софтвера.",
+                    "Када смо стигли у Нови Сад, одмах\nсмо отишли на састанак са колегама\nиз централног тима за развој софтвера.",
+                    "Када смо стигли у Нови Сад,\nодмах смо отишли на састанак\nса колегама из централног\nтима за развој софтвера.",
+                ],
+            ),
+            (
+                "She told us that she can't join the meeting in New York without her manager's final approval.",
+                30,
+                [
+                    "She told us that she can't join the meeting in New York without her manager's final approval.",
+                    "She told us that she can't join the meeting\nin New York without her manager's final approval.",
+                    "She told us that she can't join\nthe meeting in New York without\nher manager's final approval.",
+                    "She told us that she can't\njoin the meeting in New York\nwithout her manager's\nfinal approval.",
+                ],
+            ),
+            (
+                "Međutim Marko radi bez prestanka na ovom zadatku.",
+                18,
+                [
+                    "Međutim Marko radi bez prestanka na ovom zadatku.",
+                    "Međutim Marko radi\nbez prestanka na ovom zadatku.",
+                    "Međutim Marko\nradi bez prestanka\nna ovom zadatku.",
+                    "Međutim Marko\nradi bez prestanka\nna ovom zadatku.",
+                ],
+            ),
+            (
+                "Aleksandar Tesla radi svakog dana u laboratoriji.",
+                20,
+                [
+                    "Aleksandar Tesla radi svakog dana u laboratoriji.",
+                    "Aleksandar Tesla radi\nsvakog dana u laboratoriji.",
+                    "Aleksandar Tesla\nradi svakog dana\nu laboratoriji.",
+                    "Aleksandar Tesla\nradi svakog dana\nu laboratoriji.",
+                ],
+            ),
+            (
+                "Kratak titl u jednom redu.",
+                42,
+                [
+                    "Kratak titl u jednom redu.",
+                    "Kratak titl u jednom redu.",
+                    "Kratak titl u jednom redu.",
+                    "Kratak titl u jednom redu.",
+                ],
+            ),
+        ];
+
+        for (idx, (text, max_chars, expected_by_lines)) in corpus.iter().enumerate() {
+            for max_lines in 1u32..=4u32 {
+                let actual = wrap_balanced_lines(text, *max_chars, max_lines);
+                assert_eq!(
+                    actual,
+                    expected_by_lines[(max_lines - 1) as usize],
+                    "Parity mismatch on sentence #{} (max_lines={max_lines})",
+                    idx + 1
+                );
+                assert_eq!(
+                    actual.replace('\n', " "),
+                    *text,
+                    "Wrapped text must preserve all words on sentence #{}",
+                    idx + 1
+                );
+            }
+        }
+
+        // Canonical cue warning IDs & thresholds parity matrix (1:1 with subtitleUtils.test.ts)
+        let standard_rules = SegmentRules::default();
+        let warning_cases: [(u64, u64, &str, f64, &[&str]); 6] = [
+            (1000, 4000, "Dobro došli u EasySRT Studio.", 9.7, &[]),
+            (
+                0,
+                2000,
+                "Ovo je malo brži titl sa trideset osam",
+                19.0,
+                &["high_cps"],
+            ),
+            (
+                0,
+                500,
+                "Ovaj prvi red ima mnogo više od četrdeset dva karaktera u jednom redu titla.\nDrugi red.\nTreći red.",
+                192.0,
+                &[
+                    "critical_cps",
+                    "line_too_long",
+                    "too_many_lines",
+                    "duration_too_short",
+                ],
+            ),
+            (0, 8500, "Dugačak prikaz na ekranu.", 2.9, &["duration_too_long"]),
+            (
+                0,
+                3000,
+                "Prvi red.\nDrugi red.\nTreći red.",
+                9.7,
+                &["too_many_lines"],
+            ),
+            (0, 200, "   ", 0.0, &[]),
+        ];
+
+        for (start_ms, end_ms, source_text, expected_cps, expected_warnings) in warning_cases {
+            let mut cue = SubtitleCue {
+                id: 1,
+                start_ms,
+                end_ms,
+                source_text: source_text.to_string(),
+                translated_text: String::new(),
+                cps: 0.0,
+                warnings: Vec::new(),
+            };
+            compute_cue_metrics(&mut cue, &standard_rules);
+            assert_eq!(cue.cps, expected_cps);
+            let expected: Vec<String> = expected_warnings.iter().map(|s| (*s).to_string()).collect();
+            assert_eq!(cue.warnings, expected);
+        }
     }
 }

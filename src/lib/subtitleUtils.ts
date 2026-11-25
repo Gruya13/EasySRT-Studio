@@ -137,6 +137,57 @@ export function normalizeTranslationStyle(
   return style === "formal" ? "formal" : "natural";
 }
 
+/** Minimum breathing gap between consecutive subtitle cues (2 frames @ 25 fps). */
+export const MIN_INTER_CUE_GAP_MS = 80;
+
+const MIN_SPLIT_HALF_DURATION_MS = 160;
+
+/**
+ * Computes left-end / right-start timestamps when splitting a cue at `splitMs`,
+ * leaving a `MIN_INTER_CUE_GAP_MS` (80 ms) breathing gap (`splitMs - 40` / `splitMs + 40`)
+ * whenever cue durations permit while keeping `>= 160 ms` per half.
+ */
+export function computeSplitBoundaries(
+  startMs: number,
+  endMs: number,
+  splitMs: number,
+): { leftEndMs: number; rightStartMs: number } {
+  const safeStart = Math.max(0, Math.round(startMs));
+  const safeEnd = Math.max(safeStart, Math.round(endMs));
+  const total = safeEnd - safeStart;
+  const halfGap = Math.floor(MIN_INTER_CUE_GAP_MS / 2);
+
+  if (total >= MIN_SPLIT_HALF_DURATION_MS * 2 + MIN_INTER_CUE_GAP_MS) {
+    const minSplit = safeStart + MIN_SPLIT_HALF_DURATION_MS + halfGap;
+    const maxSplit = safeEnd - MIN_SPLIT_HALF_DURATION_MS - halfGap;
+    const clampedSplit = Math.min(
+      maxSplit,
+      Math.max(minSplit, Math.round(splitMs)),
+    );
+    return {
+      leftEndMs: clampedSplit - halfGap,
+      rightStartMs: clampedSplit + halfGap,
+    };
+  }
+
+  if (total >= MIN_SPLIT_HALF_DURATION_MS * 2) {
+    return {
+      leftEndMs: safeStart + MIN_SPLIT_HALF_DURATION_MS,
+      rightStartMs: safeEnd - MIN_SPLIT_HALF_DURATION_MS,
+    };
+  }
+
+  if (total <= 1) {
+    return { leftEndMs: safeStart, rightStartMs: safeEnd };
+  }
+
+  const mid = Math.min(
+    safeEnd - 1,
+    Math.max(safeStart + 1, Math.round(splitMs)),
+  );
+  return { leftEndMs: mid, rightStartMs: mid };
+}
+
 /**
  * Calculates Characters Per Second (CPS) rounded to 1 decimal place.
  * Supports both `calculateCps(text, durationMs)` and `calculateCps(text, startMs, endMs)`.
@@ -146,22 +197,29 @@ export function calculateCps(
   startOrDurationMs: number,
   endMs?: number,
 ): number {
-  const cleaned = text.replace(/\r\n/g, "\n").trim().replace(/\n/g, "");
+  const cleaned = text
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim()
+    .replace(/\n/g, "");
   const charCount = [...cleaned].length;
   if (charCount === 0) {
     return 0;
   }
   const durationMs =
     typeof endMs === "number"
-      ? Math.max(1, endMs - startOrDurationMs)
-      : Math.max(1, startOrDurationMs);
+      ? Math.max(0, endMs - startOrDurationMs)
+      : Math.max(0, startOrDurationMs);
+  if (durationMs === 0) {
+    return 999.0;
+  }
   const durationSec = durationMs / 1000;
-  return Number((charCount / durationSec).toFixed(1));
+  return Math.round((charCount / durationSec) * 10) / 10;
 }
 
 /**
- * Computes warning identifiers (`high_cps`, `critical_cps`, `line_too_long`,
- * `too_many_lines`, `short_duration`, `long_duration`) for a cue under `rules`.
+ * Computes canonical warning identifiers (`critical_cps`, `high_cps`, `line_too_long`,
+ * `too_many_lines`, `duration_too_short`, `duration_too_long`) for a cue under `rules`.
  */
 export function computeCueWarnings(
   cue: Pick<SubtitleCue, "startMs" | "endMs" | "sourceText" | "translatedText"> & {
@@ -169,10 +227,11 @@ export function computeCueWarnings(
   },
   rules: SegmentRules,
 ): string[] {
-  const activeText = (
-    cue.translatedText.trim() || cue.sourceText.trim()
-  ).replace(/\r\n/g, "\n");
-  const durationMs = Math.max(1, cue.endMs - cue.startMs);
+  const activeText = (cue.translatedText.trim() || cue.sourceText.trim())
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim();
+  const durationMs = Math.max(0, cue.endMs - cue.startMs);
   const charCount = [...activeText.replace(/\n/g, "")].length;
   const cps =
     typeof cue.cps === "number" && cue.cps > 0
@@ -197,9 +256,9 @@ export function computeCueWarnings(
   }
 
   if (durationMs < rules.minDurationMs && charCount > 0) {
-    warnings.push("short_duration");
+    warnings.push("duration_too_short");
   } else if (durationMs > rules.maxDurationMs) {
-    warnings.push("long_duration");
+    warnings.push("duration_too_long");
   }
 
   return warnings;
@@ -209,9 +268,10 @@ export function calculateCueMetrics(
   cue: Pick<SubtitleCue, "startMs" | "endMs" | "sourceText" | "translatedText">,
   rules: SegmentRules,
 ): { cps: number; warnings: string[] } {
-  const activeText = (
-    cue.translatedText.trim() || cue.sourceText.trim()
-  ).replace(/\r\n/g, "\n");
+  const activeText = (cue.translatedText.trim() || cue.sourceText.trim())
+    .replace(/\r\n/g, "\n")
+    .replace(/\r/g, "\n")
+    .trim();
   const cps = calculateCps(activeText, cue.startMs, cue.endMs);
   const warnings = computeCueWarnings({ ...cue, cps }, rules);
   return { cps, warnings };
@@ -229,9 +289,806 @@ export function recalculateCue(
   };
 }
 
+// ---------------------------------------------------------------------------
+// Linguistically-Aware Multi-Line Wrapping (1..=4 lines, 1:1 with segmenter.rs)
+// ---------------------------------------------------------------------------
+
+const SENTENCE_ABBREVIATIONS = new Set([
+  "dr.",
+  "mr.",
+  "sv.",
+  "br.",
+  "st.",
+  "prof.",
+  "tj.",
+  "npr.",
+  "др.",
+  "мр.",
+  "св.",
+  "бр.",
+  "проф.",
+  "тј.",
+  "нпр.",
+]);
+
+const WRAP_NEGATIONS = new Set([
+  "ne",
+  "ni",
+  "niti",
+  "nije",
+  "nisam",
+  "nisi",
+  "nismo",
+  "niste",
+  "nisu",
+  "neću",
+  "necu",
+  "nećeš",
+  "neces",
+  "neće",
+  "nece",
+  "nećemo",
+  "necemo",
+  "nećete",
+  "necete",
+  "nemoj",
+  "nemojte",
+  "nemam",
+  "nema",
+  "nemaju",
+  "не",
+  "ни",
+  "нити",
+  "није",
+  "нисам",
+  "ниси",
+  "нисмо",
+  "нисте",
+  "нису",
+  "нећу",
+  "нећеш",
+  "неће",
+  "нећемо",
+  "нећете",
+  "немој",
+  "немојте",
+  "немам",
+  "нема",
+  "немају",
+  "not",
+  "no",
+  "never",
+  "don't",
+  "doesn't",
+  "didn't",
+  "won't",
+  "wouldn't",
+  "can't",
+  "cannot",
+  "couldn't",
+  "shouldn't",
+  "isn't",
+  "aren't",
+  "wasn't",
+  "weren't",
+  "haven't",
+  "hasn't",
+  "hadn't",
+]);
+
+const WRAP_PREPOSITIONS_AND_ARTICLES = new Set([
+  "u",
+  "na",
+  "za",
+  "sa",
+  "s",
+  "od",
+  "do",
+  "iz",
+  "o",
+  "po",
+  "pri",
+  "ka",
+  "k",
+  "uz",
+  "niz",
+  "nad",
+  "pod",
+  "pred",
+  "među",
+  "medju",
+  "kroz",
+  "kod",
+  "bez",
+  "osim",
+  "prema",
+  "protiv",
+  "oko",
+  "posle",
+  "pre",
+  "у",
+  "на",
+  "за",
+  "са",
+  "с",
+  "од",
+  "до",
+  "из",
+  "о",
+  "по",
+  "при",
+  "ка",
+  "к",
+  "уз",
+  "низ",
+  "над",
+  "под",
+  "пред",
+  "међу",
+  "кроз",
+  "код",
+  "без",
+  "осим",
+  "према",
+  "против",
+  "око",
+  "после",
+  "пре",
+  "a",
+  "an",
+  "the",
+  "in",
+  "on",
+  "at",
+  "to",
+  "of",
+  "for",
+  "with",
+  "from",
+  "by",
+  "into",
+  "onto",
+  "upon",
+  "about",
+  "against",
+  "between",
+  "through",
+  "during",
+  "without",
+  "within",
+  "under",
+  "over",
+]);
+
+const WRAP_AUXILIARIES_AND_ENCLITICS = new Set([
+  "sam",
+  "si",
+  "je",
+  "smo",
+  "ste",
+  "su",
+  "ću",
+  "cu",
+  "ćeš",
+  "ces",
+  "će",
+  "ce",
+  "ćemo",
+  "cemo",
+  "ćete",
+  "cete",
+  "bih",
+  "bi",
+  "bismo",
+  "biste",
+  "se",
+  "li",
+  "bio",
+  "bila",
+  "bilo",
+  "bili",
+  "bile",
+  "сам",
+  "си",
+  "је",
+  "смо",
+  "сте",
+  "су",
+  "ћу",
+  "ћеш",
+  "ће",
+  "ћемо",
+  "ћете",
+  "бих",
+  "би",
+  "бисмо",
+  "бисте",
+  "се",
+  "ли",
+  "био",
+  "била",
+  "било",
+  "били",
+  "биле",
+  "is",
+  "am",
+  "are",
+  "was",
+  "were",
+  "be",
+  "been",
+  "being",
+  "has",
+  "have",
+  "had",
+  "do",
+  "does",
+  "did",
+  "will",
+  "would",
+  "shall",
+  "should",
+  "can",
+  "could",
+  "may",
+  "might",
+  "must",
+]);
+
+const WRAP_CONJUNCTIONS = new Set([
+  "i",
+  "a",
+  "ali",
+  "ili",
+  "da",
+  "pa",
+  "te",
+  "jer",
+  "što",
+  "sto",
+  "ako",
+  "dok",
+  "kad",
+  "kada",
+  "nego",
+  "već",
+  "vec",
+  "kako",
+  "gde",
+  "gdje",
+  "koji",
+  "koja",
+  "koje",
+  "čiji",
+  "ciji",
+  "и",
+  "а",
+  "али",
+  "или",
+  "да",
+  "па",
+  "те",
+  "јер",
+  "што",
+  "ако",
+  "док",
+  "кад",
+  "када",
+  "него",
+  "већ",
+  "како",
+  "где",
+  "гдје",
+  "који",
+  "која",
+  "које",
+  "чији",
+  "and",
+  "or",
+  "but",
+  "so",
+  "yet",
+  "nor",
+  "that",
+  "which",
+  "who",
+  "whom",
+  "whose",
+  "where",
+  "when",
+  "while",
+  "because",
+  "although",
+  "since",
+  "until",
+  "unless",
+  "if",
+  "whether",
+]);
+
+const WRAP_PRONOUNS = new Set([
+  "ja",
+  "ti",
+  "on",
+  "ona",
+  "ono",
+  "mi",
+  "vi",
+  "oni",
+  "one",
+  "moj",
+  "moja",
+  "moje",
+  "tvoj",
+  "tvoja",
+  "tvoje",
+  "njegov",
+  "njen",
+  "naš",
+  "nas",
+  "vaš",
+  "vas",
+  "njihov",
+  "svoj",
+  "svoja",
+  "svoje",
+  "ovaj",
+  "ova",
+  "ovo",
+  "taj",
+  "ta",
+  "to",
+  "onaj",
+  "mu",
+  "joj",
+  "ga",
+  "ih",
+  "nam",
+  "vam",
+  "ја",
+  "ти",
+  "он",
+  "она",
+  "оно",
+  "ми",
+  "ви",
+  "они",
+  "оне",
+  "мој",
+  "моја",
+  "моје",
+  "твој",
+  "твоја",
+  "твоје",
+  "његов",
+  "њен",
+  "наш",
+  "ваш",
+  "њихов",
+  "свој",
+  "своја",
+  "своје",
+  "овај",
+  "ова",
+  "ово",
+  "тај",
+  "та",
+  "то",
+  "онај",
+  "му",
+  "јој",
+  "га",
+  "их",
+  "нам",
+  "вам",
+  "i",
+  "you",
+  "he",
+  "she",
+  "it",
+  "we",
+  "they",
+  "my",
+  "your",
+  "his",
+  "her",
+  "its",
+  "our",
+  "their",
+  "this",
+  "that",
+  "these",
+  "those",
+]);
+
+const SENTENCE_OPENING_NON_NAMES = new Set([
+  "danas",
+  "sada",
+  "sad",
+  "ovde",
+  "ovdje",
+  "tamo",
+  "tada",
+  "tad",
+  "kada",
+  "kad",
+  "ali",
+  "međutim",
+  "medjutim",
+  "ipak",
+  "dakle",
+  "zato",
+  "potom",
+  "zatim",
+  "onda",
+  "juče",
+  "juce",
+  "sutra",
+  "uvek",
+  "uvijek",
+  "nikad",
+  "nikada",
+  "možda",
+  "mozda",
+  "naravno",
+  "zapravo",
+  "inače",
+  "inace",
+  "dok",
+  "ako",
+  "pošto",
+  "posto",
+  "iako",
+  "čim",
+  "cim",
+  "već",
+  "vec",
+  "samo",
+  "čak",
+  "cak",
+  "baš",
+  "bas",
+  "i",
+  "a",
+  "pa",
+  "da",
+  "ne",
+  "ovaj",
+  "ova",
+  "ovo",
+  "taj",
+  "ta",
+  "to",
+  "onaj",
+  "ona",
+  "ono",
+  "on",
+  "mi",
+  "vi",
+  "oni",
+  "one",
+  "ja",
+  "ti",
+  "svi",
+  "sve",
+  "neko",
+  "niko",
+  "šta",
+  "sta",
+  "ko",
+  "kako",
+  "zašto",
+  "zasto",
+  "gde",
+  "gdje",
+  "koliko",
+  "данас",
+  "сада",
+  "сад",
+  "овде",
+  "овдје",
+  "тамо",
+  "тада",
+  "тад",
+  "када",
+  "кад",
+  "али",
+  "међутим",
+  "ипак",
+  "дакле",
+  "зато",
+  "потом",
+  "затим",
+  "онда",
+  "јуче",
+  "сутра",
+  "увек",
+  "увијек",
+  "никад",
+  "никада",
+  "можда",
+  "наравно",
+  "заправо",
+  "иначе",
+  "док",
+  "ако",
+  "пошто",
+  "иако",
+  "чим",
+  "већ",
+  "само",
+  "чак",
+  "баш",
+  "и",
+  "а",
+  "па",
+  "да",
+  "не",
+  "овај",
+  "ова",
+  "ово",
+  "тај",
+  "та",
+  "то",
+  "онај",
+  "она",
+  "оно",
+  "он",
+  "ми",
+  "ви",
+  "они",
+  "оне",
+  "ја",
+  "ти",
+  "сви",
+  "све",
+  "неко",
+  "нико",
+  "шта",
+  "ко",
+  "како",
+  "зашто",
+  "где",
+  "гдје",
+  "колико",
+  "when",
+  "today",
+  "tomorrow",
+  "yesterday",
+  "here",
+  "there",
+  "then",
+  "now",
+  "however",
+  "therefore",
+  "meanwhile",
+  "otherwise",
+  "suddenly",
+  "actually",
+  "maybe",
+  "perhaps",
+  "always",
+  "never",
+  "often",
+  "sometimes",
+  "already",
+  "still",
+  "just",
+  "only",
+  "even",
+  "also",
+  "but",
+  "and",
+  "or",
+  "so",
+  "yet",
+  "because",
+  "although",
+  "though",
+  "while",
+  "since",
+  "until",
+  "unless",
+  "if",
+  "whether",
+  "after",
+  "before",
+  "during",
+  "why",
+  "how",
+  "what",
+  "where",
+  "who",
+  "this",
+  "that",
+  "these",
+  "those",
+  "they",
+  "we",
+  "he",
+  "she",
+  "it",
+  "you",
+  "everyone",
+  "someone",
+  "nobody",
+  "finally",
+  "first",
+  "next",
+  "later",
+]);
+
+function endsWithSentencePunct(word: string): boolean {
+  const trimmed = word.replace(/["'”’)\]]+$/u, "");
+  if (!trimmed) {
+    return false;
+  }
+  if (SENTENCE_ABBREVIATIONS.has(trimmed.toLowerCase())) {
+    return false;
+  }
+  return /[.!?…]$/u.test(trimmed);
+}
+
+function endsWithClausePunct(word: string): boolean {
+  const trimmed = word.replace(/["'”’)\]]+$/u, "");
+  return /[,;:—–]$/u.test(trimmed);
+}
+
+function normalizeWrapToken(word: string): string {
+  return word
+    .replace(/^[^\p{L}\p{N}]+|[^\p{L}\p{N}]+$/gu, "")
+    .replace(/’/g, "'")
+    .toLowerCase();
+}
+
+function startsWithUppercaseAlpha(word: string): boolean {
+  const trimmed = word.replace(/^["'„“‘«(\[]+/u, "");
+  const first = [...trimmed][0];
+  return isUppercaseChar(first);
+}
+
+function isProperNamePair(
+  words: string[],
+  k: number,
+  prevClean: string,
+): boolean {
+  if (k <= 0 || k >= words.length) {
+    return false;
+  }
+  if (
+    !startsWithUppercaseAlpha(words[k - 1]) ||
+    !startsWithUppercaseAlpha(words[k])
+  ) {
+    return false;
+  }
+  const isSentenceStart = k === 1 || endsWithSentencePunct(words[k - 2]);
+  return !(isSentenceStart && SENTENCE_OPENING_NON_NAMES.has(prevClean));
+}
+
+function linguisticSplitPenalty(words: string[], k: number): number {
+  if (k <= 0 || k >= words.length) {
+    return 0;
+  }
+  const prev = words[k - 1];
+  if (endsWithSentencePunct(prev) || endsWithClausePunct(prev)) {
+    return 0;
+  }
+  const clean = normalizeWrapToken(prev);
+  let penalty = 0;
+  if (WRAP_NEGATIONS.has(clean)) {
+    penalty = Math.max(penalty, 42);
+  }
+  if (WRAP_PREPOSITIONS_AND_ARTICLES.has(clean)) {
+    penalty = Math.max(penalty, 38);
+  }
+  if (isProperNamePair(words, k, clean)) {
+    penalty = Math.max(penalty, 36);
+  }
+  if (WRAP_AUXILIARIES_AND_ENCLITICS.has(clean)) {
+    penalty = Math.max(penalty, 34);
+  }
+  if (WRAP_CONJUNCTIONS.has(clean)) {
+    penalty = Math.max(penalty, 30);
+  }
+  if (WRAP_PRONOUNS.has(clean)) {
+    penalty = Math.max(penalty, 28);
+  }
+  return penalty;
+}
+
+function punctBreakBonus(word: string): number {
+  if (endsWithSentencePunct(word)) {
+    return 14;
+  }
+  if (endsWithClausePunct(word)) {
+    return 10;
+  }
+  return 0;
+}
+
+function solveExactLineCountDp(
+  prefixChars: number[],
+  boundaryCosts: number[],
+  totalSingleLineChars: number,
+  maxChars: number,
+  lineCount: number,
+): { overflow: number; splits: number[] } {
+  const n = prefixChars.length - 1;
+  const l = lineCount;
+  const totalLinesChars = totalSingleLineChars - (lineCount - 1);
+
+  const lineLen = (a: number, b: number): number =>
+    prefixChars[b] - prefixChars[a] + (b - a - 1);
+
+  const INF = Number.MAX_SAFE_INTEGER;
+  const dpOv: number[][] = Array.from({ length: lineCount + 1 }, () =>
+    new Array<number>(n + 1).fill(INF),
+  );
+  const dpSc: number[][] = Array.from({ length: lineCount + 1 }, () =>
+    new Array<number>(n + 1).fill(INF),
+  );
+  const nextSplit: number[][] = Array.from({ length: lineCount + 1 }, () =>
+    new Array<number>(n + 1).fill(n),
+  );
+
+  for (let i = 0; i < n; i++) {
+    const len = lineLen(i, n);
+    const ov = Math.max(0, len - maxChars);
+    const balance = Math.abs(l * len - totalLinesChars);
+    dpOv[1][i] = ov;
+    dpSc[1][i] = ov * 1000 * l + balance;
+    nextSplit[1][i] = n;
+  }
+
+  for (let r = 2; r <= lineCount; r++) {
+    const iStart = r === lineCount ? 0 : 1;
+    const iEnd = r === lineCount ? 0 : n - r;
+    for (let i = iStart; i <= iEnd; i++) {
+      let bestOv = INF;
+      let bestSc = INF;
+      let bestK = i + 1;
+
+      for (let k = i + 1; k <= n - (r - 1); k++) {
+        const tailOv = dpOv[r - 1][k];
+        if (tailOv >= INF) {
+          continue;
+        }
+        const len = lineLen(i, k);
+        const ov = Math.max(0, len - maxChars);
+        const balance = Math.abs(l * len - totalLinesChars);
+        const candOv = ov + tailOv;
+        const candSc =
+          ov * 1000 * l + balance + boundaryCosts[k] * l + dpSc[r - 1][k];
+
+        if (candOv < bestOv || (candOv === bestOv && candSc < bestSc)) {
+          bestOv = candOv;
+          bestSc = candSc;
+          bestK = k;
+        }
+      }
+
+      dpOv[r][i] = bestOv;
+      dpSc[r][i] = bestSc;
+      nextSplit[r][i] = bestK;
+    }
+  }
+
+  const splits: number[] = [];
+  let cur = 0;
+  for (let r = lineCount; r >= 2; r--) {
+    const k = nextSplit[r][cur];
+    splits.push(k);
+    cur = k;
+  }
+
+  return { overflow: dpOv[lineCount][0], splits };
+}
+
 /**
- * Balances text into at most `maxLines` lines (preferring 1 line if it fits within
- * `maxCharsPerLine`, or splitting into 2 balanced lines near the visual midpoint).
+ * Balances text into at most `maxLines` (`1..=4`) linguistically-clean lines using
+ * exact dynamic programming (minimizing overflow first, then smallest feasible line count,
+ * then length balance + linguistic split penalties - punctuation break bonuses).
+ * Behaviorally 1:1 identical to Rust `segmenter::wrap_balanced_lines`.
  */
 export function wrapBalancedLines(
   text: string,
@@ -247,39 +1104,60 @@ export function wrapBalancedLines(
   }
 
   const singleLine = words.join(" ");
-  const maxChars = Math.max(1, maxCharsPerLine);
+  const singleLineChars = [...singleLine].length;
+  const maxChars = Math.max(1, Math.trunc(maxCharsPerLine));
+  const clampedMaxLines = Math.min(4, Math.max(1, Math.trunc(maxLines)));
 
-  if (maxLines <= 1 || [...singleLine].length <= maxChars || words.length === 1) {
+  if (
+    clampedMaxLines <= 1 ||
+    singleLineChars <= maxChars ||
+    words.length === 1
+  ) {
     return singleLine;
   }
 
-  let bestSplit = 1;
-  let bestScore = Number.POSITIVE_INFINITY;
+  const n = words.length;
+  const effectiveMaxLines = Math.min(clampedMaxLines, n);
 
-  for (let k = 1; k < words.length; k++) {
-    const line1 = words.slice(0, k).join(" ");
-    const line2 = words.slice(k).join(" ");
-    const len1 = [...line1].length;
-    const len2 = [...line2].length;
+  const prefixChars: number[] = [0];
+  for (const w of words) {
+    prefixChars.push(prefixChars[prefixChars.length - 1] + [...w].length);
+  }
 
-    const overflow1 = Math.max(0, len1 - maxChars);
-    const overflow2 = Math.max(0, len2 - maxChars);
-    const overflowPenalty = (overflow1 + overflow2) * 1000;
+  const boundaryCosts: number[] = new Array<number>(n).fill(0);
+  for (let k = 1; k < n; k++) {
+    boundaryCosts[k] =
+      linguisticSplitPenalty(words, k) - punctBreakBonus(words[k - 1]);
+  }
 
-    const diff = Math.abs(len1 - len2);
-    const prevWord = words[k - 1].replace(/["'”’)\]]+$/, "");
-    const punctBonus = /[,;:—–.!?…]$/.test(prevWord) ? 6 : 0;
+  let bestOverflow = Number.MAX_SAFE_INTEGER;
+  let bestSplits: number[] = [];
 
-    const score = overflowPenalty + diff - punctBonus;
-    if (score < bestScore) {
-      bestScore = score;
-      bestSplit = k;
+  for (let lineCount = 2; lineCount <= effectiveMaxLines; lineCount++) {
+    const { overflow, splits } = solveExactLineCountDp(
+      prefixChars,
+      boundaryCosts,
+      singleLineChars,
+      maxChars,
+      lineCount,
+    );
+    if (overflow < bestOverflow) {
+      bestOverflow = overflow;
+      bestSplits = splits;
+      if (overflow === 0) {
+        break;
+      }
     }
   }
 
-  const line1 = words.slice(0, bestSplit).join(" ");
-  const line2 = words.slice(bestSplit).join(" ");
-  return `${line1}\n${line2}`;
+  const lines: string[] = [];
+  let start = 0;
+  for (const end of bestSplits) {
+    lines.push(words.slice(start, end).join(" "));
+    start = end;
+  }
+  lines.push(words.slice(start).join(" "));
+  return lines.join("\n");
 }
 
 // ---------------------------------------------------------------------------
