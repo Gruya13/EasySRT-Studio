@@ -19,6 +19,8 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
@@ -28,6 +30,24 @@ jobs:
           cache-dependency-path: |
             package-lock.json
             worker/package-lock.json
+
+      - name: Verify manifest versions and documentation rules (fail-fast)
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          FULL_REF: ${{ github.ref }}
+        run: |
+          npm run version:check
+          if [ "$BASE_REF" = "main" ] || [ "$FULL_REF" = "refs/heads/main" ]; then
+            if [ -n "$BASE_REF" ]; then
+              npm run docs:check -- --strict-main --base "origin/${BASE_REF}"
+            else
+              npm run docs:check -- --strict-main
+            fi
+          elif [ -n "$BASE_REF" ]; then
+            npm run docs:check -- --base "origin/${BASE_REF}"
+          else
+            npm run docs:check
+          fi
 
       - name: Setup Rust stable
         uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
@@ -54,9 +74,6 @@ jobs:
 
       - name: Audit frontend npm dependencies
         run: npm audit --audit-level=high
-
-      - name: Verify manifest versions are in sync
-        run: npm run version:check
 
       - name: Typecheck frontend
         run: npm run typecheck

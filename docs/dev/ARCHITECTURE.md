@@ -7,37 +7,40 @@
 ## 1. End-to-End Data Flow
 
 EasySRT Studio supports two primary entry paths into its unified `SubtitleProject` data model:
-1. **Media Pipeline (`.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.mp4`, `.mkv`, `.webm`)**: Runs through FFmpeg normalization, Whisper ASR + Silero VAD, and the Rust word-level segmenter.
-2. **Direct Subtitle Import (`.srt`, `.vtt`)**: Parses existing SubRip or WebVTT files (`pipeline::importer` / `parseSubtitleFileText`) directly into `SubtitleProject` cues for translation, Serbian polishing, script conversion, re-wrapping, Search & Replace (`Ctrl+H`), Undo/Redo (`Ctrl+Z`/`Ctrl+Y`), and multi-format export.
+1. **Media Pipeline (`.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.opus`, `.mp4`, `.mkv`, `.webm`)**: Runs an optional preemptible background media intake probe (`pipeline::probe`), followed on execution by FFmpeg normalization, Whisper ASR + Silero VAD, pure-Rust acoustic speaker-turn detection (`pipeline::diarizer`), and the word-level linguistic segmenter.
+2. **Direct Subtitle Import (`.srt`, `.vtt`)**: Parses existing SubRip or WebVTT files (`pipeline::importer` / `parseSubtitleFileText`) directly into `SubtitleProject` cues for translation, dual-style Serbian switching, Ekavian polishing, script conversion, re-wrapping, Undo/Redo (`Ctrl+Z`/`Ctrl+Y`), and multi-format export.
 
 ```mermaid
 flowchart TD
-    subgraph Input["1. Input & Ingestion"]
-        A["Audio / Video File"] --> B["FFmpeg 16 kHz Mono PCM WAV\n(pipeline::ffmpeg)"]
-        S["Existing .SRT / .VTT File"] --> I["Direct Subtitle Importer\n(pipeline::importer)"]
+    subgraph Input["1. Input & Background Intake Probe"]
+        A["Audio / Video File"] --> P["Preemptible Intake Probe (pipeline::probe)"]
+        A --> B["FFmpeg 16 kHz Mono PCM WAV (pipeline::ffmpeg)"]
+        S["Existing .SRT / .VTT File"] --> I["Direct Subtitle Importer (pipeline::importer)"]
     end
 
-    subgraph ASR["2. ASR & Word Segmentation (VRAM Stage 1)"]
-        B --> C["whisper.cpp (whisper-cli -ojf)\n+ Silero VAD v6.2.0 (--vad -vm)\n+ Glossary Prompt (--prompt)"]
-        C -->|"Process exits & releases 100% VRAM"| D["Rust Word-Level Segmenter\n(pipeline::segmenter)"]
+    subgraph ASR["2. ASR, Diarization & Linguistic Segmentation (VRAM Stage 1)"]
+        B --> C["whisper.cpp + Silero VAD v6.2.0 + Glossary Prompt"]
+        C -->|"Process exits & releases 100% VRAM"| D1["Acoustic Speaker-Turn Diarizer (pipeline::diarizer)"]
+        D1 --> D["Linguistic Word Segmenter (pipeline::segmenter)"]
     end
 
     I --> E
-    D --> E["Checkpoint Saved\n(<data_dir>/checkpoints/<job_id>.easysrt.json)"]
+    D --> E["Checkpoint Saved (<data_dir>/checkpoints/<job_id>.easysrt.json)"]
 
     subgraph LLM["3. VRAM Handoff / Cloud Pipeline & LLM Processing"]
         E --> F{"Translation / Polishing Provider"}
-        F -->|"Offline (LocalLlama)<br/>Two-Phase Batch: single warm guard"| G["LlamaServerGuard (-np 1 -fitc 2048 -ctk q8_0)<br/>Ephemeral 127.0.0.1:&lt;port&gt;/v1"]
-        F -->|"Online (DeepSeek / CustomOpenAi)<br/>Can overlap with Whisper on next queued file"| H["HTTPS OpenAI-Compatible API<br/>(api.deepseek.com/v1)"]
-        G --> J["ID-Locked Context-Window Batch Engine<br/>(Translate + optional correct_source_asr / PolishSerbian / CondenseCps)"]
+        F -->|"Offline (LocalLlama): Two-Phase single warm guard"| G["LlamaServerGuard (127.0.0.1:<port>/v1, ephemeral token)"]
+        F -->|"Online (DeepSeek / CustomOpenAi): HTTPS/SSRF guard"| H["HTTPS OpenAI-Compatible API"]
+        P -.->|"Probed topic context"| J
+        G --> J["ID-Locked Context-Window Batch Engine (Natural/Formal + ASR Fix / Polish / Condense)"]
         H --> J
     end
 
     subgraph Post["4. Deterministic Post-Processing & Export"]
-        J -->|"LlamaServerGuard::drop kills & reaps llama-server"| K["Ekavian Normalizer + Script Converter<br/>(pipeline::sr_script: normalize_ekavian & Latin <-> Cyrillic)"]
-        K --> L["Balanced Line Wrapper & CPS / Warning Metrics"]
-        L --> M["Studio UI (TopBar, FilesPanel, SettingsPanel, DualEditorBand, WaveformTimeline 100%-1000%)"]
-        M --> N["Multi-Format Exporter<br/>(pipeline::exporter: .SRT, .VTT, .TXT + Optional UTF-8 BOM)"]
+        J -->|"LlamaServerGuard::drop kills & reaps llama-server"| K["Ekavian Normalizer + Script Converter (pipeline::sr_script)"]
+        K --> L["1-4 Line Linguistic Wrapper, Dual-Style Cache & CPS Metrics"]
+        L --> M["Cinema Studio UI (DualEditorBand + Streaming WaveformTimeline 100%-2000%)"]
+        M --> N["Multi-Format Exporter (.SRT, .VTT, .TXT + Optional UTF-8 BOM)"]
     end
 ```
 
@@ -45,21 +48,23 @@ flowchart TD
 
 | Module | Responsibility |
 | :--- | :--- |
-| `models.rs` | Canonical `camelCase` data contract shared 1:1 with `src/types/models.ts` (including `JobOptions.correct_source_asr`, diagnostics/crash payloads, and hardware telemetry). |
-| `hardware.rs` | `nvidia-smi` GPU probing (`CREATE_NO_WINDOW` on Windows), multi-GPU max-VRAM selection, Windows `nvcuda.dll` CUDA 12.4 readiness check (`driver >= 550.54`), and `VramTier` classification. |
-| `storage.rs` | Canonical Installed path resolution (`%LOCALAPPDATA%\com.easysrt.studio` / `~/.local/share/com.easysrt.studio`), atomic `config.json` and checkpoint persistence (`<job_id>.easysrt.json`), and OS Keyring + fallback `.credentials.json` storage. |
-| `setup_manager.rs` | Curated catalog loader (`resources/catalog.json`), headless NSIS `--install-runtime` bootstrapper (FFmpeg, CUDA/CPU binaries, Silero VAD, Whisper Large V3 Turbo Q5_0, CUDA DLL reuse across `whisper/Release` and `llama`), resumable HTTP `Range` downloads, and SHA-256 verification. |
-| `diagnostics.rs` | Rolling `data/logs/app.log`, Rust panic hook, subprocess failure recording, strict secret/PII/username redaction, offline local report export, and telemetry dispatch to `https://easysrt-telemetry.ig-systems.rs`. |
-| `pipeline/ffmpeg.rs` | Spawns `ffmpeg -y -i <input> -vn -acodec pcm_s16le -ar 16000 -ac 1 <temp.16k.wav>` with cancellation polling and WAV header duration calculation. |
-| `pipeline/whisper.rs` | Runs `whisper-cli -ojf` with Silero VAD (`--vad -vm`), glossary hints (`--prompt`), constrained `Auto (EN / SR)` language pre-probing (`-dl` + EN/SR confidence scoring so non-native accents never leak into third languages while preserving bilingual EN/SR recovery), and pre-flight CPU fallback. |
-| `pipeline/segmenter.rs` | Groups `TimedWord`s into `SubtitleCue`s using punctuation, pause (`>= 350ms`), dangling-word penalty (`is_dangling_function_word`), duration, and character limits (`Standard` 2×42, `Reels` 1×20, `Custom`), balanced 2-line wrapping, and CPS metrics. |
-| `pipeline/llama_server.rs` | RAII `LlamaServerGuard` binding an ephemeral localhost TCP port with 4 GB VRAM auto-fit (`-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0`), automatic `-ngl 0` CPU fallback, `/health` polling, and `Drop` process reaping. |
-| `pipeline/translator.rs` | ID-locked sliding context-window batch translator (supporting optional single-pass `correct_source_asr` dual-column output `{"source", "text"}`), Serbian ASR polisher, and targeted CPS condenser (`BatchOperation::CondenseCps`) with per-cue `max_chars` budgets, keyed `json_schema` / `json_object` decoding, recursive subdivision retry, and per-batch atomic checkpointing. |
+| `models.rs` | Canonical `camelCase` data contract shared 1:1 with `src/types/models.ts` (including `JobOptions.correct_source_asr`, `split_on_speaker_change`, `remove_spoken_fillers`, `translation_style`, dual-style cue caches, `MediaProbeResult`, diagnostics/crash payloads, and hardware telemetry). |
+| `hardware.rs` | Canonical system-path `nvidia-smi` GPU probing (`CREATE_NO_WINDOW` on Windows, bounded timeouts), multi-GPU max-VRAM selection, Windows `nvcuda.dll` CUDA 12.4 readiness check (`driver >= 550.54`), and `VramTier` classification. |
+| `storage.rs` | Canonical Installed path resolution (`%LOCALAPPDATA%\com.easysrt.studio` / `~/.local/share/com.easysrt.studio`), atomic `config.json` and checkpoint persistence (`<job_id>.easysrt.json`), and hardened API key storage (OS Keyring primary, RAM `SESSION_VAULT` fallback, and explicit opt-in encrypted local vault `v2:` / Windows `dpapi1:`). |
+| `setup_manager.rs` | Curated catalog loader (`resources/catalog.json`), headless NSIS `--install-runtime` bootstrapper, HTTPS host allowlist + SHA-256 verification, safe archive extraction (blocking path traversal and non-symlink collisions while preserving valid same-dir `.so` SONAME symlinks), and resumable HTTP `Range` downloads. |
+| `diagnostics.rs` | Rolling `data/logs/app.log`, Rust panic hook, subprocess failure recording, strict secret/PII/username/API-key redaction, offline local report export, and telemetry dispatch to `https://easysrt-telemetry.ig-systems.rs`. |
+| `pipeline/probe.rs` | Preemptible, serialized 3-stage Background Media Intake Probe (`acoustic` speaker count & speech ratio → `asr` 35s language/snippet → `topic` classification), instantly cancelled with clean teardown whenever a pipeline run starts. |
+| `pipeline/ffmpeg.rs` | Spawns `ffmpeg -y -i <input> -vn -acodec pcm_s16le -ar 16000 -ac 1 <temp.16k.wav>` and streaming waveform peak extraction with cancellation polling and WAV header validation. |
+| `pipeline/whisper.rs` | Runs `whisper-cli -ojf` with Silero VAD (`--vad -vm`), glossary hints (`--prompt`), constrained `Auto (EN / SR)` language pre-probing (`-dl` + EN/SR confidence scoring), concurrent stderr draining, and pre-flight CPU fallback. |
+| `pipeline/diarizer.rs` | Pure-Rust, zero-VRAM acoustic speaker-turn boundary detector computing 12-coeff MFCC formant distances and MPM pitch (`75–350 Hz`) autocorrelation across inter-word gaps on 16 kHz mono PCM WAV audio. |
+| `pipeline/segmenter.rs` | Groups `TimedWord`s into `SubtitleCue`s using speaker-turn flags, comma-first long-sentence lookahead, leading conjunction/discourse-filler attachment, optional spoken filler stripping, orphan-starter rollback, `80 ms` inter-cue breathing gaps, and linguistic `1–4` line balanced wrapping (`Standard` 2×42, `Reels` 1×20, `Custom`). |
+| `pipeline/llama_server.rs` | RAII `LlamaServerGuard` binding an ephemeral `127.0.0.1:<port>` with per-launch random bearer `--api-key`, restricted private logs, 4 GB VRAM auto-fit (`-np 1 -fitc 2048 -fitt 128 -ctk q8_0 -ctv q8_0`), automatic `-ngl 0` CPU fallback, `/health` polling, and `Drop` process reaping. |
+| `pipeline/translator.rs` | ID-locked sliding context-window batch engine supporting Dual Serbian Styles (`Natural` spoken vs. `Formal` Ekavian with dual-style cue caching), `correct_source_asr` dual-column output, probed `topic_context` injection, `PolishSerbian`, targeted `CondenseCps`, spoken filler cleanup, strict HTTPS/SSRF endpoint validation (zero redirects), keyed `json_schema` decoding, and recursive subdivision retry. |
 | `pipeline/mod.rs` | Top-level pipeline orchestration including `run_full_pipeline` and Two-Phase Local Offline Batch (`run_local_llm_batch`) reusing a single warm `LlamaServerGuard` across multiple transcribed projects. |
 | `pipeline/sr_script.rs` | Deterministic Ijekavian→Ekavian lexical/stem normalizer (`normalize_ekavian`) and Serbian Cyrillic ↔ Latin converter with smart digraph casing (`Љ`/`Њ`/`Џ`) and morphological prefix-boundary exception handling. |
 | `pipeline/importer.rs` | Parses `.srt` and `.vtt` files (UTF-8 BOM, CRLF/LF, comma/dot timestamps, WebVTT headers and cue settings) into `SubtitleProject` instances. |
-| `pipeline/exporter.rs` | Formats `.srt`, `.vtt`, and `.txt` outputs with optional UTF-8 BOM (`\u{FEFF}`) and dual source + translated `.srt` export (`includeSourceSrt`). |
-| `src/components/` | Borderless 3-row workspace: `TopBar` (custom drag-region & `core:window:allow-*` window buttons), `FilesPanel` (queue & drag-drop), `SettingsPanel` (6-tab settings + mode pill), `DualEditorBand` (`Original transcript` & `Prevod` cards), and `WaveformTimeline` (3-track `MP3` HiDPI canvas waveform + `Original` & `Prevod` cue tracks with trim handles & `100%–2000%` cursor-anchored scroll-wheel zoom), plus `SetupWizard`, `ExportModal`, `OnlineConfirmModal`, `UpdaterModal`, `BugReportModal`, `ErrorBoundary`, and footer bug/suggestion trigger. |
+| `pipeline/exporter.rs` | Formats `.srt`, `.vtt`, and `.txt` outputs (preserving safe dots in filename stems while blocking path traversal) with optional UTF-8 BOM (`\u{FEFF}`) and dual source + translated `.srt` export (`includeSourceSrt`). |
+| `src/components/` | Cinema 3-row workspace: `TopBar`, `FilesPanel` (queue, intake probe badges & batch controls), `SettingsPanel`, `DualEditorBand` (simultaneous Source & Translation cinema editor, independent font-size controls, `0 ms` `Natural`/`Formal` style switch, `600 ms` debounced checkpoint autosave), and `WaveformTimeline` (zero-base64 Web Audio + scoped `assetProtocol` / blob streaming playback, 3-track HiDPI waveform, trim handles & `100%–2000%` cursor-anchored wheel zoom), plus `SetupWizard`, `ExportModal`, `OnlineConfirmModal`, `UpdaterModal`, `BugReportModal`, and `ErrorBoundary`. |
 
 ---
 
@@ -172,7 +177,7 @@ After each batch succeeds:
 3. For `Translate` and `PolishSerbian`, `project.completed_translation_batches` is incremented and `storage::save_checkpoint` writes `<data_dir>/checkpoints/<job_id>.easysrt.json` atomically (`write to .tmp.<pid>` + `rename`). `CondenseCps` checkpoints updated cues without overwriting `completed_translation_batches`.
 4. If a translation/polish job is interrupted or cancelled, resuming from the checkpoint skips all completed batches where `batch_idx < completed_translation_batches` and `translated_text` is populated.
 
-> For empirical 10-file benchmark measurements (CPU vs. CUDA Whisper, Local `Gemma 3 4B` vs. `DeepSeek API` sequential and pipelined) and planned engineering milestones, see [`docs/ROADMAP.md`](ROADMAP.md).
+> For empirical 10-file benchmark measurements (CPU vs. CUDA Whisper, Local `Gemma 3 4B` vs. `DeepSeek API` sequential and pipelined), see [`docs/dev/BENCHMARKS.md`](BENCHMARKS.md).
 
 ---
 
@@ -207,18 +212,19 @@ When converting **Latin → Cyrillic** (`to_cyrillic`), greedily merging every `
 
 ---
 
-## 6. Installed Storage Layout, Credential Security & Telemetry
+## 6. Installed Storage Layout, Security Hardening & Telemetry
 
-`src-tauri/src/storage.rs` resolves paths canonically via Tauri's `app_local_data_dir()` (`Installed` mode):
+`src-tauri/src/storage.rs` resolves paths canonically via Tauri's `app_local_data_dir()` (`Installed` mode) alongside strict WebView and network boundaries:
 
 | Component | Path & Behavior |
 | :--- | :--- |
 | **Root Directory (`root_dir`)** | Windows: `%LOCALAPPDATA%\com.easysrt.studio`<br>Linux: `~/.local/share/com.easysrt.studio` |
-| **Binaries (`bin_dir`)** | `<root_dir>/bin/{ffmpeg,whisper,llama}` (seeded automatically on Windows via NSIS `--install-runtime` + bundled MSVC runtime DLLs) |
+| **Binaries (`bin_dir`)** | `<root_dir>/bin/{ffmpeg,whisper,llama}` (seeded automatically on Windows via NSIS `--install-runtime` + bundled MSVC runtime DLLs; verified via HTTPS host allowlist + SHA-256) |
 | **Models (`models_dir`)** | `<root_dir>/models/{vad,whisper,llm}` (or custom `models_dir_override` in `config.json`) |
-| **Checkpoints & Logs (`data_dir`)** | `<root_dir>/data/checkpoints/<job_id>.easysrt.json`, `<root_dir>/data/logs/app.log`, `<root_dir>/data/reports/` |
+| **Checkpoints & Logs (`data_dir`)** | `<root_dir>/data/checkpoints/<job_id>.easysrt.json`, `<root_dir>/data/logs/app.log` (`0600` permissions), `<root_dir>/data/reports/` |
 | **Config (`config_path`)** | `<root_dir>/config.json` |
-| **API Key Storage** | Native OS Keyring (`keyring` crate v3: Windows Credential Manager / Linux Keyutils / macOS Keychain) with read-after-write verification and `0600` masked `.credentials.json` (`obf1:<hex>`) fallback |
+| **API Key Storage** | Primary: Native OS Keyring (`keyring` crate v3: Windows Credential Manager / Linux Keyutils / macOS Keychain) with read-after-write verification. Fallback: ephemeral in-memory `SESSION_VAULT` (RAM only), or explicit user opt-in encrypted local vault (`dpapi1:` on Windows DPAPI / `v2:` authenticated encryption with `0600` `.vault.key` on Unix). |
+| **WebView & Network Isolation** | Strict Tauri v2 Content Security Policy (`default-src 'self'`, no `fs`/`shell` frontend plugins), dynamically allowlisted `assetProtocol` media streaming, ephemeral bearer auth on local `llama-server`, and `CustomOpenAi` HTTPS/SSRF validation with zero redirects. |
 | **Bug & Crash Telemetry** | `src-tauri/src/diagnostics.rs` sanitizes usernames, local paths, API keys, and bearer tokens (never including subtitle text) before dispatching to Cloudflare Worker `https://easysrt-telemetry.ig-systems.rs` or saving locally when offline |
 
 ---
@@ -238,8 +244,8 @@ EasySRT Studio integrates `tauri-plugin-updater` configured in `src-tauri/tauri.
 3. **Configure GitHub Actions Secrets**:
    - `TAURI_SIGNING_PRIVATE_KEY`: Contents of `~/.tauri/easysrt-studio.key`
    - `TAURI_SIGNING_PRIVATE_KEY_PASSWORD`: Password used when generating the keypair
-4. **Automated Verification & Publishing (`.github/workflows/release.yml`)**:
-   - Triggered on `v*` tags (e.g., `git tag -a v0.3.2 -m "Release v0.3.2" && git push origin v0.3.2`).
-   - Runs `npm run typecheck`, `npm test` (frontend unit test suite), and `cargo test --manifest-path src-tauri/Cargo.toml` (Rust backend unit + E2E test suite) **before** building bundles.
-   - Stages MSVC x64 runtime DLLs (`vcruntime140.dll`, `msvcp140.dll`, `vcomp140.dll`, etc.) on Windows and builds `whisper.cpp` `b5907` with `-DGGML_VULKAN=ON` using LunarG Vulkan SDK on Ubuntu `22.04`.
-   - Publishes signed Windows NSIS installer (`EasySRT Studio_<ver>_x64-setup.exe`), Linux AppImage, `latest.json` (`releaseDraft: false`, `includeUpdaterJson: true`), and `whisper-bin-ubuntu-vulkan-x64.tar.gz` directly to the GitHub Release.
+4. **Automated Verification & Publishing (`.github/workflows/release.yml`, see [`RELEASE_WORKFLOW.md`](RELEASE_WORKFLOW.md))**:
+   - Triggered automatically when a PR from `staging` merges a new untagged `package.json` version onto `main` (or via manual `workflow_dispatch` on `staging` for safe pre-release builds with `includeUpdaterJson: false`).
+   - Pins third-party GitHub Actions to full commit SHAs, verifies `npm run version:check`, `npm run typecheck`, `npm test`, and `cargo test --manifest-path src-tauri/Cargo.toml` **before** building bundles.
+   - Stages MSVC x64 runtime DLLs (`vcruntime140.dll`, `msvcp140.dll`, `vcomp140.dll`, etc.) on Windows and builds `whisper.cpp` `b5907` with `-DGGML_VULKAN=ON` using SHA-256-verified LunarG Vulkan SDK on Ubuntu `22.04`.
+   - Publishes signed Windows NSIS installer (`EasySRT.Studio_<ver>_x64-setup.exe`), Linux AppImage, `latest.json` (`releaseDraft: false`, `includeUpdaterJson: true`), and `whisper-bin-ubuntu-vulkan-x64.tar.gz` directly to the GitHub Release.

@@ -23,12 +23,16 @@ const SECTION_ORDER = [
   { key: "breaking", title: "Breaking Changes" },
   { key: "added", title: "Added" },
   { key: "fixed", title: "Fixed" },
+  { key: "security", title: "Security" },
   { key: "performance", title: "Performance" },
   { key: "changed", title: "Changed" },
   { key: "docs", title: "Documentation" },
   { key: "maintenance", title: "Maintenance" },
   { key: "other", title: "Other Changes" },
 ];
+
+const INTERNAL_DOC_SCOPES = new Set(["planning", "dev", "internal", "wip"]);
+const README_FILES = ["README.md", "README.sr.md"];
 
 export function parseSemver(input) {
   const match = String(input ?? "").trim().match(SEMVER_RE);
@@ -91,14 +95,31 @@ export function parseConventionalCommit({ hash = "", subject = "", body = "" }) 
 
   const type = match[1].toLowerCase();
   const scope = match[2]?.trim() || null;
+  const scopeLower = scope ? scope.toLowerCase() : null;
   const breaking = Boolean(match[3]) || hasBreakingFooter;
   const description = match[4].trim();
+
+  // Keep user-facing CHANGELOG.md free of internal planning/dev-doc, test, and CI noise
+  if (!breaking) {
+    if (type === "test" || type === "ci") {
+      return null;
+    }
+    if (
+      (type === "docs" || type === "chore") &&
+      scopeLower &&
+      INTERNAL_DOC_SCOPES.has(scopeLower)
+    ) {
+      return null;
+    }
+  }
 
   let section = "other";
   if (breaking) {
     section = "breaking";
   } else if (type === "feat") {
     section = "added";
+  } else if (type === "security" || (type === "fix" && scopeLower === "security")) {
+    section = "security";
   } else if (type === "fix") {
     section = "fixed";
   } else if (type === "perf") {
@@ -107,7 +128,7 @@ export function parseConventionalCommit({ hash = "", subject = "", body = "" }) 
     section = "changed";
   } else if (type === "docs") {
     section = "docs";
-  } else if (["chore", "build", "ci", "test", "style", "revert"].includes(type)) {
+  } else if (["chore", "build", "style", "revert"].includes(type)) {
     section = "maintenance";
   }
 
@@ -338,12 +359,14 @@ function updateCargoLockVersion(lockText, newVersion, packageName = "easysrt-stu
   return lockText.replace(re, `$1${newVersion}$2`);
 }
 
-function readReadmeVersions(readmeText) {
-  const badgeAlt = readmeText.match(/\[!\[Release v([^\]]+)\]/);
+export function readReadmeVersions(readmeText) {
+  const badgeAlt = readmeText.match(/\[!\[(?:Release|Izdanje) v([^\]]+)\]/);
   const badgeUrl = readmeText.match(
-    /\/badge\/release-v([0-9A-Za-z.-]+)-[0-9a-fA-F]{6}\b/,
+    /\/badge\/(?:release|izdanje)-v([0-9A-Za-z.-]+)-[0-9a-fA-F]{6}\b/,
   );
-  const heading = readmeText.match(/\[Download EasySRT Studio v([^\]]+)\]/);
+  const heading = readmeText.match(
+    /\[(?:Download|Preuzmi) EasySRT Studio v([^\]]+)\]/,
+  );
   const found = [
     badgeAlt?.[1],
     badgeUrl?.[1]?.replace(/--/g, "-"),
@@ -354,15 +377,15 @@ function readReadmeVersions(readmeText) {
   return unique.length === 1 ? unique[0] : unique.join(" / ");
 }
 
-function updateReadmeVersions(readmeText, newVersion) {
+export function updateReadmeVersions(readmeText, newVersion) {
   const badgeVersion = newVersion.replace(/-/g, "--");
   let next = readmeText.replace(
-    /\[!\[Release v[^\]]+\]\(https:\/\/img\.shields\.io\/badge\/release-v[0-9A-Za-z.-]+-([0-9a-fA-F]{6}\b)/g,
-    `[![Release v${newVersion}](https://img.shields.io/badge/release-v${badgeVersion}-$1`,
+    /\[!\[(Release|Izdanje) v[^\]]+\]\(https:\/\/img\.shields\.io\/badge\/(release|izdanje)-v[0-9A-Za-z.-]+-([0-9a-fA-F]{6}\b)/g,
+    `[![$1 v${newVersion}](https://img.shields.io/badge/$2-v${badgeVersion}-$3`,
   );
   next = next.replace(
-    /\[Download EasySRT Studio v[^\]]+\]/g,
-    `[Download EasySRT Studio v${newVersion}]`,
+    /\[(Download|Preuzmi) EasySRT Studio v[^\]]+\]/g,
+    `[$1 EasySRT Studio v${newVersion}]`,
   );
   return next;
 }
@@ -426,11 +449,13 @@ export function checkVersions(rootDir) {
     );
   }
 
-  const readmePath = path.join(rootDir, "README.md");
-  if (existsSync(readmePath)) {
-    const readmeVersion = readReadmeVersions(readFileSync(readmePath, "utf8"));
-    if (readmeVersion !== null) {
-      record("README.md", readmeVersion);
+  for (const readmeFile of README_FILES) {
+    const readmePath = path.join(rootDir, readmeFile);
+    if (existsSync(readmePath)) {
+      const readmeVersion = readReadmeVersions(readFileSync(readmePath, "utf8"));
+      if (readmeVersion !== null) {
+        record(readmeFile, readmeVersion);
+      }
     }
   }
 
@@ -509,14 +534,16 @@ export function syncVersions(rootDir, newVersion) {
     touched.push("worker/package-lock.json");
   }
 
-  const readmePath = path.join(rootDir, "README.md");
-  if (existsSync(readmePath)) {
-    const updated = updateReadmeVersions(
-      readFileSync(readmePath, "utf8"),
-      cleanVersion,
-    );
-    writeFileSync(readmePath, updated, "utf8");
-    touched.push("README.md");
+  for (const readmeFile of README_FILES) {
+    const readmePath = path.join(rootDir, readmeFile);
+    if (existsSync(readmePath)) {
+      const updated = updateReadmeVersions(
+        readFileSync(readmePath, "utf8"),
+        cleanVersion,
+      );
+      writeFileSync(readmePath, updated, "utf8");
+      touched.push(readmeFile);
+    }
   }
 
   return touched;

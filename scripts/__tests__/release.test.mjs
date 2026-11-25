@@ -52,6 +52,28 @@ describe("conventional commit parsing and changelog generation", () => {
       parseConventionalCommit({ hash: "bbbb222", subject: "chore(release): prepare v0.3.3" }),
       null,
     );
+    assert.equal(
+      parseConventionalCommit({ hash: "cccc333", subject: "docs(planning): add v0.5.0 sprint plan" }),
+      null,
+    );
+    assert.equal(
+      parseConventionalCommit({ hash: "dddd444", subject: "docs(dev): update architecture diagram" }),
+      null,
+    );
+    assert.equal(
+      parseConventionalCommit({ hash: "eeee555", subject: "test(segmenter): add comma split unit tests" }),
+      null,
+    );
+    assert.equal(
+      parseConventionalCommit({ hash: "ffff666", subject: "ci(actions): pin checkout sha" }),
+      null,
+    );
+
+    const sec = parseConventionalCommit({
+      hash: "0d579fa",
+      subject: "security(backend): harden storage vault",
+    });
+    assert.equal(sec?.section, "security");
 
     const feat = parseConventionalCommit({
       hash: "1234567890",
@@ -246,6 +268,14 @@ describe("manifest version check & sync", () => {
           "",
         ].join("\n"),
       );
+      writeFileSync(
+        path.join(tmp, "README.sr.md"),
+        [
+          "[![Izdanje v0.3.2](https://img.shields.io/badge/izdanje-v0.3.2-38bdf8?style=for-the-badge)](https://example.com)",
+          "### [Preuzmi EasySRT Studio v0.3.2](https://example.com)",
+          "",
+        ].join("\n"),
+      );
 
       assert.equal(checkVersions(tmp).ok, true);
 
@@ -267,6 +297,9 @@ describe("manifest version check & sync", () => {
       const readme = readFileSync(path.join(tmp, "README.md"), "utf8");
       assert.match(readme, /release-v0\.3\.3-38bdf8/);
       assert.match(readme, /Download EasySRT Studio v0\.3\.3/);
+      const readmeSr = readFileSync(path.join(tmp, "README.sr.md"), "utf8");
+      assert.match(readmeSr, /izdanje-v0\.3\.3-38bdf8/);
+      assert.match(readmeSr, /Preuzmi EasySRT Studio v0\.3\.3/);
 
       // Introduce drift and verify checkVersions catches it
       writeFileSync(
