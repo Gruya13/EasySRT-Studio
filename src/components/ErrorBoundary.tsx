@@ -10,6 +10,7 @@ import {
 import { Component, type ErrorInfo, type ReactNode } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { saveDiagnosticsLocal, submitCrashReport } from "../lib/tauri";
+import { toSafeExternalHttpsUrl } from "../lib/urlSafety";
 import { useAppStore } from "../stores/appStore";
 import type { ReportSubmitResult } from "../types/models";
 
@@ -159,6 +160,7 @@ export class ErrorBoundary extends Component<
       localSavedPath,
       localSaveError,
     } = this.state;
+    const safeIssueUrl = toSafeExternalHttpsUrl(reportResult?.issueUrl);
 
     return (
       <div className="flex min-h-screen w-full items-center justify-center bg-[#06070a] p-6 text-slate-100">
@@ -215,16 +217,22 @@ export class ErrorBoundary extends Component<
                       <span className="text-emerald-300">
                         Issue #{reportResult.issueNumber}
                       </span>
-                      {reportResult.issueUrl && (
+                      {safeIssueUrl ? (
                         <a
-                          href={reportResult.issueUrl}
+                          href={safeIssueUrl}
                           target="_blank"
-                          rel="noreferrer"
+                          rel="noopener noreferrer"
                           className="inline-flex items-center gap-1 text-cyan-300 hover:underline"
                         >
-                          <span>{reportResult.issueUrl}</span>
+                          <span>{safeIssueUrl}</span>
                           <ExternalLink className="h-3 w-3 shrink-0" />
                         </a>
+                      ) : (
+                        reportResult.issueUrl && (
+                          <span className="break-all text-slate-300 select-text">
+                            {reportResult.issueUrl}
+                          </span>
+                        )
                       )}
                     </div>
                   )}

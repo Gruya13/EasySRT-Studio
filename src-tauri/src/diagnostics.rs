@@ -299,8 +299,11 @@ pub fn init_logging(data_dir: &Path) {
 // ---------------------------------------------------------------------------
 
 struct SanitizerRegexes {
+    url_userinfo: Regex,
     sk_key: Regex,
-    ghp_token: Regex,
+    hf_token: Regex,
+    gemini_key: Regex,
+    gh_token: Regex,
     github_pat: Regex,
     bearer: Regex,
     api_key_kv: Regex,
@@ -308,17 +311,26 @@ struct SanitizerRegexes {
     win_user_escaped: Regex,
     win_user_path: Regex,
     linux_home_path: Regex,
+    macos_users_path: Regex,
 }
 
 fn sanitizer_regexes() -> &'static SanitizerRegexes {
     static REGEXES: OnceLock<SanitizerRegexes> = OnceLock::new();
     REGEXES.get_or_init(|| SanitizerRegexes {
-        sk_key: Regex::new(r"sk-[A-Za-z0-9_\-]{8,}").expect("valid sk_key regex"),
-        ghp_token: Regex::new(r"ghp_[A-Za-z0-9]+").expect("valid ghp_token regex"),
-        github_pat: Regex::new(r"github_pat_[A-Za-z0-9_]+").expect("valid github_pat regex"),
-        bearer: Regex::new(r"(?i)Bearer\s+[A-Za-z0-9._\-]+").expect("valid bearer regex"),
-        api_key_kv: Regex::new(r#"(?i)(api[_-]?key\s*[:=]\s*["']?)[^\s"',}]+"#)
-            .expect("valid api_key_kv regex"),
+        url_userinfo: Regex::new(
+            r#"(?i)\b([A-Za-z][A-Za-z0-9+.\-]{0,15}://)[^/\s\\?#"'<>]{1,512}@([A-Za-z0-9\[])"#,
+        )
+        .expect("valid url_userinfo regex"),
+        sk_key: Regex::new(r"\bsk-[A-Za-z0-9_\-]{8,}").expect("valid sk_key regex"),
+        hf_token: Regex::new(r"\bhf_[A-Za-z0-9]{10,}").expect("valid hf_token regex"),
+        gemini_key: Regex::new(r"\bAIza[0-9A-Za-z_\-]{20,}").expect("valid gemini_key regex"),
+        gh_token: Regex::new(r"\bgh[pousr]_[A-Za-z0-9]+").expect("valid gh_token regex"),
+        github_pat: Regex::new(r"\bgithub_pat_[A-Za-z0-9_]+").expect("valid github_pat regex"),
+        bearer: Regex::new(r"(?i)\bBearer\s+[A-Za-z0-9._\-]+").expect("valid bearer regex"),
+        api_key_kv: Regex::new(
+            r#"(?i)(\b(?:x[_-])?api[_-]?key["']?\s*[:=]\s*["']?)(?:\[REDACTED(?:_[A-Z_]+)?\]|[^\s"',}&;\]\)]+)"#,
+        )
+        .expect("valid api_key_kv regex"),
         obf_cred: Regex::new(r"obf1:[0-9a-fA-F]{8,}").expect("valid obf_cred regex"),
         win_user_escaped: Regex::new(r#"(?i)([A-Za-z]):\\\\Users\\\\[^\\/\r\n\t"']+\\\\"#)
             .expect("valid win_user_escaped regex"),
@@ -326,14 +338,20 @@ fn sanitizer_regexes() -> &'static SanitizerRegexes {
             .expect("valid win_user_path regex"),
         linux_home_path: Regex::new(r#"/home/[^/\s"'<>:;,\)\]]+/"#)
             .expect("valid linux_home_path regex"),
+        macos_users_path: Regex::new(r#"(?P<prefix>^|[^A-Za-z0-9_:])/Users/[^\\/\s"'<>:;,\)\]]+"#)
+            .expect("valid macos_users_path regex"),
     })
 }
 
-/// Redact API keys, auth tokens, and OS usernames from diagnostic text before saving or uploading.
+/// Redact API keys, auth tokens, URL credentials, and OS usernames from diagnostic text
+/// before saving or uploading.
 pub fn sanitize_diagnostic_text(raw: &str) -> String {
     let rx = sanitizer_regexes();
-    let s = rx.sk_key.replace_all(raw, "[REDACTED_API_KEY]");
-    let s = rx.ghp_token.replace_all(&s, "[REDACTED_TOKEN]");
+    let s = rx.url_userinfo.replace_all(raw, "${1}<redacted>@${2}");
+    let s = rx.sk_key.replace_all(&s, "[REDACTED_API_KEY]");
+    let s = rx.hf_token.replace_all(&s, "[REDACTED_HF_TOKEN]");
+    let s = rx.gemini_key.replace_all(&s, "[REDACTED_API_KEY]");
+    let s = rx.gh_token.replace_all(&s, "[REDACTED_TOKEN]");
     let s = rx.github_pat.replace_all(&s, "[REDACTED_TOKEN]");
     let s = rx.bearer.replace_all(&s, "Bearer [REDACTED]");
     let s = rx.api_key_kv.replace_all(&s, "${1}[REDACTED]");
@@ -343,7 +361,15 @@ pub fn sanitize_diagnostic_text(raw: &str) -> String {
         .replace_all(&s, r"${1}:\\Users\\<USER>\\");
     let s = rx.win_user_path.replace_all(&s, r"${1}:\Users\<USER>\");
     let s = rx.linux_home_path.replace_all(&s, "/home/<USER>/");
+    let s = rx
+        .macos_users_path
+        .replace_all(&s, "${prefix}/Users/<USER>");
     s.into_owned()
+}
+
+/// Alias for [`sanitize_diagnostic_text`] for callers using `diagnostics::sanitize_text`.
+pub fn sanitize_text(raw: &str) -> String {
+    sanitize_diagnostic_text(raw)
 }
 
 /// Compute a deterministic 16-character lowercase hex SHA-256 fingerprint for crash deduplication.
@@ -1301,39 +1327,73 @@ mod tests {
     fn sanitizer_redacts_secrets_tokens_and_os_usernames() {
         let raw = concat!(
             "DeepSeek key: sk-1234567890abcdef_XYZ\n",
+            "HF token: hf_AbCdEfGhIjKlMnOpQrStUvWx1234\n",
+            "Gemini key: AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe\n",
             "GitHub classic: ghp_abc123XYZ987654\n",
+            "GitHub OAuth: gho_OAuthToken987654\n",
             "GitHub fine-grained: github_pat_11AAA_bbbCCC999\n",
             "Header: Authorization: Bearer eyJhbGciOiJIUzI1NiJ9.payload.sig\n",
+            "Header2: X-API-Key: header_secret_value_77\n",
+            "Query: https://api.example.com/v1?x-api-key=query_secret_88&model=pro\n",
+            "Json: {\"x-api-key\": \"json_secret_99\", \"ok\": true}\n",
             "Config: api_key=\"super_secret_value_42\", api-key: another_secret, apiKey=third_secret\n",
             "Cred: obf1:deadbeef0123456789\n",
+            "UrlCred1: https://alice:s3cr3tPass@api.example.com/v1/chat\n",
+            "UrlCred2: socks5://proxyUser:proxyPass@192.168.1.5:1080\n",
+            "UrlClean: https://example.com/help?contact=support@example.com\n",
             "Win1: C:\\Users\\Milica\\AppData\\Local\\com.easysrt.studio\\logs\\app.log\n",
             "Win2: C:/Users/Marko/Videos/clip.mp4\n",
             "WinJson: \"C:\\\\Users\\\\Nikola\\\\Desktop\\\\test.srt\"\n",
             "Linux: /home/alice/Projects/EasySRT Studio/audio.wav\n",
+            "macOS1: /Users/elena/Movies/interview.mov\n",
+            "macOS2: HOME=/Users/stefan\n",
         );
 
         let sanitized = sanitize_diagnostic_text(raw);
 
         assert!(!sanitized.contains("sk-1234567890abcdef_XYZ"));
+        assert!(!sanitized.contains("hf_AbCdEfGhIjKlMnOpQrStUvWx1234"));
+        assert!(!sanitized.contains("AIzaSyDaGmWKa4JsXZ-HjGw7ISLn_3namBGqeQe"));
         assert!(!sanitized.contains("ghp_abc123XYZ987654"));
+        assert!(!sanitized.contains("gho_OAuthToken987654"));
         assert!(!sanitized.contains("github_pat_11AAA_bbbCCC999"));
         assert!(!sanitized.contains("eyJhbGciOiJIUzI1NiJ9"));
+        assert!(!sanitized.contains("header_secret_value_77"));
+        assert!(!sanitized.contains("query_secret_88"));
+        assert!(!sanitized.contains("json_secret_99"));
         assert!(!sanitized.contains("super_secret_value_42"));
         assert!(!sanitized.contains("another_secret"));
         assert!(!sanitized.contains("third_secret"));
         assert!(!sanitized.contains("deadbeef0123456789"));
+        assert!(!sanitized.contains("alice:s3cr3tPass"));
+        assert!(!sanitized.contains("proxyUser:proxyPass"));
         assert!(!sanitized.contains("Milica"));
         assert!(!sanitized.contains("Marko"));
         assert!(!sanitized.contains("Nikola"));
         assert!(!sanitized.contains("/home/alice/"));
+        assert!(!sanitized.contains("/Users/elena/"));
+        assert!(!sanitized.contains("/Users/stefan"));
 
         assert!(sanitized.contains("[REDACTED_API_KEY]"));
+        assert!(sanitized.contains("[REDACTED_HF_TOKEN]"));
         assert!(sanitized.contains("[REDACTED_TOKEN]"));
         assert!(sanitized.contains("Bearer [REDACTED]"));
+        assert!(sanitized.contains("X-API-Key: [REDACTED]"));
+        assert!(sanitized.contains("https://api.example.com/v1?x-api-key=[REDACTED]&model=pro"));
+        assert!(sanitized.contains(r#"{"x-api-key": "[REDACTED]", "ok": true}"#));
+        assert!(sanitized.contains("https://<redacted>@api.example.com/v1/chat"));
+        assert!(sanitized.contains("socks5://<redacted>@192.168.1.5:1080"));
+        assert!(sanitized.contains("https://example.com/help?contact=support@example.com"));
         assert!(sanitized.contains(r"C:\Users\<USER>\AppData"));
         assert!(sanitized.contains(r"C:\Users\<USER>\Videos"));
         assert!(sanitized.contains(r"C:\\Users\\<USER>\\Desktop"));
         assert!(sanitized.contains("/home/<USER>/Projects/EasySRT Studio/audio.wav"));
+        assert!(sanitized.contains("/Users/<USER>/Movies/interview.mov"));
+        assert!(sanitized.contains("HOME=/Users/<USER>"));
+
+        // Alias parity and idempotency
+        assert_eq!(sanitize_text(raw), sanitized);
+        assert_eq!(sanitize_diagnostic_text(&sanitized), sanitized);
     }
 
     #[test]

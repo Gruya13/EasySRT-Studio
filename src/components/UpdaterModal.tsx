@@ -17,6 +17,7 @@ import {
   formatBytes,
   isTauriRuntime,
 } from "../lib/subtitleUtils";
+import { toSafeExternalHttpsUrl } from "../lib/urlSafety";
 import { useAppStore } from "../stores/appStore";
 
 interface GitHubLatestRelease {
@@ -84,7 +85,8 @@ export function UpdaterModal() {
             return {
               release: {
                 version: tag.replace(/^v/i, ""),
-                htmlUrl: data.html_url || GITHUB_RELEASES_URL,
+                htmlUrl:
+                  toSafeExternalHttpsUrl(data.html_url) ?? GITHUB_RELEASES_URL,
                 body: data.body || "",
                 publishedAt: data.published_at || "",
               },
@@ -217,6 +219,16 @@ export function UpdaterModal() {
     totalBytes > 0
       ? Math.min(100, Math.round((downloadedBytes / totalBytes) * 100))
       : 0;
+  const safeGithubReleaseUrl = toSafeExternalHttpsUrl(githubRelease?.htmlUrl);
+  const safeLatestReleaseUrl =
+    safeGithubReleaseUrl ?? toSafeExternalHttpsUrl(GITHUB_RELEASES_URL);
+  const latestReleaseLabel = checking
+    ? "..."
+    : githubRelease
+      ? `v${githubRelease.version}`
+      : lang === "en"
+        ? "No release yet"
+        : "Još nema release-a";
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
@@ -257,23 +269,21 @@ export function UpdaterModal() {
             <span className="text-slate-400">
               {lang === "en" ? "Latest on GitHub" : "Najnovije na GitHub-u"}
             </span>
-            <a
-              href={githubRelease?.htmlUrl ?? GITHUB_RELEASES_URL}
-              target="_blank"
-              rel="noreferrer"
-              className="inline-flex items-center gap-1.5 font-mono font-semibold text-cyan-300 hover:underline"
-            >
-              <span>
-                {checking
-                  ? "..."
-                  : githubRelease
-                    ? `v${githubRelease.version}`
-                    : lang === "en"
-                      ? "No release yet"
-                      : "Još nema release-a"}
+            {safeLatestReleaseUrl ? (
+              <a
+                href={safeLatestReleaseUrl}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="inline-flex items-center gap-1.5 font-mono font-semibold text-cyan-300 hover:underline"
+              >
+                <span>{latestReleaseLabel}</span>
+                <ExternalLink className="h-3 w-3" />
+              </a>
+            ) : (
+              <span className="font-mono font-semibold text-slate-300">
+                {latestReleaseLabel}
               </span>
-              <ExternalLink className="h-3 w-3" />
-            </a>
+            )}
           </div>
 
           {isUpToDate && (
@@ -358,11 +368,12 @@ export function UpdaterModal() {
                   )}
                 </>
               ) : (
-                githubRelease && (
+                githubRelease &&
+                safeGithubReleaseUrl && (
                   <a
-                    href={githubRelease.htmlUrl}
+                    href={safeGithubReleaseUrl}
                     target="_blank"
-                    rel="noreferrer"
+                    rel="noopener noreferrer"
                     className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow"
                   >
                     <ExternalLink className="h-4 w-4" />
