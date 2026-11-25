@@ -724,20 +724,25 @@ fn extract_zip_archive_with_limits(
             .by_index(idx)
             .with_context(|| format!("Failed to read zip entry #{}", idx))?;
 
+        let entry_name = entry
+            .name()
+            .with_context(|| format!("Zip archive entry #{} has invalid filename", idx))?
+            .into_owned();
+
         let is_unix_symlink = entry
             .unix_mode()
             .is_some_and(|mode| (mode & 0o170000) == 0o120000);
         if entry.is_symlink() || is_unix_symlink {
             return Err(anyhow!(
                 "Zip archive contains disallowed symlink entry: {}",
-                entry.name()
+                entry_name
             ));
         }
 
         let Some(enclosed) = entry.enclosed_name().map(|p| p.to_path_buf()) else {
             return Err(anyhow!(
                 "Zip archive contains unsafe path traversal entry: {}",
-                entry.name()
+                entry_name
             ));
         };
         let Some(rel_path) = sanitize_archive_rel_path(&enclosed, "Zip")? else {
@@ -746,7 +751,7 @@ fn extract_zip_archive_with_limits(
         ensure_no_symlink_components_under(target_dir, &rel_path)?;
 
         let out_path = target_dir.join(&rel_path);
-        if entry.is_dir() || entry.name().ends_with('/') {
+        if entry.is_dir() || entry_name.ends_with('/') {
             fs::create_dir_all(&out_path)?;
         } else {
             file_count += 1;
