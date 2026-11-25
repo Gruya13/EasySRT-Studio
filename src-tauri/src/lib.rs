@@ -31,8 +31,6 @@ pub fn run() {
         })
         .manage(PipelineState::default())
         .plugin(tauri_plugin_dialog::init())
-        .plugin(tauri_plugin_fs::init())
-        .plugin(tauri_plugin_shell::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .invoke_handler(tauri::generate_handler![
@@ -50,6 +48,7 @@ pub fn run() {
             commands::clear_api_key,
             commands::list_checkpoints,
             commands::load_checkpoint,
+            commands::save_project_checkpoint,
             commands::delete_checkpoint,
             commands::import_subtitle_file,
             commands::try_load_companion_subtitles,
@@ -63,7 +62,10 @@ pub fn run() {
             commands::cancel_job,
             commands::convert_cues_script,
             commands::export_subtitles,
-            commands::read_audio_preview_base64,
+            commands::read_audio_playback_bytes,
+            commands::prepare_audio_waveform,
+            commands::probe_media_file,
+            commands::cancel_media_probe,
             commands::set_window_maximized,
             commands::collect_diagnostics_preview,
             commands::submit_bug_report,

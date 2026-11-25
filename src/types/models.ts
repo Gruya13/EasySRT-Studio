@@ -96,9 +96,12 @@ export interface SegmentRules {
   minDurationMs: number;
   maxDurationMs: number;
   maxCps: number;
+  splitOnSpeakerChange?: boolean;
 }
 
 export type SerbianScript = "latin" | "cyrillic";
+
+export type TranslationStyle = "natural" | "formal";
 
 export type TranslationProviderKind =
   | "localLlama"
@@ -144,6 +147,11 @@ export interface AppConfig {
   export: ExportOptions;
   hasCompletedSetup: boolean;
   autoSendCrashReports?: boolean;
+  editorSourceFontSize?: number;
+  editorTranslatedFontSize?: number;
+  autoProbeOnImport?: boolean;
+  autoCheckpoints?: boolean;
+  allowLocalEncryptedVault?: boolean;
 }
 
 export interface TimedWord {
@@ -151,6 +159,7 @@ export interface TimedWord {
   endMs: number;
   text: string;
   probability: number;
+  speakerChange?: boolean;
 }
 
 export interface SubtitleCue {
@@ -159,6 +168,7 @@ export interface SubtitleCue {
   endMs: number;
   sourceText: string;
   translatedText: string;
+  translatedVariants?: Partial<Record<TranslationStyle, string>>;
   cps: number;
   warnings: string[];
 }
@@ -171,6 +181,8 @@ export interface JobOptions {
   glossary: Record<string, string>;
   polishSerbian: boolean;
   correctSourceAsr?: boolean;
+  translationStyle?: TranslationStyle;
+  removeFillers?: boolean;
   providerOverride: TranslationProviderKind | null;
 }
 
@@ -196,6 +208,8 @@ export interface SubtitleProject {
   cues: SubtitleCue[];
   phase: JobPhase;
   completedTranslationBatches: number;
+  completedTranslationStyle?: TranslationStyle | null;
+  topicContext?: string | null;
   errorMessage: string | null;
   updatedAt: string;
 }
@@ -217,9 +231,31 @@ export interface ApiKeyStatus {
   storageBackend: string;
 }
 
-export interface AudioPreviewData {
-  mimeType: string;
-  base64Data: string;
+export interface WaveformPreviewData {
+  canonicalPath: string;
+  durationMs: number;
+  peaks: number[];
+}
+
+export type MediaProbeStage =
+  | "acoustic"
+  | "asr"
+  | "topic"
+  | "completed"
+  | "cancelled"
+  | "failed";
+
+export interface MediaProbeResult {
+  jobId: string;
+  audioPath: string;
+  stage: MediaProbeStage;
+  durationMs: number | null;
+  speechRatio: number | null;
+  estimatedSpeakers: number | null;
+  detectedLanguage: string | null;
+  topic: string | null;
+  suggestedStyle: TranslationStyle | null;
+  error: string | null;
 }
 
 export interface BugReportRequest {

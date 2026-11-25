@@ -1,3 +1,4 @@
+import { convertFileSrc } from "@tauri-apps/api/core";
 import { Merge, Plus, Redo2, Scissors, Trash2, Undo2 } from "lucide-react";
 import {
   Fragment,
@@ -10,7 +11,7 @@ import {
 } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
-import { readAudioPreviewBase64 } from "../lib/tauri";
+import { prepareAudioWaveform, readAudioPlaybackBytes } from "../lib/tauri";
 import {
   MAX_TIMELINE_ZOOM_PCT,
   MIN_TIMELINE_ZOOM_PCT,
@@ -18,6 +19,8 @@ import {
   computeSafeCanvasSize,
   computeWheelZoomPct,
   formatRulerTimestamp,
+  inferAudioMimeType,
+  resolveTimelineMediaState,
 } from "../lib/timelineUtils";
 import { useAppStore } from "../stores/appStore";
 import type { JobPhase, SubtitleCue } from "../types/models";
@@ -34,6 +37,7 @@ const PROCESSING_PHASES = new Set<JobPhase>([
 const FRAME_STEP_MS = 40; // 1 frame @ 25fps
 const LARGE_JUMP_MS = 1000; // 1 second jump
 const MIN_SPLIT_MARGIN_MS = 80;
+const WAVEFORM_TARGET_BUCKETS = 2000;
 
 interface TrackState {
   mp3: { muted: boolean; locked: boolean };
@@ -108,74 +112,6 @@ function findCueForTime(
   return best ?? cueList[0];
 }
 
-function decodeBase64ToBytes(base64: string): Uint8Array {
-  const binary = atob(base64);
-  const bytes = new Uint8Array(binary.length);
-  for (let i = 0; i < binary.length; i += 1) {
-    bytes[i] = binary.charCodeAt(i);
-  }
-  return bytes;
-}
-
-/** Extracts 99th-percentile normalized acoustic amplitude buckets from an AudioBuffer. */
-function extractAudioPeaks(
-  buffer: AudioBuffer,
-  bucketCount = 6400,
-): Float32Array {
-  const totalSamples = buffer.length;
-  if (totalSamples === 0 || bucketCount <= 0 || buffer.numberOfChannels === 0) {
-    return new Float32Array(0);
-  }
-
-  const channels: Float32Array[] = [];
-  for (let c = 0; c < buffer.numberOfChannels; c += 1) {
-    channels.push(buffer.getChannelData(c));
-  }
-
-  const count = Math.min(bucketCount, totalSamples);
-  const raw = new Float32Array(count);
-
-  for (let b = 0; b < count; b += 1) {
-    const start = Math.floor((b / count) * totalSamples);
-    const end = Math.max(
-      start + 1,
-      Math.floor(((b + 1) / count) * totalSamples),
-    );
-    const step = Math.max(1, Math.floor((end - start) / 64));
-
-    let peak = 0;
-    let sumSq = 0;
-    let samples = 0;
-    for (let i = start; i < end; i += step) {
-      let s = 0;
-      for (let c = 0; c < channels.length; c += 1) {
-        const v = Math.abs(channels[c][i] ?? 0);
-        if (v > s) s = v;
-      }
-      if (s > peak) peak = s;
-      sumSq += s * s;
-      samples += 1;
-    }
-
-    const rms = samples > 0 ? Math.sqrt(sumSq / samples) : 0;
-    raw[b] = 0.55 * peak + 0.45 * rms;
-  }
-
-  const sorted = Float32Array.from(raw).sort();
-  const p99Idx = Math.min(
-    sorted.length - 1,
-    Math.floor(sorted.length * 0.99),
-  );
-  const scale = sorted[p99Idx] > 0.005 ? sorted[p99Idx] : 1;
-
-  const out = new Float32Array(count);
-  for (let b = 0; b < count; b += 1) {
-    out[b] =
-      raw[b] > 0.002 ? Math.min(1, Math.max(0.02, raw[b] / scale)) : 0.02;
-  }
-  return out;
-}
-
 function buildDemoWavBuffer(
   durationMs: number,
   cues: SubtitleCue[],
@@ -232,6 +168,8 @@ function buildDemoWavBuffer(
 
 export function WaveformTimeline() {
   const config = useAppStore((s) => s.config);
+  const batchQueue = useAppStore((s) => s.batchQueue);
+  const activeJobId = useAppStore((s) => s.activeJobId);
   const activeProject = useAppStore((s) => s.activeProject);
   const activeCueId = useAppStore((s) => s.activeCueId);
   const jobOptions = useAppStore((s) => s.jobOptions);
@@ -252,6 +190,23 @@ export function WaveformTimeline() {
   const lang = normalizeUiLanguage(config.uiLanguage);
   const t = getDictionary(lang);
 
+  const selectedQueueItem = useMemo(
+    () =>
+      activeJobId
+        ? (batchQueue.find((q) => q.jobId === activeJobId) ?? null)
+        : null,
+    [batchQueue, activeJobId],
+  );
+
+  const mediaState = useMemo(
+    () => resolveTimelineMediaState({ activeProject, selectedQueueItem }),
+    [activeProject, selectedQueueItem],
+  );
+  const { hasLoadedProjectOrFile, hasAudioSource, audioPath, audioFileName } =
+    mediaState;
+  const hasLoadedRef = useRef(hasLoadedProjectOrFile);
+  hasLoadedRef.current = hasLoadedProjectOrFile;
+
   const [zoomPct, setZoomPct] = useState(MIN_TIMELINE_ZOOM_PCT);
   const zoomPctRef = useRef(zoomPct);
   zoomPctRef.current = zoomPct;
@@ -261,8 +216,10 @@ export function WaveformTimeline() {
     cursorX: number;
   } | null>(null);
   const [isPlaying, setIsPlaying] = useState(false);
+  const isPlayingRef = useRef(isPlaying);
+  isPlayingRef.current = isPlaying;
   const [playheadMs, setPlayheadMs] = useState(0);
-  const [audioBlobUrl, setAudioBlobUrl] = useState<string>("");
+  const [audioSrcUrl, setAudioSrcUrl] = useState<string>("");
   const [liveAudioDurationMs, setLiveAudioDurationMs] = useState(0);
   const [waveformVersion, setWaveformVersion] = useState(0);
   const [viewportWidth, setViewportWidth] = useState(1000);
@@ -274,15 +231,15 @@ export function WaveformTimeline() {
   });
 
   const audioRef = useRef<HTMLAudioElement | null>(null);
-  const audioRawBytesRef = useRef<ArrayBuffer | null>(null);
   const audioPeaksRef = useRef<Float32Array | null>(null);
   const webAudioCtxRef = useRef<AudioContext | null>(null);
+  const webAudioBufferRef = useRef<AudioBuffer | null>(null);
   const webAudioSourceRef = useRef<AudioBufferSourceNode | null>(null);
   const webAudioGainRef = useRef<GainNode | null>(null);
-  const webAudioBufferRef = useRef<AudioBuffer | null>(null);
   const loadDecodePromiseRef = useRef<Promise<AudioBuffer | null> | null>(null);
   const webAudioStartCtxTimeRef = useRef(0);
   const webAudioStartOffsetSecRef = useRef(0);
+  const webAudioRequestIdRef = useRef(0);
 
   const viewportRef = useRef<HTMLDivElement | null>(null);
   const contentRef = useRef<HTMLDivElement | null>(null);
@@ -298,6 +255,7 @@ export function WaveformTimeline() {
   const lastResetJobIdRef = useRef<string | null>(null);
   const lastResetPhaseRef = useRef<JobPhase | null>(null);
   const lastResetCueCountRef = useRef<number>(0);
+  const lastHandledPlaybackRequestRef = useRef<typeof playbackRequest>(null);
 
   const cues = activeProject?.cues ?? [];
   const cuesRef = useRef(cues);
@@ -311,27 +269,34 @@ export function WaveformTimeline() {
     () => cues.reduce((max, c) => Math.max(max, c.endMs), 0),
     [cues],
   );
-  const actualAudioDurationMs = useMemo(
-    () =>
-      liveAudioDurationMs > 0
-        ? liveAudioDurationMs
-        : Math.max(activeProject?.durationMs ?? 0, maxCueEndMs, 1000),
-    [liveAudioDurationMs, activeProject?.durationMs, maxCueEndMs],
-  );
-  const audioEndMs = useMemo(
-    () =>
-      Math.max(
-        activeProject?.durationMs ?? 0,
-        liveAudioDurationMs,
-        maxCueEndMs,
-        1000,
-      ),
-    [activeProject?.durationMs, liveAudioDurationMs, maxCueEndMs],
-  );
-  const totalMs = useMemo(
-    () => Math.max(Math.round(audioEndMs * 1.04), maxCueEndMs + 500, 1000),
-    [audioEndMs, maxCueEndMs],
-  );
+  const actualAudioDurationMs = useMemo(() => {
+    if (!hasLoadedProjectOrFile) return 0;
+    if (liveAudioDurationMs > 0) return liveAudioDurationMs;
+    return Math.max(activeProject?.durationMs ?? 0, maxCueEndMs, 1000);
+  }, [
+    hasLoadedProjectOrFile,
+    liveAudioDurationMs,
+    activeProject?.durationMs,
+    maxCueEndMs,
+  ]);
+  const audioEndMs = useMemo(() => {
+    if (!hasLoadedProjectOrFile) return 0;
+    return Math.max(
+      activeProject?.durationMs ?? 0,
+      liveAudioDurationMs,
+      maxCueEndMs,
+      1000,
+    );
+  }, [
+    hasLoadedProjectOrFile,
+    activeProject?.durationMs,
+    liveAudioDurationMs,
+    maxCueEndMs,
+  ]);
+  const totalMs = useMemo(() => {
+    if (!hasLoadedProjectOrFile) return 0;
+    return Math.max(Math.round(audioEndMs * 1.04), maxCueEndMs + 500, 1000);
+  }, [hasLoadedProjectOrFile, audioEndMs, maxCueEndMs]);
 
   const audioEndMsRef = useRef(audioEndMs);
   audioEndMsRef.current = audioEndMs;
@@ -341,88 +306,210 @@ export function WaveformTimeline() {
     return cues.find((c) => c.id === activeCueId) ?? null;
   }, [cues, activeCueId]);
 
-  const stopWebAudio = useCallback(() => {
-    if (webAudioSourceRef.current) {
+  const ensureAudioContext = useCallback((): AudioContext | null => {
+    if (typeof AudioContext === "undefined") {
+      return null;
+    }
+    if (!webAudioCtxRef.current || webAudioCtxRef.current.state === "closed") {
+      webAudioCtxRef.current = new AudioContext();
+    }
+    return webAudioCtxRef.current;
+  }, []);
+
+  const stopWebAudioSource = useCallback((invalidatePending = true) => {
+    if (invalidatePending) {
+      webAudioRequestIdRef.current += 1;
+    }
+    const src = webAudioSourceRef.current;
+    if (src) {
+      src.onended = null;
       try {
-        webAudioSourceRef.current.stop();
-        webAudioSourceRef.current.disconnect();
+        src.stop();
       } catch {
-        // Ignore already stopped source
+        // Ignore stop errors if already ended
+      }
+      try {
+        src.disconnect();
+      } catch {
+        // Ignore disconnect errors
       }
       webAudioSourceRef.current = null;
     }
+    if (webAudioGainRef.current) {
+      try {
+        webAudioGainRef.current.disconnect();
+      } catch {
+        // Ignore disconnect errors
+      }
+      webAudioGainRef.current = null;
+    }
   }, []);
 
-  // Load real audio bytes and decode PCM AudioBuffer for sample-accurate playback & waveform
+  const startWebAudioAtOffset = useCallback(
+    async (offsetSec: number): Promise<boolean> => {
+      const reqId = ++webAudioRequestIdRef.current;
+      let buf = webAudioBufferRef.current;
+      if (!buf && loadDecodePromiseRef.current) {
+        buf = await loadDecodePromiseRef.current;
+        if (reqId !== webAudioRequestIdRef.current || !isPlayingRef.current) {
+          return false;
+        }
+      }
+      if (!buf || buf.duration <= 0) {
+        return false;
+      }
+
+      const ctx = ensureAudioContext();
+      if (!ctx) {
+        return false;
+      }
+      if (ctx.state === "suspended") {
+        try {
+          await ctx.resume();
+        } catch {
+          // Proceed and attempt playback
+        }
+        if (reqId !== webAudioRequestIdRef.current || !isPlayingRef.current) {
+          return false;
+        }
+      }
+
+      stopWebAudioSource(false);
+      const source = ctx.createBufferSource();
+      source.buffer = buf;
+      const gain = ctx.createGain();
+      gain.gain.value = tracksRef.current.mp3.muted ? 0 : 1;
+      source.connect(gain);
+      gain.connect(ctx.destination);
+
+      const safeOffset = Math.max(
+        0,
+        Math.min(Math.max(0, buf.duration - 0.005), offsetSec),
+      );
+      webAudioSourceRef.current = source;
+      webAudioGainRef.current = gain;
+      webAudioStartCtxTimeRef.current = ctx.currentTime;
+      webAudioStartOffsetSecRef.current = safeOffset;
+      source.onended = () => {
+        if (webAudioSourceRef.current === source) {
+          webAudioSourceRef.current = null;
+        }
+      };
+      source.start(0, safeOffset);
+      return true;
+    },
+    [ensureAudioContext, stopWebAudioSource],
+  );
+
+  // BUG-M2: Ensure any AudioContext instance and active source are closed on unmount
+  useEffect(() => {
+    return () => {
+      stopWebAudioSource();
+      if (webAudioCtxRef.current) {
+        void webAudioCtxRef.current.close().catch(() => {});
+        webAudioCtxRef.current = null;
+      }
+    };
+  }, [stopWebAudioSource]);
+
+  // Workstream 6 + SEC-H1: Load lightweight Rust waveform peaks + zero-Base64 binary Web Audio / blob playback
   useEffect(() => {
     let active = true;
-    let createdUrl = "";
+    let createdBlobUrl = "";
 
-    stopWebAudio();
+    stopWebAudioSource();
     webAudioBufferRef.current = null;
-    audioRawBytesRef.current = null;
-    audioPeaksRef.current = null;
     loadDecodePromiseRef.current = null;
+    audioPeaksRef.current = null;
     setLiveAudioDurationMs(0);
-    setAudioBlobUrl("");
+    setAudioSrcUrl("");
     setWaveformVersion((v) => v + 1);
 
-    const path = activeProject?.audioPath?.trim() ?? "";
-    if (!path || /\.(srt|vtt)$/i.test(path)) {
+    if (!hasAudioSource || !audioPath) {
       return;
     }
 
-    const isDemoProject =
-      !isTauriRuntime() || activeProject?.jobId === "demo-session-01";
-
-    const loadPromise = (async (): Promise<AudioBuffer | null> => {
-      let rawBuf: ArrayBuffer | null = null;
+    const decodeIntoWebAudio = async (
+      rawBuf: ArrayBuffer,
+    ): Promise<AudioBuffer | null> => {
+      const ctx = ensureAudioContext();
+      if (!ctx) return null;
       try {
-        const preview = await readAudioPreviewBase64(path);
-        if (!active) return null;
-        const bytes = decodeBase64ToBytes(preview.base64Data);
-        rawBuf = bytes.buffer.slice(
-          bytes.byteOffset,
-          bytes.byteOffset + bytes.byteLength,
-        ) as ArrayBuffer;
-        audioRawBytesRef.current = rawBuf;
-        const blob = new Blob([rawBuf], { type: preview.mimeType });
-        createdUrl = URL.createObjectURL(blob);
-        setAudioBlobUrl(createdUrl);
-      } catch {
-        if (!active) return null;
-        if (isDemoProject) {
-          rawBuf = buildDemoWavBuffer(
-            audioEndMsRef.current,
-            cuesRef.current,
-          );
-          audioRawBytesRef.current = rawBuf;
-          const blob = new Blob([rawBuf], { type: "audio/wav" });
-          createdUrl = URL.createObjectURL(blob);
-          setAudioBlobUrl(createdUrl);
-        }
-      }
-
-      if (!active || !rawBuf || typeof AudioContext === "undefined") {
-        return null;
-      }
-
-      try {
-        if (!webAudioCtxRef.current) {
-          webAudioCtxRef.current = new AudioContext();
-        }
-        const decoded = await webAudioCtxRef.current.decodeAudioData(
-          rawBuf.slice(0),
-        );
+        const decoded = await ctx.decodeAudioData(rawBuf.slice(0));
         if (!active) return null;
         webAudioBufferRef.current = decoded;
         if (decoded.duration > 0) {
-          setLiveAudioDurationMs(Math.round(decoded.duration * 1000));
+          const decodedMs = Math.round(decoded.duration * 1000);
+          setLiveAudioDurationMs((prev) => (prev > 0 ? prev : decodedMs));
         }
-        audioPeaksRef.current = extractAudioPeaks(decoded, 6400);
-        setWaveformVersion((v) => v + 1);
         return decoded;
-      } catch {
+      } catch (err) {
+        console.warn("[WaveformTimeline] Web Audio decodeAudioData failed", err);
+        return null;
+      }
+    };
+
+    const loadPromise = (async (): Promise<AudioBuffer | null> => {
+      try {
+        const preview = await prepareAudioWaveform(
+          audioPath,
+          WAVEFORM_TARGET_BUCKETS,
+        );
+        if (!active) return null;
+
+        audioPeaksRef.current = Float32Array.from(preview.peaks);
+        if (preview.durationMs > 0) {
+          setLiveAudioDurationMs(preview.durationMs);
+        }
+        setWaveformVersion((v) => v + 1);
+
+        if (isTauriRuntime()) {
+          try {
+            const rawBuf = await readAudioPlaybackBytes(preview.canonicalPath);
+            if (!active) return null;
+            const mimeType = inferAudioMimeType(preview.canonicalPath, rawBuf);
+            const blob = new Blob([rawBuf], { type: mimeType });
+            createdBlobUrl = URL.createObjectURL(blob);
+            setAudioSrcUrl(createdBlobUrl);
+            return await decodeIntoWebAudio(rawBuf);
+          } catch (err) {
+            if (!active) return null;
+            console.warn(
+              "[WaveformTimeline] Binary playback fallback triggered",
+              err,
+            );
+            const assetUrl = convertFileSrc(preview.canonicalPath);
+            if (!assetUrl.startsWith("asset://")) {
+              setAudioSrcUrl(assetUrl);
+            }
+            return null;
+          }
+        }
+
+        const rawBuf = buildDemoWavBuffer(
+          preview.durationMs || audioEndMsRef.current || 24000,
+          cuesRef.current,
+        );
+        const blob = new Blob([rawBuf], { type: "audio/wav" });
+        createdBlobUrl = URL.createObjectURL(blob);
+        setAudioSrcUrl(createdBlobUrl);
+        return await decodeIntoWebAudio(rawBuf);
+      } catch (err) {
+        if (!active) return null;
+        console.warn(
+          "[WaveformTimeline] Waveform/audio preparation failed",
+          err,
+        );
+        if (!isTauriRuntime()) {
+          const rawBuf = buildDemoWavBuffer(
+            audioEndMsRef.current || 24000,
+            cuesRef.current,
+          );
+          const blob = new Blob([rawBuf], { type: "audio/wav" });
+          createdBlobUrl = URL.createObjectURL(blob);
+          setAudioSrcUrl(createdBlobUrl);
+          return await decodeIntoWebAudio(rawBuf);
+        }
         return null;
       }
     })();
@@ -431,29 +518,30 @@ export function WaveformTimeline() {
 
     return () => {
       active = false;
-      loadDecodePromiseRef.current = null;
-      stopWebAudio();
-      if (createdUrl) {
-        URL.revokeObjectURL(createdUrl);
+      stopWebAudioSource();
+      if (createdBlobUrl) {
+        URL.revokeObjectURL(createdBlobUrl);
       }
     };
-  }, [activeProject?.jobId, activeProject?.audioPath, stopWebAudio]);
+  }, [hasAudioSource, audioPath, ensureAudioContext, stopWebAudioSource]);
 
-  // Sync mute state onto <audio> and Web Audio gain
+  // Sync mute state onto both <audio> and Web Audio GainNode
   useEffect(() => {
     if (audioRef.current) {
       audioRef.current.muted = tracks.mp3.muted;
     }
-    if (webAudioGainRef.current && webAudioCtxRef.current) {
-      webAudioGainRef.current.gain.setValueAtTime(
-        tracks.mp3.muted ? 0 : 1,
-        webAudioCtxRef.current.currentTime,
-      );
+    if (webAudioGainRef.current) {
+      webAudioGainRef.current.gain.value = tracks.mp3.muted ? 0 : 1;
     }
   }, [tracks.mp3.muted]);
 
   const seekPlayhead = useCallback(
     (ms: number, syncCue = true) => {
+      if (!hasLoadedRef.current) {
+        playheadRef.current = 0;
+        setPlayheadMs(0);
+        return;
+      }
       const clamped = Math.max(0, Math.min(audioEndMsRef.current, ms));
       playheadRef.current = clamped;
       setPlayheadMs(clamped);
@@ -467,7 +555,16 @@ export function WaveformTimeline() {
         }
       }
 
-      if (audioRef.current && audioBlobUrl) {
+      if (
+        isPlayingRef.current &&
+        hasAudioSource &&
+        webAudioBufferRef.current &&
+        webAudioSourceRef.current
+      ) {
+        void startWebAudioAtOffset(clamped / 1000);
+      }
+
+      if (audioRef.current && audioSrcUrl) {
         try {
           if (
             !Number.isFinite(audioRef.current.duration) ||
@@ -479,37 +576,14 @@ export function WaveformTimeline() {
           // Ignore seek errors before metadata
         }
       }
-
-      // If Web Audio fallback is actively playing, restart buffer from new offset
-      if (webAudioSourceRef.current && webAudioBufferRef.current) {
-        const startOffsetSec = Math.max(
-          0,
-          Math.min(
-            webAudioBufferRef.current.duration - 0.01,
-            clamped / 1000,
-          ),
-        );
-        stopWebAudio();
-        const ctx = webAudioCtxRef.current;
-        const gain = webAudioGainRef.current;
-        if (ctx && gain) {
-          const src = ctx.createBufferSource();
-          src.buffer = webAudioBufferRef.current;
-          src.connect(gain);
-          webAudioStartCtxTimeRef.current = ctx.currentTime;
-          webAudioStartOffsetSecRef.current = startOffsetSec;
-          src.start(0, startOffsetSec);
-          webAudioSourceRef.current = src;
-        }
-      }
     },
-    [audioBlobUrl, setActiveCueId, stopWebAudio],
+    [audioSrcUrl, hasAudioSource, setActiveCueId, startWebAudioAtOffset],
   );
 
-  // When switching projects, stop playback and position playhead on active/first cue start
+  // When switching projects or clearing to empty state, stop playback & reset playhead
   useEffect(() => {
-    const currentJobId = activeProject?.jobId ?? null;
-    const currentPhase = activeProject?.phase ?? null;
+    const currentJobId = activeProject?.jobId ?? selectedQueueItem?.jobId ?? null;
+    const currentPhase = activeProject?.phase ?? selectedQueueItem?.phase ?? null;
     const prevJobId = lastResetJobIdRef.current;
     const prevPhase = lastResetPhaseRef.current;
     const prevCueCount = lastResetCueCountRef.current;
@@ -533,7 +607,7 @@ export function WaveformTimeline() {
     if (jobChanged || completedNow) {
       setIsPlaying(false);
       segmentEndMsRef.current = null;
-      stopWebAudio();
+      stopWebAudioSource();
       if (audioRef.current) {
         audioRef.current.pause();
         try {
@@ -570,29 +644,48 @@ export function WaveformTimeline() {
   }, [
     activeProject?.jobId,
     activeProject?.phase,
+    selectedQueueItem?.jobId,
+    selectedQueueItem?.phase,
     cues.length,
     setActiveCueId,
-    stopWebAudio,
+    stopWebAudioSource,
   ]);
 
   // Handle external playbackRequest (e.g. playCueSegment)
   useEffect(() => {
-    if (!playbackRequest) return;
+    if (
+      !playbackRequest ||
+      !hasLoadedProjectOrFile ||
+      lastHandledPlaybackRequestRef.current === playbackRequest
+    ) {
+      return;
+    }
+    lastHandledPlaybackRequestRef.current = playbackRequest;
+    const ctx = ensureAudioContext();
+    if (ctx && ctx.state === "suspended") {
+      void ctx.resume().catch(() => {});
+    }
     segmentEndMsRef.current = playbackRequest.endMs;
     activeCueIdRef.current = playbackRequest.cueId;
     setActiveCueId(playbackRequest.cueId);
     seekPlayhead(playbackRequest.startMs, false);
     setIsPlaying(true);
-  }, [playbackRequest, seekPlayhead, setActiveCueId]);
+  }, [
+    playbackRequest,
+    hasLoadedProjectOrFile,
+    ensureAudioContext,
+    seekPlayhead,
+    setActiveCueId,
+  ]);
 
-  // Playback loop (<audio> blob primary + Web Audio API fallback + rAF clock)
+  // Playback loop (Web Audio primary + blob/<audio> fallback + rAF clock fallback)
   useEffect(() => {
-    if (!isPlaying) {
+    if (!isPlaying || !hasLoadedProjectOrFile) {
       if (rafIdRef.current !== null) {
         window.cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;
       }
-      stopWebAudio();
+      stopWebAudioSource();
       if (audioRef.current && !audioRef.current.paused) {
         audioRef.current.pause();
       }
@@ -600,7 +693,7 @@ export function WaveformTimeline() {
     }
 
     let cancelled = false;
-    let clockSource: "audio" | "webaudio" | "raf" = "raf";
+    let clockSource: "webaudio" | "audio" | "raf" = "raf";
 
     const syncEditorToPlayhead = (ms: number) => {
       const matched = findCueForTime(cuesRef.current, ms, false);
@@ -625,18 +718,24 @@ export function WaveformTimeline() {
       const tick = (now: number) => {
         if (cancelled) return;
 
+        const dt = Math.max(0, now - lastRafTickRef.current);
+        lastRafTickRef.current = now;
+
         let nextMs: number;
-        if (clockSource === "audio" && audioRef.current) {
+        if (
+          clockSource === "webaudio" &&
+          webAudioCtxRef.current &&
+          webAudioSourceRef.current
+        ) {
+          const elapsedSec = Math.max(
+            0,
+            webAudioCtxRef.current.currentTime -
+              webAudioStartCtxTimeRef.current,
+          );
+          nextMs = (webAudioStartOffsetSecRef.current + elapsedSec) * 1000;
+        } else if (clockSource === "audio" && audioRef.current) {
           nextMs = audioRef.current.currentTime * 1000;
-        } else if (clockSource === "webaudio" && webAudioCtxRef.current) {
-          nextMs =
-            (webAudioStartOffsetSecRef.current +
-              (webAudioCtxRef.current.currentTime -
-                webAudioStartCtxTimeRef.current)) *
-            1000;
         } else {
-          const dt = Math.max(0, now - lastRafTickRef.current);
-          lastRafTickRef.current = now;
           nextMs = playheadRef.current + dt;
         }
 
@@ -651,7 +750,7 @@ export function WaveformTimeline() {
           setPlayheadMs(limit);
           syncEditorToPlayhead(limit);
           segmentEndMsRef.current = null;
-          stopWebAudio();
+          stopWebAudioSource();
           if (audioRef.current && !audioRef.current.paused) {
             audioRef.current.pause();
           }
@@ -668,72 +767,13 @@ export function WaveformTimeline() {
       rafIdRef.current = window.requestAnimationFrame(tick);
     };
 
-    const startWebAudioPrimary = async (): Promise<boolean> => {
-      if (typeof AudioContext === "undefined") {
-        return false;
-      }
-      try {
-        if (!webAudioCtxRef.current) {
-          webAudioCtxRef.current = new AudioContext();
-        }
-        const ctx = webAudioCtxRef.current;
-        if (ctx.state === "suspended") {
-          await ctx.resume();
-        }
-        if (!webAudioGainRef.current) {
-          const gain = ctx.createGain();
-          gain.connect(ctx.destination);
-          webAudioGainRef.current = gain;
-        }
-        webAudioGainRef.current.gain.setValueAtTime(
-          tracksRef.current.mp3.muted ? 0 : 1,
-          ctx.currentTime,
-        );
-
-        let buffer = webAudioBufferRef.current;
-        if (!buffer && loadDecodePromiseRef.current) {
-          buffer = await loadDecodePromiseRef.current;
-        }
-        if (cancelled) return false;
-        if (!buffer && audioRawBytesRef.current) {
-          buffer = await ctx.decodeAudioData(audioRawBytesRef.current.slice(0));
-          if (cancelled) return false;
-          webAudioBufferRef.current = buffer;
-          if (buffer.duration > 0) {
-            setLiveAudioDurationMs(Math.round(buffer.duration * 1000));
-          }
-          if (!audioPeaksRef.current) {
-            audioPeaksRef.current = extractAudioPeaks(buffer, 6400);
-            setWaveformVersion((v) => v + 1);
-          }
-        }
-        if (!buffer || cancelled) return false;
-
-        stopWebAudio();
-        const offsetSec = Math.max(
-          0,
-          Math.min(
-            Math.max(0, buffer.duration - 0.02),
-            playheadRef.current / 1000,
-          ),
-        );
-        const src = ctx.createBufferSource();
-        src.buffer = buffer;
-        src.connect(webAudioGainRef.current);
-        webAudioStartCtxTimeRef.current = ctx.currentTime;
-        webAudioStartOffsetSecRef.current = offsetSec;
-        src.start(0, offsetSec);
-        webAudioSourceRef.current = src;
-        return true;
-      } catch {
-        return false;
-      }
-    };
-
-    const runAudioFallback = () => {
+    const runAudioElementFallback = () => {
       const audioEl = audioRef.current;
-      if (audioBlobUrl && audioEl && !audioEl.error) {
+      if (hasAudioSource && audioSrcUrl && audioEl && !audioEl.error) {
         try {
+          if (audioEl.readyState === 0) {
+            audioEl.load();
+          }
           audioEl.currentTime = playheadRef.current / 1000;
           audioEl.muted = tracksRef.current.mp3.muted;
           const playPromise = audioEl.play();
@@ -745,7 +785,8 @@ export function WaveformTimeline() {
                   startClock();
                 }
               })
-              .catch(() => {
+              .catch((err) => {
+                console.warn("[WaveformTimeline] <audio> play() failed", err);
                 if (!cancelled) {
                   clockSource = "raf";
                   startClock();
@@ -756,71 +797,90 @@ export function WaveformTimeline() {
           clockSource = "audio";
           startClock();
           return;
-        } catch {
-          // Fall through to rAF clock
+        } catch (err) {
+          console.warn("[WaveformTimeline] <audio> playback threw", err);
         }
       }
       clockSource = "raf";
       startClock();
     };
 
-    void startWebAudioPrimary().then((ok) => {
-      if (cancelled) return;
-      if (ok) {
-        clockSource = "webaudio";
-        startClock();
-      } else {
-        runAudioFallback();
-      }
-    });
+    if (hasAudioSource) {
+      void startWebAudioAtOffset(playheadRef.current / 1000).then((ok) => {
+        if (cancelled) {
+          if (ok) {
+            stopWebAudioSource();
+          }
+          return;
+        }
+        if (ok) {
+          clockSource = "webaudio";
+          startClock();
+        } else {
+          runAudioElementFallback();
+        }
+      });
+    } else {
+      clockSource = "raf";
+      startClock();
+    }
 
     return () => {
       cancelled = true;
-      stopWebAudio();
       if (rafIdRef.current !== null) {
         window.cancelAnimationFrame(rafIdRef.current);
         rafIdRef.current = null;
       }
+      stopWebAudioSource();
+      if (audioRef.current && !audioRef.current.paused) {
+        audioRef.current.pause();
+      }
     };
   }, [
     isPlaying,
-    audioBlobUrl,
+    hasLoadedProjectOrFile,
+    hasAudioSource,
+    audioSrcUrl,
     activeProject?.durationMs,
     setActiveCueId,
-    stopWebAudio,
+    startWebAudioAtOffset,
+    stopWebAudioSource,
   ]);
 
   const togglePlayTimeline = useCallback(() => {
+    if (!hasLoadedRef.current) return;
     if (isPlaying) {
       segmentEndMsRef.current = null;
       setIsPlaying(false);
       return;
     }
+    const ctx = ensureAudioContext();
+    if (ctx && ctx.state === "suspended") {
+      void ctx.resume().catch(() => {});
+    }
     segmentEndMsRef.current = null;
     if (playheadRef.current >= audioEndMsRef.current) {
       seekPlayhead(0, true);
     }
-    // Kick user-gesture audio unlock synchronously inside click/Space handler
-    if (webAudioCtxRef.current?.state === "suspended") {
-      void webAudioCtxRef.current.resume().catch(() => {});
-    }
-    if (audioRef.current && audioBlobUrl && !audioRef.current.error) {
+    if (audioRef.current && audioSrcUrl && !audioRef.current.error) {
       audioRef.current.muted = tracksRef.current.mp3.muted;
     }
     setIsPlaying(true);
-  }, [isPlaying, audioBlobUrl, seekPlayhead]);
+  }, [isPlaying, audioSrcUrl, ensureAudioContext, seekPlayhead]);
 
   const playFromStart = useCallback(() => {
+    if (!hasLoadedRef.current) return;
+    const ctx = ensureAudioContext();
+    if (ctx && ctx.state === "suspended") {
+      void ctx.resume().catch(() => {});
+    }
     segmentEndMsRef.current = null;
     seekPlayhead(0, true);
-    if (webAudioCtxRef.current?.state === "suspended") {
-      void webAudioCtxRef.current.resume().catch(() => {});
-    }
-    if (audioRef.current && audioBlobUrl && !audioRef.current.error) {
+    if (audioRef.current && audioSrcUrl && !audioRef.current.error) {
       audioRef.current.muted = tracksRef.current.mp3.muted;
     }
     setIsPlaying(true);
-  }, [audioBlobUrl, seekPlayhead]);
+  }, [audioSrcUrl, ensureAudioContext, seekPlayhead]);
 
   const stopTimeline = useCallback(() => {
     segmentEndMsRef.current = null;
@@ -845,11 +905,14 @@ export function WaveformTimeline() {
     return () => window.removeEventListener("resize", updateSize);
   }, []);
 
-  // Mouse-wheel zoom (scroll up = zoom in, scroll down = zoom out, up to 2000%, cursor-anchored; Shift+wheel = horizontal pan)
+  // Mouse-wheel zoom (disabled on empty startup state)
   useEffect(() => {
     const vp = viewportRef.current;
     if (!vp) return;
     const handleWheel = (e: WheelEvent) => {
+      if (!hasLoadedRef.current) {
+        return;
+      }
       if (Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
         return;
       }
@@ -905,11 +968,11 @@ export function WaveformTimeline() {
     );
   }, [zoomPct]);
 
-  // Draw HiDPI MP3 Waveform Canvas (clamped to 16384px WebView backing store limit)
+  // Draw HiDPI Waveform Canvas from real Rust peaks only (zero fake procedural waves on empty/subtitle-only states)
   const drawWaveform = useCallback(() => {
     const canvas = canvasRef.current;
     const parent = mp3ClipRef.current;
-    if (!canvas || !parent) return;
+    if (!canvas || !parent || !hasAudioSource) return;
 
     const rect = parent.getBoundingClientRect();
     const width = Math.max(1, Math.floor(rect.width));
@@ -930,84 +993,52 @@ export function WaveformTimeline() {
     ctx.fillStyle = "rgba(56, 189, 248, 0.14)";
     ctx.fillRect(0, midY - 0.5, width, 1);
 
-    const stepX = 3;
-    const barW = 2;
-    const maxHalf = Math.max(4, height * 0.41);
-    const words = activeProject?.words ?? [];
     const peaks = audioPeaksRef.current;
-
-    if (peaks && peaks.length > 0) {
-      for (let x = 2; x < width - 2; x += stepX) {
-        const frac0 = x / width;
-        const frac1 = (x + stepX) / width;
-        const b0 = Math.max(0, Math.floor(frac0 * peaks.length));
-        const b1 = Math.min(
-          peaks.length,
-          Math.max(b0 + 1, Math.floor(frac1 * peaks.length)),
-        );
-
-        let amp = 0;
-        for (let b = b0; b < b1; b += 1) {
-          if (peaks[b] > amp) {
-            amp = peaks[b];
-          }
-        }
-
-        const tMs = frac0 * actualAudioDurationMs;
-        const inCue = cues.some((c) => tMs >= c.startMs && tMs <= c.endMs);
-        ctx.fillStyle = inCue
-          ? "rgba(56, 189, 248, 0.85)"
-          : "rgba(56, 189, 248, 0.42)";
-
-        const barH = Math.max(2, amp * maxHalf * 2);
-        ctx.fillRect(x, midY - barH / 2, barW, barH);
-      }
+    if (!peaks || peaks.length === 0) {
       return;
     }
 
-    for (let x = 2; x < width - 2; x += stepX) {
-      const tMs = (x / width) * actualAudioDurationMs;
-      const activeWord =
-        words.length > 0
-          ? words.find((w) => tMs >= w.startMs && tMs <= w.endMs)
-          : undefined;
-      const activeSeg = cues.find((c) => tMs >= c.startMs && tMs <= c.endMs);
+    const stepX = 3;
+    const barW = 2;
+    const maxHalf = Math.max(4, height * 0.41);
 
-      let amp = 0.06;
-      if (activeWord || activeSeg) {
-        const spanStart = activeWord ? activeWord.startMs : activeSeg!.startMs;
-        const spanEnd = activeWord ? activeWord.endMs : activeSeg!.endMs;
-        const segId = activeSeg ? activeSeg.id : 1;
-        const segPos = (tMs - spanStart) / Math.max(1, spanEnd - spanStart);
-        const edgeFade = Math.sin(
-          Math.min(1, Math.min(segPos * 7, (1 - segPos) * 7)) * (Math.PI / 2),
-        );
-        const wave =
-          0.48 +
-          0.24 * Math.sin(tMs * 0.017 + segId * 1.7) +
-          0.18 * Math.cos(tMs * 0.043) +
-          0.1 * Math.sin(tMs * 0.097);
-        amp = Math.max(
-          0.14,
-          Math.min(0.95, wave * (0.45 + 0.55 * edgeFade)),
-        );
-        ctx.fillStyle = "rgba(56, 189, 248, 0.72)";
-      } else {
-        amp = 0.04 + 0.04 * Math.abs(Math.sin(tMs * 0.031));
-        ctx.fillStyle = "rgba(56, 189, 248, 0.24)";
+    for (let x = 2; x < width - 2; x += stepX) {
+      const frac0 = x / width;
+      const frac1 = (x + stepX) / width;
+      const b0 = Math.max(0, Math.floor(frac0 * peaks.length));
+      const b1 = Math.min(
+        peaks.length,
+        Math.max(b0 + 1, Math.floor(frac1 * peaks.length)),
+      );
+
+      let amp = 0;
+      for (let b = b0; b < b1; b += 1) {
+        if (peaks[b] > amp) {
+          amp = peaks[b];
+        }
       }
+
+      const tMs = frac0 * actualAudioDurationMs;
+      const inCue =
+        cues.length > 0 && cues.some((c) => tMs >= c.startMs && tMs <= c.endMs);
+      ctx.fillStyle =
+        cues.length === 0 || inCue
+          ? "rgba(56, 189, 248, 0.85)"
+          : "rgba(56, 189, 248, 0.42)";
 
       const barH = Math.max(2, amp * maxHalf * 2);
       ctx.fillRect(x, midY - barH / 2, barW, barH);
     }
-  }, [activeProject?.words, cues, actualAudioDurationMs, waveformVersion]);
+  }, [hasAudioSource, cues, actualAudioDurationMs, waveformVersion]);
 
   useEffect(() => {
+    if (!hasAudioSource) return;
     const id = window.requestAnimationFrame(drawWaveform);
     return () => window.cancelAnimationFrame(id);
-  }, [drawWaveform, zoomPct, viewportWidth]);
+  }, [hasAudioSource, drawWaveform, zoomPct, viewportWidth]);
 
   useEffect(() => {
+    if (!hasAudioSource) return;
     const clipEl = mp3ClipRef.current;
     if (!clipEl || typeof ResizeObserver === "undefined") return;
     const ro = new ResizeObserver(() => {
@@ -1015,9 +1046,9 @@ export function WaveformTimeline() {
     });
     ro.observe(clipEl);
     return () => ro.disconnect();
-  }, [drawWaveform]);
+  }, [hasAudioSource, drawWaveform]);
 
-  // Global keyboard shortcuts (Space, Shift+Space, C, Arrow frame/jump/segment, Alt+1/2, Ctrl+Z/Y)
+  // Global keyboard shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
       const st = useAppStore.getState();
@@ -1085,6 +1116,10 @@ export function WaveformTimeline() {
             });
           });
         }
+        return;
+      }
+
+      if (!hasLoadedRef.current) {
         return;
       }
 
@@ -1197,6 +1232,10 @@ export function WaveformTimeline() {
                   .find((c) => c.startMs < playheadRef.current) ?? list[0]);
         }
         if (target) {
+          const ctx = ensureAudioContext();
+          if (ctx && ctx.state === "suspended") {
+            void ctx.resume().catch(() => {});
+          }
           playCueSegment(target);
         }
       }
@@ -1205,6 +1244,7 @@ export function WaveformTimeline() {
     window.addEventListener("keydown", handleKeyDown);
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, [
+    ensureAudioContext,
     togglePlayTimeline,
     playFromStart,
     undoCueEdit,
@@ -1215,8 +1255,11 @@ export function WaveformTimeline() {
     seekPlayhead,
   ]);
 
-  // Compute adaptive ruler ticks & gridlines
+  // Compute adaptive ruler ticks & gridlines (empty when no project/file loaded)
   const rulerTicks = useMemo(() => {
+    if (!hasLoadedProjectOrFile || totalMs <= 0) {
+      return [];
+    }
     const contentWidthPx = viewportWidth * (zoomPct / 100);
     const pxPerSec = contentWidthPx / Math.max(0.1, totalMs / 1000);
     const majorSteps = [
@@ -1246,9 +1289,10 @@ export function WaveformTimeline() {
       });
     }
     return ticks;
-  }, [viewportWidth, zoomPct, totalMs]);
+  }, [hasLoadedProjectOrFile, viewportWidth, zoomPct, totalMs]);
 
   const scrubFromClientX = (clientX: number) => {
+    if (!hasLoadedProjectOrFile || totalMs <= 0) return;
     const contentEl = contentRef.current;
     if (!contentEl) return;
     const rect = contentEl.getBoundingClientRect();
@@ -1268,7 +1312,7 @@ export function WaveformTimeline() {
     trackKind: "original" | "prevod",
   ) => {
     e.stopPropagation();
-    if (tracks[trackKind].locked) return;
+    if (!hasLoadedProjectOrFile || tracks[trackKind].locked) return;
     const contentEl = contentRef.current;
     if (!contentEl) return;
 
@@ -1287,20 +1331,26 @@ export function WaveformTimeline() {
   };
 
   const moveTrimDrag = (e: React.PointerEvent<HTMLDivElement>) => {
-    if (!trimDrag) return;
+    if (!trimDrag || totalMs <= 0) return;
     e.stopPropagation();
     const dx = e.clientX - trimDrag.startClientX;
     const deltaMs = (dx / trimDrag.contentWidthPx) * totalMs;
     if (trimDrag.edge === "start") {
       const nextStart = Math.max(
         0,
-        Math.min(trimDrag.origEndMs - 200, Math.round(trimDrag.origStartMs + deltaMs)),
+        Math.min(
+          trimDrag.origEndMs - 200,
+          Math.round(trimDrag.origStartMs + deltaMs),
+        ),
       );
       setTrimDrag({ ...trimDrag, previewStartMs: nextStart });
     } else {
       const nextEnd = Math.min(
         totalMs,
-        Math.max(trimDrag.origStartMs + 200, Math.round(trimDrag.origEndMs + deltaMs)),
+        Math.max(
+          trimDrag.origStartMs + 200,
+          Math.round(trimDrag.origEndMs + deltaMs),
+        ),
       );
       setTrimDrag({ ...trimDrag, previewEndMs: nextEnd });
     }
@@ -1325,6 +1375,9 @@ export function WaveformTimeline() {
   };
 
   const renderClips = (kind: "original" | "prevod") => {
+    if (!hasLoadedProjectOrFile || totalMs <= 0 || tracks[kind].hidden) {
+      return null;
+    }
     return cues.map((cue) => {
       const isTrimming = trimDrag?.cueId === cue.id;
       const startMs = isTrimming ? trimDrag.previewStartMs : cue.startMs;
@@ -1384,14 +1437,14 @@ export function WaveformTimeline() {
   };
 
   const showHours = totalMs >= 3_600_000;
-  const playheadPct = Math.max(
-    0,
-    Math.min(100, (playheadMs / Math.max(1, totalMs)) * 100),
-  );
-  const mp3ClipPct = Math.max(
-    1,
-    Math.min(100, (actualAudioDurationMs / Math.max(1, totalMs)) * 100),
-  );
+  const playheadPct =
+    hasLoadedProjectOrFile && totalMs > 0
+      ? Math.max(0, Math.min(100, (playheadMs / totalMs) * 100))
+      : 0;
+  const mp3ClipPct =
+    hasAudioSource && totalMs > 0
+      ? Math.max(1, Math.min(100, (actualAudioDurationMs / totalMs) * 100))
+      : 0;
 
   const srcLangSub = (
     activeProject?.detectedLanguage ||
@@ -1415,15 +1468,19 @@ export function WaveformTimeline() {
     activeCue?.id === cues[cues.length - 1]?.id;
 
   return (
-    <section id="timeline-panel" aria-label="Timeline">
+    <section
+      id="timeline-panel"
+      className={hasLoadedProjectOrFile ? undefined : "tl-empty"}
+      aria-label="Timeline"
+    >
       <audio
         ref={audioRef}
-        src={audioBlobUrl || undefined}
-        preload="auto"
+        src={hasAudioSource && audioSrcUrl ? audioSrcUrl : undefined}
+        preload="metadata"
         onLoadedMetadata={(e) => {
           const el = e.currentTarget;
           if (Number.isFinite(el.duration) && el.duration > 0) {
-            if (!activeProject?.durationMs) {
+            if (!activeProject?.durationMs && liveAudioDurationMs <= 0) {
               setLiveAudioDurationMs(Math.round(el.duration * 1000));
             }
             if (Math.abs(el.currentTime * 1000 - playheadRef.current) > 80) {
@@ -1438,6 +1495,13 @@ export function WaveformTimeline() {
           segmentEndMsRef.current = null;
           setIsPlaying(false);
         }}
+        onError={(e) => {
+          console.warn(
+            "[WaveformTimeline] <audio> load error",
+            e.currentTarget.error?.code,
+            e.currentTarget.error?.message,
+          );
+        }}
         className="hidden"
       />
 
@@ -1447,6 +1511,7 @@ export function WaveformTimeline() {
             id="tl-btn-play"
             className={`tl-icon-btn${isPlaying ? " playing" : ""}`}
             type="button"
+            disabled={!hasLoadedProjectOrFile}
             title={
               lang === "en"
                 ? "Play / Pause (Space)"
@@ -1482,6 +1547,7 @@ export function WaveformTimeline() {
             id="tl-btn-stop"
             className="tl-icon-btn"
             type="button"
+            disabled={!hasLoadedProjectOrFile}
             title={
               lang === "en"
                 ? "Stop and return to start"
@@ -1496,11 +1562,15 @@ export function WaveformTimeline() {
 
           <div className="tl-timecode" id="tl-timecode">
             <span id="tl-tc-cur" className="tl-tc-cur">
-              {formatTimecode(playheadMs, showHours)}
+              {hasLoadedProjectOrFile
+                ? formatTimecode(playheadMs, showHours)
+                : "00:00:00.00"}
             </span>
             <span className="tl-tc-sep">/</span>
             <span className="tl-tc-tot">
-              {formatTimecode(audioEndMs, showHours)}
+              {hasLoadedProjectOrFile
+                ? formatTimecode(audioEndMs, showHours)
+                : "00:00:00.00"}
             </span>
           </div>
         </div>
@@ -1510,7 +1580,7 @@ export function WaveformTimeline() {
           <button
             type="button"
             className="tl-icon-btn"
-            disabled={!canUndo}
+            disabled={!hasLoadedProjectOrFile || !canUndo}
             onClick={undoCueEdit}
             title={t.table.undo}
           >
@@ -1519,7 +1589,7 @@ export function WaveformTimeline() {
           <button
             type="button"
             className="tl-icon-btn"
-            disabled={!canRedo}
+            disabled={!hasLoadedProjectOrFile || !canRedo}
             onClick={redoCueEdit}
             title={t.table.redo}
           >
@@ -1532,12 +1602,13 @@ export function WaveformTimeline() {
             type="button"
             className="tl-icon-btn"
             disabled={
-              !activeCue &&
-              !cues.some(
-                (c) =>
-                  playheadMs >= c.startMs + MIN_SPLIT_MARGIN_MS &&
-                  playheadMs <= c.endMs - MIN_SPLIT_MARGIN_MS,
-              )
+              !hasLoadedProjectOrFile ||
+              (!activeCue &&
+                !cues.some(
+                  (c) =>
+                    playheadMs >= c.startMs + MIN_SPLIT_MARGIN_MS &&
+                    playheadMs <= c.endMs - MIN_SPLIT_MARGIN_MS,
+                ))
             }
             onClick={() => {
               const markerCue = cues.find(
@@ -1546,7 +1617,10 @@ export function WaveformTimeline() {
                   playheadRef.current <= c.endMs - MIN_SPLIT_MARGIN_MS,
               );
               if (markerCue) {
-                splitCueAtMidpoint(markerCue.id, Math.round(playheadRef.current));
+                splitCueAtMidpoint(
+                  markerCue.id,
+                  Math.round(playheadRef.current),
+                );
               } else if (activeCue) {
                 splitCueAtMidpoint(activeCue.id);
               }
@@ -1558,7 +1632,7 @@ export function WaveformTimeline() {
           <button
             type="button"
             className="tl-icon-btn"
-            disabled={!activeCue || isLastCue}
+            disabled={!hasLoadedProjectOrFile || !activeCue || isLastCue}
             onClick={() => activeCue && mergeCueWithNext(activeCue.id)}
             title={t.table.mergeNext}
           >
@@ -1567,7 +1641,7 @@ export function WaveformTimeline() {
           <button
             type="button"
             className="tl-icon-btn add"
-            disabled={!activeProject}
+            disabled={!hasLoadedProjectOrFile || !activeProject}
             onClick={addCueAtEnd}
             title={t.table.addCue}
           >
@@ -1576,7 +1650,7 @@ export function WaveformTimeline() {
           <button
             type="button"
             className="tl-icon-btn danger"
-            disabled={!activeCue}
+            disabled={!hasLoadedProjectOrFile || !activeCue}
             onClick={() => activeCue && deleteCueById(activeCue.id)}
             title={t.table.deleteCue}
           >
@@ -1589,6 +1663,7 @@ export function WaveformTimeline() {
             id="tl-zoom-out"
             className="tl-zoom-btn"
             type="button"
+            disabled={!hasLoadedProjectOrFile}
             title={
               lang === "en"
                 ? "Zoom out (Mouse wheel down)"
@@ -1602,6 +1677,7 @@ export function WaveformTimeline() {
             id="tl-zoom-slider"
             className="tl-zoom-slider"
             type="range"
+            disabled={!hasLoadedProjectOrFile}
             min={MIN_TIMELINE_ZOOM_PCT}
             max={MAX_TIMELINE_ZOOM_PCT}
             step={25}
@@ -1616,6 +1692,7 @@ export function WaveformTimeline() {
             id="tl-zoom-in"
             className="tl-zoom-btn"
             type="button"
+            disabled={!hasLoadedProjectOrFile}
             title={
               lang === "en"
                 ? "Zoom in (Mouse wheel up)"
@@ -1707,7 +1784,7 @@ export function WaveformTimeline() {
             </div>
           </div>
 
-          {/* Track 2: Original transcript */}
+          {/* Track 2: Original transcript (localized) */}
           <div className="tl-track-header original">
             <div className="tl-th-info">
               <span className="tl-th-icon" aria-hidden="true">
@@ -1726,7 +1803,7 @@ export function WaveformTimeline() {
                 </svg>
               </span>
               <div className="tl-th-text">
-                <span className="tl-th-title">Original transcript</span>
+                <span className="tl-th-title">{t.editor.originalTitle}</span>
                 <span className="tl-th-sub">{srcLangSub}</span>
               </div>
             </div>
@@ -1820,9 +1897,7 @@ export function WaveformTimeline() {
                 </svg>
               </span>
               <div className="tl-th-text">
-                <span className="tl-th-title">
-                  {lang === "en" ? "Translation" : "Prevod"}
-                </span>
+                <span className="tl-th-title">{t.editor.translationTitle}</span>
                 <span className="tl-th-sub">{dstLangSub}</span>
               </div>
             </div>
@@ -1896,17 +1971,20 @@ export function WaveformTimeline() {
             ref={contentRef}
             id="tl-content"
             className="tl-content"
-            style={{ width: `${zoomPct}%` }}
+            style={{ width: hasLoadedProjectOrFile ? `${zoomPct}%` : "100%" }}
           >
             <div
               ref={rulerRef}
               id="tl-ruler"
+              className={hasLoadedProjectOrFile ? undefined : "empty"}
               onPointerDown={(e) => {
+                if (!hasLoadedProjectOrFile) return;
                 scrubbingRef.current = true;
                 e.currentTarget.setPointerCapture(e.pointerId);
                 scrubFromClientX(e.clientX);
               }}
               onPointerMove={(e) => {
+                if (!hasLoadedProjectOrFile) return;
                 if (scrubbingRef.current) {
                   scrubFromClientX(e.clientX);
                 }
@@ -1924,48 +2002,52 @@ export function WaveformTimeline() {
                 }
               }}
             >
-              {rulerTicks.map((tick) => (
-                <Fragment key={`t-${tick.ms}`}>
-                  <div
-                    className={`tl-tick ${tick.isMajor ? "major" : "minor"}`}
-                    style={{ left: `${tick.pct}%` }}
-                  />
-                  {tick.label !== null && (
-                    <span
-                      className="tl-tick-label"
+              {hasLoadedProjectOrFile &&
+                rulerTicks.map((tick) => (
+                  <Fragment key={`t-${tick.ms}`}>
+                    <div
+                      className={`tl-tick ${tick.isMajor ? "major" : "minor"}`}
                       style={{ left: `${tick.pct}%` }}
-                    >
-                      {tick.label}
-                    </span>
-                  )}
-                </Fragment>
-              ))}
-            </div>
-
-            <div id="tl-gridlines" className="tl-gridlines">
-              {rulerTicks
-                .filter((t) => t.isMajor && t.ms > 0 && t.ms < totalMs)
-                .map((tick) => (
-                  <div
-                    key={`g-${tick.ms}`}
-                    className="tl-gridline"
-                    style={{ left: `${tick.pct}%` }}
-                  />
+                    />
+                    {tick.label !== null && (
+                      <span
+                        className="tl-tick-label"
+                        style={{ left: `${tick.pct}%` }}
+                      >
+                        {tick.label}
+                      </span>
+                    )}
+                  </Fragment>
                 ))}
             </div>
 
-            {/* Lane 1: MP3 */}
+            <div id="tl-gridlines" className="tl-gridlines">
+              {hasLoadedProjectOrFile &&
+                rulerTicks
+                  .filter((tick) => tick.isMajor && tick.ms > 0 && tick.ms < totalMs)
+                  .map((tick) => (
+                    <div
+                      key={`g-${tick.ms}`}
+                      className="tl-gridline"
+                      style={{ left: `${tick.pct}%` }}
+                    />
+                  ))}
+            </div>
+
+            {/* Lane 1: MP3 Audio */}
             <div
               id="lane-mp3"
               className={`tl-lane${tracks.mp3.muted ? " muted" : ""}${
                 tracks.mp3.locked ? " locked" : ""
               }`}
               onPointerDown={(e) => {
+                if (!hasLoadedProjectOrFile || tracks.mp3.locked) return;
                 scrubbingRef.current = true;
                 e.currentTarget.setPointerCapture(e.pointerId);
                 scrubFromClientX(e.clientX);
               }}
               onPointerMove={(e) => {
+                if (!hasLoadedProjectOrFile || tracks.mp3.locked) return;
                 if (scrubbingRef.current) {
                   scrubFromClientX(e.clientX);
                 }
@@ -1983,31 +2065,35 @@ export function WaveformTimeline() {
                 }
               }}
             >
-              <div
-                ref={mp3ClipRef}
-                className="mp3-clip"
-                style={{ width: `${mp3ClipPct}%` }}
-              >
-                <span id="mp3-clip-tag" className="mp3-clip-tag">
-                  {activeProject?.audioFileName ?? "audio_track.mp3"}
-                </span>
-                <canvas ref={canvasRef} id="mp3-waveform" />
-              </div>
+              {hasAudioSource && audioFileName && (
+                <div
+                  ref={mp3ClipRef}
+                  className="mp3-clip"
+                  style={{ width: `${mp3ClipPct}%` }}
+                >
+                  <span id="mp3-clip-tag" className="mp3-clip-tag">
+                    {audioFileName}
+                  </span>
+                  <canvas ref={canvasRef} id="mp3-waveform" />
+                </div>
+              )}
             </div>
 
             {/* Lane 2: Original transcript */}
             <div
               id="lane-original"
-              className={`tl-lane${tracks.original.hidden ? " muted" : ""}${
+              className={`tl-lane${tracks.original.hidden ? " hidden-track" : ""}${
                 tracks.original.locked ? " locked" : ""
               }`}
               onPointerDown={(e) => {
+                if (!hasLoadedProjectOrFile) return;
                 if (e.target !== e.currentTarget) return;
                 scrubbingRef.current = true;
                 e.currentTarget.setPointerCapture(e.pointerId);
                 scrubFromClientX(e.clientX);
               }}
               onPointerMove={(e) => {
+                if (!hasLoadedProjectOrFile) return;
                 if (scrubbingRef.current) {
                   scrubFromClientX(e.clientX);
                 }
@@ -2031,16 +2117,18 @@ export function WaveformTimeline() {
             {/* Lane 3: Prevod */}
             <div
               id="lane-prevod"
-              className={`tl-lane${tracks.prevod.hidden ? " muted" : ""}${
+              className={`tl-lane${tracks.prevod.hidden ? " hidden-track" : ""}${
                 tracks.prevod.locked ? " locked" : ""
               }`}
               onPointerDown={(e) => {
+                if (!hasLoadedProjectOrFile) return;
                 if (e.target !== e.currentTarget) return;
                 scrubbingRef.current = true;
                 e.currentTarget.setPointerCapture(e.pointerId);
                 scrubFromClientX(e.clientX);
               }}
               onPointerMove={(e) => {
+                if (!hasLoadedProjectOrFile) return;
                 if (scrubbingRef.current) {
                   scrubFromClientX(e.clientX);
                 }
@@ -2061,8 +2149,10 @@ export function WaveformTimeline() {
               {renderClips("prevod")}
             </div>
 
-            {/* Vertical Playhead */}
-            <div id="tl-playhead" style={{ left: `${playheadPct}%` }} />
+            {/* Vertical Playhead (only rendered when a file/project is loaded) */}
+            {hasLoadedProjectOrFile && (
+              <div id="tl-playhead" style={{ left: `${playheadPct}%` }} />
+            )}
           </div>
         </div>
       </div>

@@ -6,11 +6,11 @@
 
 *Turn any audio or video into clean, broadcast-ready subtitles on an interactive waveform timeline — with 1-click setup, offline AI privacy, or up to **28x real-time** speed.*
 
-[![Release v0.3.2](https://img.shields.io/badge/release-v0.3.2-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+[![Release v0.4.0](https://img.shields.io/badge/release-v0.4.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-10b981?style=for-the-badge)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-6366f1?style=for-the-badge)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
-### [Download EasySRT Studio v0.3.2](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+### [Download EasySRT Studio v0.4.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
 </div>
 

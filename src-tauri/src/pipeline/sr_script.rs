@@ -46,6 +46,20 @@ pub fn convert_script(text: &str, target: SerbianScript) -> String {
     }
 }
 
+/// Converts every non-empty string yielded by `values` in place to the target Serbian
+/// script (`Latin` or `Cyrillic`). Keeps multi-style translation variant maps in sync
+/// with the project's active script regardless of map key type.
+pub fn convert_script_values<'a>(
+    values: impl Iterator<Item = &'a mut String>,
+    script: SerbianScript,
+) {
+    for value in values {
+        if !value.is_empty() {
+            *value = convert_script(value, script);
+        }
+    }
+}
+
 /// Converts Serbian Cyrillic text to Serbian Latin.
 ///
 /// Smart-cases uppercase digraphs (`Љ`, `Њ`, `Џ`):
@@ -373,6 +387,11 @@ const EXACT_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
     ("hljeb", "hleb"),
     ("hljeba", "hleba"),
     ("hljebu", "hlebu"),
+    ("hljebom", "hlebom"),
+    ("hljebovi", "hlebovi"),
+    ("hljebova", "hlebova"),
+    ("hljebove", "hlebove"),
+    ("hljebovima", "hlebovima"),
     ("mlijeko", "mleko"),
     ("mlijeka", "mleka"),
     ("mlijeku", "mleku"),
@@ -479,20 +498,13 @@ const EXACT_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
     ("zagrijati", "zagrejati"),
     ("ugrijati", "ugrejati"),
     ("ogrijati", "ogrejati"),
-    ("oduvijek", "oduvek"),
-    ("zauvijek", "zauvek"),
     ("navijek", "navek"),
     ("naprijed", "napred"),
-    ("prije", "pre"),
     ("otprije", "otpre"),
     ("prijeko", "preko"),
     ("prijeki", "preki"),
     ("prijeka", "preka"),
     ("prijekog", "prekog"),
-    ("djeca", "deca"),
-    ("dijete", "dete"),
-    ("djeteta", "deteta"),
-    ("djetetu", "detetu"),
     ("djelo", "delo"),
     ("djela", "dela"),
     ("djelu", "delu"),
@@ -513,6 +525,201 @@ const EXACT_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
     ("sjedio", "sedeo"),
     ("sjedila", "sedela"),
     ("sjedili", "sedeli"),
+    // Unambiguous Croatian pronouns and lexical forms -> standard Serbian
+    ("tko", "ko"),
+    ("netko", "neko"),
+    ("nitko", "niko"),
+    ("svatko", "svako"),
+    ("itko", "iko"),
+    ("tkogod", "kogod"),
+    ("krajolik", "pejzaž"),
+    ("krajolika", "pejzaža"),
+    ("krajoliku", "pejzažu"),
+    ("krajolikom", "pejzažem"),
+    ("krajolici", "pejzaži"),
+    ("krajolike", "pejzaže"),
+    ("krajolicima", "pejzažima"),
+    ("poviješću", "istorijom"),
+    ("povijesni", "istorijski"),
+    ("povijesna", "istorijska"),
+    ("povijesno", "istorijsko"),
+    ("povijesne", "istorijske"),
+    ("povijesnu", "istorijsku"),
+    ("povijesnog", "istorijskog"),
+    ("povijesnoj", "istorijskoj"),
+    ("povijesnom", "istorijskom"),
+    ("povijesnih", "istorijskih"),
+    ("povijesnim", "istorijskim"),
+    // `tisuća` -> `hiljada` (exact noun + compound forms; avoids mangling `tisućljeće`)
+    ("tisuća", "hiljada"),
+    ("tisuće", "hiljade"),
+    ("tisući", "hiljadi"),
+    ("tisuću", "hiljadu"),
+    ("tisućo", "hiljado"),
+    ("tisućom", "hiljadom"),
+    ("tisućama", "hiljadama"),
+    ("tisućljetni", "hiljadugodišnji"),
+    ("tisućljetna", "hiljadugodišnja"),
+    ("tisućljetno", "hiljadugodišnje"),
+    ("tisućljetne", "hiljadugodišnje"),
+    ("tisućljetnu", "hiljadugodišnju"),
+    ("tisućljetnog", "hiljadugodišnjeg"),
+    ("tisućljetnoj", "hiljadugodišnjoj"),
+    ("tisućljetnih", "hiljadugodišnjih"),
+    ("tisućljetnim", "hiljadugodišnjim"),
+    // `glazba` -> `muzika`, `glazbeni` -> `muzički`, `glazbenik` -> `muzičar`, `glazbenica` -> `muzičarka`
+    ("glazba", "muzika"),
+    ("glazbe", "muzike"),
+    ("glazbi", "muzici"),
+    ("glazbu", "muziku"),
+    ("glazbo", "muziko"),
+    ("glazbom", "muzikom"),
+    ("glazbama", "muzikama"),
+    ("glazbeni", "muzički"),
+    ("glazbena", "muzička"),
+    ("glazbeno", "muzičko"),
+    ("glazbene", "muzičke"),
+    ("glazbenu", "muzičku"),
+    ("glazbenog", "muzičkog"),
+    ("glazbenoga", "muzičkoga"),
+    ("glazbenoj", "muzičkoj"),
+    ("glazbenom", "muzičkom"),
+    ("glazbenome", "muzičkome"),
+    ("glazbenih", "muzičkih"),
+    ("glazbenim", "muzičkim"),
+    ("glazbenima", "muzičkima"),
+    ("glazbenik", "muzičar"),
+    ("glazbenika", "muzičara"),
+    ("glazbeniku", "muzičaru"),
+    ("glazbeniče", "muzičaru"),
+    ("glazbenikom", "muzičarom"),
+    ("glazbenici", "muzičari"),
+    ("glazbenike", "muzičare"),
+    ("glazbenicima", "muzičarima"),
+    ("glazbenica", "muzičarka"),
+    ("glazbenice", "muzičarke"),
+    ("glazbenicu", "muzičarku"),
+    ("glazbenicom", "muzičarkom"),
+    ("glazbenicama", "muzičarkama"),
+    // `tjedan` -> `nedelja` / `tjedni` -> `nedeljni` / `tjedno` -> `nedeljno`
+    ("tjedan", "nedelja"),
+    ("tjedna", "nedelje"),
+    ("tjednu", "nedelji"),
+    ("tjednom", "nedeljom"),
+    ("tjedana", "nedelja"),
+    ("tjedne", "nedelje"),
+    ("tjednima", "nedeljama"),
+    ("tjedni", "nedeljni"),
+    ("tjedno", "nedeljno"),
+    ("tjednog", "nedeljnog"),
+    ("tjednoga", "nedeljnoga"),
+    ("tjednoj", "nedeljnoj"),
+    ("tjednih", "nedeljnih"),
+    ("tjednim", "nedeljnim"),
+    // `uvjet` -> `uslov` (exact noun/verb forms; participle `uvjetovan*` -> `uslovljen*` handled by stem)
+    ("uvjet", "uslov"),
+    ("uvjeta", "uslova"),
+    ("uvjetu", "uslovu"),
+    ("uvjetom", "uslovom"),
+    ("uvjeti", "uslovi"),
+    ("uvjete", "uslove"),
+    ("uvjetima", "uslovima"),
+    ("preduvjet", "preduslov"),
+    ("preduvjeta", "preduslova"),
+    ("preduvjetu", "preduslovu"),
+    ("preduvjetom", "preduslovom"),
+    ("preduvjeti", "preduslovi"),
+    ("preduvjete", "preduslove"),
+    ("preduvjetima", "preduslovima"),
+    ("uvjetovati", "usloviti"),
+    ("uvjetuje", "uslovljava"),
+    ("uvjetuju", "uslovljavaju"),
+    ("uvjetujem", "uslovljavam"),
+    ("uvjetuješ", "uslovljavaš"),
+    ("uvjetujemo", "uslovljavamo"),
+    ("uvjetujete", "uslovljavate"),
+    ("uvjetovao", "uslovio"),
+    ("uvjetovala", "uslovila"),
+    ("uvjetovali", "uslovili"),
+    ("uvjetovalo", "uslovilo"),
+    ("uvjetovale", "uslovile"),
+    ("uvjetovanje", "uslovljavanje"),
+    ("uvjetovanja", "uslovljavanja"),
+    ("uvjetovanju", "uslovljavanju"),
+    ("uvjetovanjem", "uslovljavanjem"),
+    // Unambiguous Croatian month names -> standard Serbian month names.
+    // Intentionally skipped to prevent Serbian false positives:
+    // - `kolovoz` / `kolovoza` / `kolovozu` / `kolovozom`: standard Serbian for "roadway/carriageway" (e.g. "na kolovozu").
+    // - `studeni` / `studenog` / `studenom`: standard Serbian adjective for "freezing cold" (e.g. "studeni vetar").
+    // - `listopadn*` adjectives (`listopadne šume`, `listopadno drveće` = deciduous): protected by matching only exact noun forms of `listopad`.
+    // - `travnjak` ("lawn"): protected by matching only exact noun forms of `travanj` and stem `travanjsk*`.
+    // - `rujno` / `rujni` / `rujne` (poetic adjective "rosy/crimson", e.g. "rujno vino"): protected by matching only noun cases and `rujansk*`.
+    ("siječanj", "januar"),
+    ("siječnja", "januara"),
+    ("siječnju", "januaru"),
+    ("siječnjem", "januarom"),
+    ("veljača", "februar"),
+    ("veljače", "februara"),
+    ("veljači", "februaru"),
+    ("veljaču", "februar"),
+    ("veljačom", "februarom"),
+    ("ožujak", "mart"),
+    ("ožujka", "marta"),
+    ("ožujku", "martu"),
+    ("ožujkom", "martom"),
+    ("travanj", "april"),
+    ("travnja", "aprila"),
+    ("travnju", "aprilu"),
+    ("travnjem", "aprilom"),
+    ("svibanj", "maj"),
+    ("svibnja", "maja"),
+    ("svibnju", "maju"),
+    ("svibnjem", "majem"),
+    ("lipanj", "jun"),
+    ("lipnja", "juna"),
+    ("lipnju", "junu"),
+    ("lipnjem", "junom"),
+    ("srpanj", "jul"),
+    ("srpnja", "jula"),
+    ("srpnju", "julu"),
+    ("srpnjem", "julom"),
+    ("rujan", "septembar"),
+    ("rujna", "septembra"),
+    ("rujnu", "septembru"),
+    ("rujnom", "septembrom"),
+    ("listopad", "oktobar"),
+    ("listopada", "oktobra"),
+    ("listopadu", "oktobru"),
+    ("listopadom", "oktobrom"),
+    ("prosinac", "decembar"),
+    ("prosinca", "decembra"),
+    ("prosincu", "decembru"),
+    ("prosincem", "decembrom"),
+    // `vlak` -> `voz` (exact noun forms only; strictly protects Serbian `vlakno`/`vlakna`/`vlakana`/`vlaknima`/`vlaknasto` = fiber and `vlače`)
+    ("vlak", "voz"),
+    ("vlaka", "voza"),
+    ("vlaku", "vozu"),
+    ("vlakom", "vozom"),
+    ("vlakovi", "vozovi"),
+    ("vlakova", "vozova"),
+    ("vlakove", "vozove"),
+    ("vlakovima", "vozovima"),
+    ("vlakić", "vozić"),
+    ("vlakića", "vozića"),
+    ("vlakiću", "voziću"),
+    ("vlakićem", "vozićem"),
+    ("vlakići", "vozići"),
+    ("vlakiće", "voziće"),
+    ("vlakićima", "vozićima"),
+    // `kruh` -> `hleb` (exact noun forms only; strictly protects `kruška`, `krug`, `krut`, `kruna`, `krupan`, `kruše`)
+    ("kruh", "hleb"),
+    ("kruha", "hleba"),
+    ("kruhu", "hlebu"),
+    ("kruhom", "hlebom"),
+    ("kruhovi", "hlebovi"),
+    ("kruhova", "hlebova"),
+    ("kruhove", "hlebove"),
+    ("kruhovima", "hlebovima"),
 ];
 
 const STEM_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
@@ -665,6 +872,29 @@ const STEM_IJEKAVIAN_TO_EKAVIAN: &[(&str, &str)] = &[
     ("prijetit", "pretit"),
     ("prijetio", "pretio"),
     ("prijet", "pret"),
+    // Safe morphological stems for non-Serbian lexical leaks (longer prefixes first)
+    ("tisućit", "hiljadit"),
+    ("tisućark", "hiljadark"),
+    ("glazbenikov", "muzičarev"),
+    ("dvotjedn", "dvonedeljn"),
+    ("trotjedn", "tronedeljn"),
+    ("višetjedn", "višenedeljn"),
+    ("tjednik", "nedeljnik"),
+    ("tjednic", "nedeljnic"),
+    ("neuvjetovan", "neuslovljen"),
+    ("uvjetovanj", "uslovljavanj"),
+    ("uvjetovan", "uslovljen"),
+    ("bezuvjetn", "bezuslovn"),
+    ("uvjetn", "uslovn"),
+    ("siječanjsk", "januarsk"),
+    ("ožujsk", "martovsk"),
+    ("travanjsk", "aprilsk"),
+    ("svibanjsk", "majsk"),
+    ("lipanjsk", "junsk"),
+    ("srpanjsk", "julsk"),
+    ("rujansk", "septembarsk"),
+    ("listopadsk", "oktobarsk"),
+    ("prosinačk", "decembarsk"),
 ];
 
 fn is_cyrillic_alpha(ch: char) -> bool {
@@ -756,8 +986,12 @@ fn normalize_ekavian_segment(segment: &str) -> String {
     out
 }
 
-/// Normalizes common unambiguous Ijekavian words and stems into Serbian Ekavian
-/// while preserving casing, URLs, emails, HTML/ASS tags, and Cyrillic/Latin script.
+/// Normalizes common unambiguous Ijekavian and non-Serbian Croatian lexical forms
+/// (including Ekavian stems, `tisuća` -> `hiljada`, `glazba` -> `muzika`,
+/// `tjedan` -> `nedelja`, `uvjet` -> `uslov`, unambiguous month names, `vlak` -> `voz`,
+/// `kruh` -> `hleb`) into standard Serbian Ekavian while preserving casing,
+/// URLs, emails, HTML/ASS tags, markers, and Cyrillic/Latin script, and guarding
+/// against Serbian false positives (`vlakno`, `kolovoz`, `studeni`, `listopadno`, `travnjak`).
 pub fn normalize_ekavian(text: &str) -> String {
     let re = protected_span_regex();
     let mut out = String::with_capacity(text.len());
@@ -882,5 +1116,266 @@ mod tests {
             normalize_ekavian("Sjedinjene Države i sjedinjenje ne treba mijenjati."),
             "Sjedinjene Države i sjedinjenje ne treba menjati."
         );
+    }
+
+    #[test]
+    fn normalizes_expanded_serbian_lexical_families_and_cases() {
+        // tisuća -> hiljada (singular, plural, cases, ordinals, casing, Cyrillic)
+        assert_eq!(
+            normalize_ekavian("Tisuća ljudi, dve tisuće dinara, tisuću puta, tisućama godina, po tisućiti put."),
+            "Hiljada ljudi, dve hiljade dinara, hiljadu puta, hiljadama godina, po hiljaditi put."
+        );
+        assert_eq!(
+            normalize_ekavian("TISUĆA i Tisućarka iz tisućljetnog grada."),
+            "HILJADA i Hiljadarka iz hiljadugodišnjeg grada."
+        );
+        assert_eq!(
+            normalize_ekavian("Тисућа људи, ТИСУЋЕ динара и тисућама година."),
+            "Хиљада људи, ХИЉАДЕ динара и хиљадама година."
+        );
+
+        // glazba -> muzika, glazbeni -> muzički, glazbenik -> muzičar, glazbenica -> muzičarka
+        assert_eq!(
+            normalize_ekavian("Glazba je lepa; bez glazbe, u glazbi, volim glazbu i živim s glazbom."),
+            "Muzika je lepa; bez muzike, u muzici, volim muziku i živim s muzikom."
+        );
+        assert_eq!(
+            normalize_ekavian("Glazbeni festival, glazbena škola, glazbeno delo, glazbenih numera."),
+            "Muzički festival, muzička škola, muzičko delo, muzičkih numera."
+        );
+        assert_eq!(
+            normalize_ekavian("Glazbenik i glazbenica su sjajni glazbenici; pričamo sa glazbenikom."),
+            "Muzičar i muzičarka su sjajni muzičari; pričamo sa muzičarom."
+        );
+        assert_eq!(
+            normalize_ekavian("ГЛАЗБА, Глазби, глазбени и глазбеник."),
+            "МУЗИКА, Музици, музички и музичар."
+        );
+
+        // tjedan -> nedelja / tjedni -> nedeljni / tjedno -> nedeljno
+        assert_eq!(
+            normalize_ekavian("Tjedan dana, tri tjedna, u tjednu, pet tjedana, tjednima čekamo."),
+            "Nedelja dana, tri nedelje, u nedelji, pet nedelja, nedeljama čekamo."
+        );
+        assert_eq!(
+            normalize_ekavian("Tjedni plan, tri puta tjedno, na tjednoj bazi, dvotjedni odmor i tjednik."),
+            "Nedeljni plan, tri puta nedeljno, na nedeljnoj bazi, dvonedeljni odmor i nedeljnik."
+        );
+        assert_eq!(
+            normalize_ekavian("ТЈЕДАН, Тједно и тједнима у тједнику."),
+            "НЕДЕЉА, Недељно и недељама у недељнику."
+        );
+
+        // uvjet -> uslov, uvjetovan -> uslovljen, bezuvjetno -> bezuslovno, preduvjet -> preduslov
+        assert_eq!(
+            normalize_ekavian("Uvjet, bez uvjeta, po uvjetu, pod uvjetom, uvjeti, uvjete i uvjetima."),
+            "Uslov, bez uslova, po uslovu, pod uslovom, uslovi, uslove i uslovima."
+        );
+        assert_eq!(
+            normalize_ekavian("Uvjetovan refleks, uvjetovana odluka, uvjetovanost i neuvjetovano."),
+            "Uslovljen refleks, uslovljena odluka, uslovljenost i neuslovljeno."
+        );
+        assert_eq!(
+            normalize_ekavian("Bezuvjetna ljubav je preduvjet koji uvjetuje uspeh i uvjetovanje sa uvjetovanjima."),
+            "Bezuslovna ljubav je preduslov koji uslovljava uspeh i uslovljavanje sa uslovljavanjima."
+        );
+        assert_eq!(
+            normalize_ekavian("УВЈЕТ, Увјетован и безувјетно."),
+            "УСЛОВ, Условљен и безусловно."
+        );
+
+        // vlak -> voz
+        assert_eq!(
+            normalize_ekavian("Vlak kasni; bez vlaka, u vlaku, idem vlakom, vlakovi i vlakovima."),
+            "Voz kasni; bez voza, u vozu, idem vozom, vozovi i vozovima."
+        );
+        assert_eq!(
+            normalize_ekavian("ВЛАК, Влакови и путујемо влаком."),
+            "ВОЗ, Возови и путујемо возом."
+        );
+
+        // kruh -> hleb (plus completed hljeb forms)
+        assert_eq!(
+            normalize_ekavian("Kruh, parče kruha, o kruhu, sa kruhom, kruhovi i hljebom."),
+            "Hleb, parče hleba, o hlebu, sa hlebom, hlebovi i hlebom."
+        );
+        assert_eq!(
+            normalize_ekavian("КРУХ, Круха и са крухом."),
+            "ХЛЕБ, Хлеба и са хлебом."
+        );
+
+        // Croatian pronouns & lexical forms
+        assert_eq!(
+            normalize_ekavian("Tko zna da li je netko ili nitko video svatko i taj krajolik?"),
+            "Ko zna da li je neko ili niko video svako i taj pejzaž?"
+        );
+        assert_eq!(
+            normalize_ekavian("Тко је видео повијесни крајолик?"),
+            "Ко је видео историјски пејзаж?"
+        );
+    }
+
+    #[test]
+    fn normalizes_unambiguous_croatian_months_preserving_case_and_cyrillic() {
+        assert_eq!(
+            normalize_ekavian("Siječanj, u siječnju, 10. siječnja, siječanjski mraz."),
+            "Januar, u januaru, 10. januara, januarski mraz."
+        );
+        assert_eq!(
+            normalize_ekavian("Veljača, u veljači, 14. veljače, veljačom."),
+            "Februar, u februaru, 14. februara, februarom."
+        );
+        assert_eq!(
+            normalize_ekavian("Ožujak, u ožujku, 8. ožujka, ožujski dani."),
+            "Mart, u martu, 8. marta, martovski dani."
+        );
+        assert_eq!(
+            normalize_ekavian("Travanj, u travnju, 1. travnja, travanjska kiša."),
+            "April, u aprilu, 1. aprila, aprilska kiša."
+        );
+        assert_eq!(
+            normalize_ekavian("Svibanj, u svibnju, 1. svibnja, svibnjem, svibanjski praznik."),
+            "Maj, u maju, 1. maja, majem, majski praznik."
+        );
+        assert_eq!(
+            normalize_ekavian("Lipanj, u lipnju, 21. lipnja, lipanjsko sunce."),
+            "Jun, u junu, 21. juna, junsko sunce."
+        );
+        assert_eq!(
+            normalize_ekavian("Srpanj, u srpnju, 15. srpnja, srpanjska vrućina."),
+            "Jul, u julu, 15. jula, julska vrućina."
+        );
+        assert_eq!(
+            normalize_ekavian("Rujan, u rujnu, 1. rujna, rujanski rok."),
+            "Septembar, u septembru, 1. septembra, septembarski rok."
+        );
+        assert_eq!(
+            normalize_ekavian("Listopad, u listopadu, 5. listopada, listopadski događaj."),
+            "Oktobar, u oktobru, 5. oktobra, oktobarski događaj."
+        );
+        assert_eq!(
+            normalize_ekavian("Prosinac, u prosincu, 31. prosinca, prosinački sneg."),
+            "Decembar, u decembru, 31. decembra, decembarski sneg."
+        );
+        // ALL CAPS & Cyrillic months
+        assert_eq!(
+            normalize_ekavian("SIJEČANJ, VELJAČA, PROSINAC"),
+            "JANUAR, FEBRUAR, DECEMBAR"
+        );
+        assert_eq!(
+            normalize_ekavian("Сијечањ, ВЕЉАЧА, у ожујку, 15. рујна и у просинцу."),
+            "Јануар, ФЕБРУАР, у марту, 15. септембра и у децембру."
+        );
+    }
+
+    #[test]
+    fn guards_against_serbian_false_positives_and_preserves_protected_spans() {
+        // `vlakno` / `vlakana` / `vlaknima` = fiber (MUST NOT become `vozno` / `vozana`!)
+        let fiber_latin = "Ova hrana ima puno vlakana, jedno vlakno, bogata vlaknima i vlaknasta je, dok konji vlače.";
+        assert_eq!(normalize_ekavian(fiber_latin), fiber_latin);
+        let fiber_cyr = "Влакно, влакана и влакнима богато јело.";
+        assert_eq!(normalize_ekavian(fiber_cyr), fiber_cyr);
+
+        // `kolovoz` in Serbian = roadway/carriageway (MUST NOT become `avgust`!)
+        let road_latin = "Na kolovozu ima leda, kolovoz je klizav, vozilo je sletelo sa kolovoza.";
+        assert_eq!(normalize_ekavian(road_latin), road_latin);
+        let road_cyr = "На коловозу има поледице и коловоз је мокар.";
+        assert_eq!(normalize_ekavian(road_cyr), road_cyr);
+
+        // `studeni` in Serbian = freezing cold adjective (MUST NOT become `novembar`!)
+        let cold_latin = "Studeni vetar duva po studenom vremenu od studenog jutra.";
+        assert_eq!(normalize_ekavian(cold_latin), cold_latin);
+        let cold_cyr = "Студени ветар дува целог дана.";
+        assert_eq!(normalize_ekavian(cold_cyr), cold_cyr);
+
+        // `listopadne šume` / `listopadno drveće` (deciduous), `travnjak` (lawn), `rujno vino` (rosy)
+        let botany = "Listopadne šume, listopadno drveće, zeleni travnjak i rujno vino.";
+        assert_eq!(normalize_ekavian(botany), botany);
+
+        // `kruška`, `krug`, `krut`, `kruna`, `krupan`, `kruše` (MUST NOT be affected by `kruh`)
+        let kruh_neighbors = "Kruška, krug, krut stav, kruna, krupan plod i zrna se kruše.";
+        assert_eq!(normalize_ekavian(kruh_neighbors), kruh_neighbors);
+
+        // `tisućljeće` MUST NOT be corrupted into invalid `hiljadljeće`
+        assert_eq!(normalize_ekavian("Novo tisućljeće"), "Novo tisućljeće");
+
+        // `Sjedinjene` / `sjedinjenje`
+        assert_eq!(
+            normalize_ekavian("Sjedinjene Države i sjedinjenje"),
+            "Sjedinjene Države i sjedinjenje"
+        );
+
+        // Protected spans (URLs, emails, HTML/ASS tags, bracket markers) untouched alongside converted words
+        let mixed = "<i>Glazba za tisuću ljudi na https://example.com/vlak/tisuća/glazba ili glazba@vlak.hr [GLAZBA] {\\an8}</i>";
+        assert_eq!(
+            normalize_ekavian(mixed),
+            "<i>Muzika za hiljadu ljudi na https://example.com/vlak/tisuća/glazba ili glazba@vlak.hr [GLAZBA] {\\an8}</i>"
+        );
+    }
+
+    #[test]
+    fn lexical_tables_have_unique_lowercase_keys() {
+        use std::collections::HashSet;
+
+        let mut exact_keys = HashSet::new();
+        for &(src, dst) in EXACT_IJEKAVIAN_TO_EKAVIAN {
+            assert!(!src.is_empty() && !dst.is_empty());
+            assert_eq!(src, src.to_lowercase(), "exact key must be lowercase: {src}");
+            assert_ne!(src, dst, "no-op exact mapping: {src}");
+            assert!(
+                exact_keys.insert(src),
+                "duplicate key in EXACT_IJEKAVIAN_TO_EKAVIAN: {src}"
+            );
+        }
+
+        let mut stem_keys = HashSet::new();
+        for (idx, &(src, dst)) in STEM_IJEKAVIAN_TO_EKAVIAN.iter().enumerate() {
+            assert!(!src.is_empty() && !dst.is_empty());
+            assert_eq!(src, src.to_lowercase(), "stem key must be lowercase: {src}");
+            assert_ne!(src, dst, "no-op stem mapping: {src}");
+            assert!(
+                stem_keys.insert(src),
+                "duplicate key in STEM_IJEKAVIAN_TO_EKAVIAN: {src}"
+            );
+            for &(earlier, _) in &STEM_IJEKAVIAN_TO_EKAVIAN[..idx] {
+                assert!(
+                    !src.starts_with(earlier),
+                    "earlier stem `{earlier}` shadows longer stem `{src}` in STEM_IJEKAVIAN_TO_EKAVIAN"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn converts_script_values_in_place_across_variant_maps() {
+        use std::collections::BTreeMap;
+
+        let mut variants = BTreeMap::from([
+            ("natural", "Đorđe gleda film u Nišu na https://example.com/ljubav.".to_string()),
+            ("formal", "Gospodin Đorđe prisustvuje projekciji u Nišu.".to_string()),
+            ("empty", String::new()),
+        ]);
+
+        convert_script_values(variants.values_mut(), SerbianScript::Cyrillic);
+        assert_eq!(
+            variants.get("natural").map(String::as_str),
+            Some("Ђорђе гледа филм у Нишу на https://example.com/ljubav.")
+        );
+        assert_eq!(
+            variants.get("formal").map(String::as_str),
+            Some("Господин Ђорђе присуствује пројекцији у Нишу.")
+        );
+        assert_eq!(variants.get("empty").map(String::as_str), Some(""));
+
+        convert_script_values(variants.values_mut(), SerbianScript::Latin);
+        assert_eq!(
+            variants.get("natural").map(String::as_str),
+            Some("Đorđe gleda film u Nišu na https://example.com/ljubav.")
+        );
+        assert_eq!(
+            variants.get("formal").map(String::as_str),
+            Some("Gospodin Đorđe prisustvuje projekciji u Nišu.")
+        );
+        assert_eq!(variants.get("empty").map(String::as_str), Some(""));
     }
 }

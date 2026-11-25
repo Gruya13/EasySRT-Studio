@@ -57,12 +57,6 @@ export const RATE_LIMITS: Readonly<Record<"bug" | "crash", number>> = {
 export const GITHUB_USER_AGENT = "EasySRT-Telemetry-Worker";
 const GITHUB_API_VERSION = "2022-11-28";
 
-export const CORS_HEADERS: Readonly<Record<string, string>> = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type",
-};
-
 const FINGERPRINT_RE = /^[A-Za-z0-9]{8,64}$/;
 const GITHUB_REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 
@@ -85,15 +79,15 @@ export function jsonResponse(
     status,
     headers: {
       "Content-Type": "application/json; charset=utf-8",
-      ...CORS_HEADERS,
       ...extraHeaders,
     },
   });
 }
 
 /**
- * Extra server-side privacy sanitization: redacts API keys, GitHub tokens,
- * Bearer tokens, and Windows/Linux home directory usernames.
+ * Extra server-side privacy sanitization: redacts URL userinfo credentials,
+ * API keys, HuggingFace/Gemini/GitHub tokens, Bearer tokens, x-api-key headers,
+ * and Windows/Linux/macOS home directory usernames.
  */
 export function sanitizeText(raw: string): string {
   let out = raw;
@@ -101,8 +95,21 @@ export function sanitizeText(raw: string): string {
   // Strip ASCII control chars except tab, LF, CR
   out = out.replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, "");
 
+  // Redact URL userinfo credentials (e.g. https://user:pass@host -> https://<redacted>@host)
+  // Word-bounded + capped scheme/userinfo quantifiers guarantee linear-time execution (no ReDoS).
+  out = out.replace(
+    /\b([A-Za-z][A-Za-z0-9+.-]{0,15}:\/\/)[^/\s\\?#"'<>]{1,512}@([A-Za-z0-9\[])/g,
+    "$1<redacted>@$2",
+  );
+
   // Redact OpenAI / DeepSeek / Stripe-style sk- keys
   out = out.replace(/\bsk-[A-Za-z0-9_-]{8,}/g, "[REDACTED_API_KEY]");
+
+  // Redact HuggingFace access tokens (hf_...)
+  out = out.replace(/\bhf_[A-Za-z0-9]{10,}/g, "[REDACTED_HF_TOKEN]");
+
+  // Redact Google / Gemini API keys (AIza...)
+  out = out.replace(/\bAIza[0-9A-Za-z_-]{20,}/g, "[REDACTED_API_KEY]");
 
   // Redact GitHub personal access tokens (classic & fine-grained) and OAuth/app tokens
   out = out.replace(/\bgithub_pat_[A-Za-z0-9_]+/g, "[REDACTED_GH_TOKEN]");
@@ -111,9 +118,9 @@ export function sanitizeText(raw: string): string {
   // Redact HTTP Bearer tokens
   out = out.replace(/\bBearer\s+[A-Za-z0-9._-]+/gi, "Bearer [REDACTED_TOKEN]");
 
-  // Redact generic api_key / api-key / apikey assignments
+  // Redact x-api-key headers/params and generic api_key / api-key / apikey assignments
   out = out.replace(
-    /(\bapi[_-]?key\s*[:=]\s*["']?)([^\s"',}]+)/gi,
+    /(\b(?:x[_-])?api[_-]?key["']?\s*[:=]\s*["']?)(?:\[REDACTED(?:_[A-Z_]+)?\]|[^\s"',}&;\]\)]+)/gi,
     "$1[REDACTED]",
   );
 
@@ -124,7 +131,20 @@ export function sanitizeText(raw: string): string {
   // Redact Linux /home/<name>/ paths
   out = out.replace(/(^|[^A-Za-z0-9_:])(\/home\/)([^\\/\s"'<>|]+)/g, "$1$2<USER>");
 
+  // Redact macOS /Users/<name>/ paths (excludes drive-letter C:/Users/ handled above)
+  out = out.replace(/(^|[^A-Za-z0-9_:])(\/Users\/)([^\\/\s"'<>|]+)/g, "$1$2<USER>");
+
   return out;
+}
+
+/**
+ * Neutralize GitHub `@username` and `@org/team` mentions by inserting a zero-width
+ * space (`U+200B`) directly after `@` so untrusted telemetry text cannot trigger
+ * GitHub mention notifications, while preserving email addresses (`user@example.com`)
+ * and normal non-mention text.
+ */
+export function neutralizeGitHubMentions(raw: string): string {
+  return raw.replace(/(^|[^A-Za-z0-9_])@([A-Za-z0-9])/g, "$1@\u200B$2");
 }
 
 export function truncateText(
@@ -140,7 +160,7 @@ export function truncateText(
 }
 
 export function sanitizeSingleLine(raw: string, maxLen: number): string {
-  const cleaned = sanitizeText(raw)
+  const cleaned = neutralizeGitHubMentions(sanitizeText(raw))
     .replace(/[\r\n\t]+/g, " ")
     .replace(/\s{2,}/g, " ")
     .trim();
@@ -369,7 +389,10 @@ function buildDiagnosticsDetailsBlock(diagnostics: string | null | undefined, ma
   if (!diagnostics || diagnostics.trim().length === 0) {
     return "";
   }
-  const sanitized = truncateText(sanitizeText(diagnostics.trim()), maxChars);
+  const sanitized = truncateText(
+    neutralizeGitHubMentions(sanitizeText(diagnostics.trim())),
+    maxChars,
+  );
   const safeContent = escapeCodeFence(sanitized);
   return [
     "<details>",
@@ -389,9 +412,12 @@ export function formatBugIssue(
 ): { title: string; body: string; labels: string[] } {
   const cleanVersion = sanitizeSingleLine(payload.appVersion, 40);
   const cleanTitle = sanitizeSingleLine(payload.title, 180);
-  const cleanDescription = truncateText(sanitizeText(payload.description.trim()), 8000);
+  const cleanDescription = truncateText(
+    neutralizeGitHubMentions(sanitizeText(payload.description.trim())),
+    8000,
+  );
   const cleanSteps = payload.steps?.trim()
-    ? truncateText(sanitizeText(payload.steps.trim()), 4000)
+    ? truncateText(neutralizeGitHubMentions(sanitizeText(payload.steps.trim())), 4000)
     : null;
   const cleanContact = payload.contact?.trim()
     ? sanitizeSingleLine(payload.contact, 200)
@@ -443,7 +469,10 @@ export function formatCrashIssue(
   const cleanKind = sanitizeSingleLine(payload.crashKind, 64);
   const cleanFingerprint = payload.fingerprint.trim();
   const shortMessage = sanitizeSingleLine(payload.message, 120);
-  const cleanMessage = truncateText(sanitizeText(payload.message.trim()), 4000);
+  const cleanMessage = truncateText(
+    neutralizeGitHubMentions(sanitizeText(payload.message.trim())),
+    4000,
+  );
   const cleanSource = payload.source?.trim()
     ? sanitizeSingleLine(payload.source, 200)
     : null;
@@ -454,7 +483,12 @@ export function formatCrashIssue(
     ? sanitizeSingleLine(payload.gpu, 250)
     : "unknown";
   const cleanStack = payload.stackTrace?.trim()
-    ? escapeCodeFence(truncateText(sanitizeText(payload.stackTrace.trim()), 16_000))
+    ? escapeCodeFence(
+        truncateText(
+          neutralizeGitHubMentions(sanitizeText(payload.stackTrace.trim())),
+          16_000,
+        ),
+      )
     : null;
 
   const sections: string[] = [
@@ -506,7 +540,10 @@ export function formatCrashComment(
 ): string {
   const cleanVersion = sanitizeSingleLine(payload.appVersion, 40);
   const cleanKind = sanitizeSingleLine(payload.crashKind, 64);
-  const cleanMessage = truncateText(sanitizeText(payload.message.trim()), 4000);
+  const cleanMessage = truncateText(
+    neutralizeGitHubMentions(sanitizeText(payload.message.trim())),
+    4000,
+  );
   const cleanSource = payload.source?.trim()
     ? sanitizeSingleLine(payload.source, 200)
     : null;
@@ -517,7 +554,12 @@ export function formatCrashComment(
     ? sanitizeSingleLine(payload.gpu, 250)
     : "unknown";
   const cleanStack = payload.stackTrace?.trim()
-    ? escapeCodeFence(truncateText(sanitizeText(payload.stackTrace.trim()), 12_000))
+    ? escapeCodeFence(
+        truncateText(
+          neutralizeGitHubMentions(sanitizeText(payload.stackTrace.trim())),
+          12_000,
+        ),
+      )
     : null;
 
   const sections: string[] = [
@@ -970,6 +1012,10 @@ async function handleCrashReport(request: Request, env: Env): Promise<Response> 
   return jsonResponse(responsePayload, 201);
 }
 
+function hasBrowserOrigin(request: Request): boolean {
+  return request.headers.has("Origin");
+}
+
 export default {
   async fetch(
     request: Request,
@@ -977,10 +1023,6 @@ export default {
     _ctx?: ExecutionContext,
   ): Promise<Response> {
     try {
-      if (request.method === "OPTIONS") {
-        return new Response(null, { status: 204, headers: CORS_HEADERS });
-      }
-
       const url = new URL(request.url);
       const pathname =
         url.pathname.length > 1 && url.pathname.endsWith("/")
@@ -990,28 +1032,34 @@ export default {
       if (pathname === "/health") {
         if (request.method !== "GET") {
           return jsonResponse({ ok: false, error: "Method not allowed" }, 405, {
-            Allow: "GET, OPTIONS",
+            Allow: "GET",
           });
         }
         return jsonResponse({ ok: true, service: SERVICE_NAME }, 200);
       }
 
-      if (pathname === "/v1/report/bug") {
+      if (pathname === "/v1/report/bug" || pathname === "/v1/report/crash") {
+        if (hasBrowserOrigin(request)) {
+          return jsonResponse(
+            { ok: false, error: "Cross-origin browser requests are not allowed" },
+            403,
+          );
+        }
         if (request.method !== "POST") {
           return jsonResponse({ ok: false, error: "Method not allowed" }, 405, {
-            Allow: "POST, OPTIONS",
+            Allow: "POST",
           });
         }
-        return await handleBugReport(request, env);
+        return pathname === "/v1/report/bug"
+          ? await handleBugReport(request, env)
+          : await handleCrashReport(request, env);
       }
 
-      if (pathname === "/v1/report/crash") {
-        if (request.method !== "POST") {
-          return jsonResponse({ ok: false, error: "Method not allowed" }, 405, {
-            Allow: "POST, OPTIONS",
-          });
-        }
-        return await handleCrashReport(request, env);
+      if (request.method === "OPTIONS" && hasBrowserOrigin(request)) {
+        return jsonResponse(
+          { ok: false, error: "Cross-origin browser requests are not allowed" },
+          403,
+        );
       }
 
       return jsonResponse({ ok: false, error: "Not found" }, 404);

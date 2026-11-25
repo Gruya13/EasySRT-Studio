@@ -10,6 +10,8 @@ import {
   computeSafeCanvasSize,
   computeWheelZoomPct,
   formatRulerTimestamp,
+  inferAudioMimeType,
+  resolveTimelineMediaState,
 } from "../timelineUtils.ts";
 
 describe("timelineUtils", () => {
@@ -63,5 +65,161 @@ describe("timelineUtils", () => {
     assert.equal(formatRulerTimestamp(1500), "00:01.5");
     assert.equal(formatRulerTimestamp(65000), "01:05");
     assert.equal(formatRulerTimestamp(3661500), "1:01:01.5");
+  });
+
+  it("resolves timeline media state across empty startup, queued audio, completed project, and standalone SRT/VTT", () => {
+    // 1. Empty startup (nothing loaded)
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: null,
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: false,
+        hasAudioSource: false,
+        audioPath: null,
+        audioFileName: null,
+        isSubtitleOnly: false,
+      },
+    );
+
+    // 2. Queued audio/video file before ASR (both with null activeProject and placeholder cues: [])
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: null,
+        selectedQueueItem: {
+          audioPath: "/media/interview_ep1.webm",
+          audioFileName: "interview_ep1.webm",
+        },
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: true,
+        audioPath: "/media/interview_ep1.webm",
+        audioFileName: "interview_ep1.webm",
+        isSubtitleOnly: false,
+      },
+    );
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "/media/interview_ep1.mp3",
+          audioFileName: "interview_ep1.mp3",
+          cues: [],
+        },
+        selectedQueueItem: {
+          audioPath: "/media/interview_ep1.mp3",
+          audioFileName: "interview_ep1.mp3",
+        },
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: true,
+        audioPath: "/media/interview_ep1.mp3",
+        audioFileName: "interview_ep1.mp3",
+        isSubtitleOnly: false,
+      },
+    );
+
+    // 3. Completed audio + subtitle project
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "C:\\Studio\\Podcast_Ep14.mp4",
+          audioFileName: "Podcast_Ep14.mp4",
+          cues: [
+            {
+              id: 1,
+              startMs: 500,
+              endMs: 3200,
+              sourceText: "Hello world",
+              translatedText: "Zdravo svete",
+              cps: 4.4,
+              warnings: [],
+            },
+          ],
+        },
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: true,
+        audioPath: "C:\\Studio\\Podcast_Ep14.mp4",
+        audioFileName: "Podcast_Ep14.mp4",
+        isSubtitleOnly: false,
+      },
+    );
+
+    // 4. Standalone imported .srt / .vtt without companion audio
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "/subs/movie_subtitles.srt",
+          audioFileName: "movie_subtitles.srt",
+          cues: [
+            {
+              id: 1,
+              startMs: 1000,
+              endMs: 4000,
+              sourceText: "Imported subtitle",
+              translatedText: "",
+              cps: 5.7,
+              warnings: [],
+            },
+          ],
+        },
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: false,
+        audioPath: null,
+        audioFileName: null,
+        isSubtitleOnly: true,
+      },
+    );
+
+    assert.deepEqual(
+      resolveTimelineMediaState({
+        activeProject: {
+          audioPath: "captions.VTT",
+          audioFileName: "captions.VTT",
+          cues: [],
+        },
+        selectedQueueItem: null,
+      }),
+      {
+        hasLoadedProjectOrFile: true,
+        hasAudioSource: false,
+        audioPath: null,
+        audioFileName: null,
+        isSubtitleOnly: true,
+      },
+    );
+  });
+
+  it("infers MIME types from RIFF/ID3/OggS/fLaC magic headers and falls back to extensions", () => {
+    const wavBytes = new Uint8Array([
+      0x52, 0x49, 0x46, 0x46, 0x24, 0x00, 0x00, 0x00, 0x57, 0x41, 0x56, 0x45,
+    ]);
+    // Transcoded WAV payload from an .mp4 or .mkv path must resolve to audio/wav
+    assert.equal(inferAudioMimeType("/tmp/video.mp4", wavBytes.buffer), "audio/wav");
+    assert.equal(inferAudioMimeType("/tmp/clip.mkv", wavBytes), "audio/wav");
+
+    const id3Bytes = new Uint8Array([0x49, 0x44, 0x33, 0x04]);
+    assert.equal(inferAudioMimeType("unknown.bin", id3Bytes), "audio/mpeg");
+
+    const oggBytes = new Uint8Array([0x4f, 0x67, 0x67, 0x53]);
+    assert.equal(inferAudioMimeType("voice.opus", oggBytes), "audio/ogg");
+
+    const flacBytes = new Uint8Array([0x66, 0x4c, 0x61, 0x43]);
+    assert.equal(inferAudioMimeType("track.dat", flacBytes), "audio/flac");
+
+    // Extension fallbacks
+    assert.equal(inferAudioMimeType("/a/b/speech.MP3"), "audio/mpeg");
+    assert.equal(inferAudioMimeType("/a/b/speech.wav"), "audio/wav");
+    assert.equal(inferAudioMimeType("/a/b/podcast.m4a"), "audio/mp4");
+    assert.equal(inferAudioMimeType("/a/b/clip.aac"), "audio/aac");
+    assert.equal(inferAudioMimeType("/a/b/clip.webm"), "audio/webm");
   });
 });

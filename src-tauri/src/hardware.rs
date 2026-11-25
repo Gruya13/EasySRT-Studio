@@ -2,13 +2,19 @@
 //! and VRAM tier classification).
 
 use crate::models::{GpuInfo, VramTier};
-use std::process::Command;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+const NVIDIA_SMI_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
+const MAX_PROBE_STDOUT_BYTES: u64 = 256 * 1024;
 
 /// Minimum NVIDIA driver version required for CUDA 12.4 (`550.54`).
 pub const MIN_CUDA_12_4_DRIVER_MAJOR: u32 = 550;
@@ -76,12 +82,67 @@ fn normalize_driver_field(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn windows_nvcuda_dll_exists() -> bool {
-    #[cfg(windows)]
+/// Build strict Windows absolute candidate paths for `nvidia-smi.exe` using `%SystemRoot%` and
+/// `%ProgramFiles%` (never a bare relative `"nvidia-smi"` susceptible to CWD/PATH hijacking).
+pub fn build_windows_nvidia_smi_candidates(
+    system_root: Option<&str>,
+    program_files: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut out = Vec::with_capacity(2);
+
+    let sys_root = system_root
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(r"C:\Windows");
+    let sys_root_clean = sys_root.trim_end_matches(['\\', '/']);
+    out.push(PathBuf::from(format!(
+        r"{sys_root_clean}\System32\nvidia-smi.exe"
+    )));
+
+    let prog_files = program_files
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(r"C:\Program Files");
+    let prog_files_clean = prog_files.trim_end_matches(['\\', '/']);
+    out.push(PathBuf::from(format!(
+        r"{prog_files_clean}\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+    )));
+
+    out
+}
+
+fn resolve_nvidia_smi_candidates() -> Vec<PathBuf> {
+    #[cfg(target_os = "windows")]
     {
-        std::path::Path::new(r"C:\Windows\System32\nvcuda.dll").is_file()
+        let sys_root = std::env::var("SystemRoot")
+            .ok()
+            .or_else(|| std::env::var("WINDIR").ok());
+        let prog_files = std::env::var("ProgramFiles").ok();
+        build_windows_nvidia_smi_candidates(sys_root.as_deref(), prog_files.as_deref())
     }
-    #[cfg(not(windows))]
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        vec![
+            PathBuf::from("/usr/bin/nvidia-smi"),
+            PathBuf::from("/usr/local/bin/nvidia-smi"),
+            PathBuf::from("nvidia-smi"),
+        ]
+    }
+}
+
+fn windows_nvcuda_dll_exists() -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        let sys_root = std::env::var("SystemRoot")
+            .ok()
+            .or_else(|| std::env::var("WINDIR").ok())
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| r"C:\Windows".to_string());
+        let sys_root_clean = sys_root.trim_end_matches(['\\', '/']);
+        PathBuf::from(format!(r"{sys_root_clean}\System32\nvcuda.dll")).is_file()
+    }
+    #[cfg(not(target_os = "windows"))]
     {
         true
     }
@@ -224,41 +285,84 @@ pub fn parse_nvidia_smi_output(raw: &str) -> GpuInfo {
     parse_nvidia_smi_output_with_nvcuda(raw, true)
 }
 
-fn run_nvidia_smi_query(binary: &str, query: &str) -> Option<String> {
+fn run_command_stdout_with_timeout(
+    binary: &Path,
+    args: &[&str],
+    timeout: Duration,
+) -> Option<String> {
     let mut cmd = Command::new(binary);
-    cmd.args([query, "--format=csv,noheader,nounits"]);
+    cmd.args(args)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
 
     #[cfg(windows)]
     cmd.creation_flags(CREATE_NO_WINDOW);
 
-    let output = cmd.output().ok()?;
-    if !output.status.success() {
+    let mut child = cmd.spawn().ok()?;
+    let stdout_pipe = child.stdout.take();
+    let reader_handle = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        if let Some(pipe) = stdout_pipe {
+            let _ = pipe.take(MAX_PROBE_STDOUT_BYTES).read_to_end(&mut buf);
+        }
+        buf
+    });
+
+    let start = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    let _ = reader_handle.join();
+                    return None;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = reader_handle.join();
+                return None;
+            }
+        }
+    };
+
+    let stdout_bytes = reader_handle.join().ok()?;
+    if !status.success() {
         return None;
     }
 
-    String::from_utf8(output.stdout).ok()
+    String::from_utf8(stdout_bytes).ok()
 }
 
-fn run_nvidia_smi_command(binary: &str) -> Option<String> {
+fn run_nvidia_smi_query(binary: &Path, query: &str) -> Option<String> {
+    run_command_stdout_with_timeout(
+        binary,
+        &[query, "--format=csv,noheader,nounits"],
+        NVIDIA_SMI_PROBE_TIMEOUT,
+    )
+}
+
+fn run_nvidia_smi_command(binary: &Path) -> Option<String> {
+    if binary.is_absolute() && !binary.is_file() {
+        return None;
+    }
     run_nvidia_smi_query(binary, "--query-gpu=name,memory.total,driver_version")
         .filter(|out| !out.trim().is_empty())
         .or_else(|| run_nvidia_smi_query(binary, "--query-gpu=name,memory.total"))
 }
 
-/// Probe the system for an NVIDIA GPU using `nvidia-smi`, validate CUDA 12.4 driver support
-/// (and `C:\Windows\System32\nvcuda.dll` on Windows), and classify its VRAM tier.
+/// Probe the system for an NVIDIA GPU using `nvidia-smi` (with strict Windows system paths
+/// and a 5s execution timeout), validate CUDA 12.4 driver support, and classify its VRAM tier.
 pub fn detect_gpu() -> GpuInfo {
-    let candidates: &[&str] = &[
-        "nvidia-smi",
-        #[cfg(windows)]
-        r"C:\Windows\System32\nvidia-smi.exe",
-        #[cfg(windows)]
-        r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe",
-    ];
-
+    let candidates = resolve_nvidia_smi_candidates();
     let nvcuda_present = windows_nvcuda_dll_exists();
 
-    for bin in candidates {
+    for bin in &candidates {
         if let Some(stdout) = run_nvidia_smi_command(bin) {
             let info = parse_nvidia_smi_output_with_nvcuda(&stdout, nvcuda_present);
             if info.has_nvidia {
@@ -281,6 +385,57 @@ pub fn detect_gpu() -> GpuInfo {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn windows_nvidia_smi_candidates_use_strict_absolute_system_paths_only() {
+        let cands = build_windows_nvidia_smi_candidates(
+            Some(r"D:\WinSys"),
+            Some(r"E:\Program Files\"),
+        );
+        assert_eq!(cands.len(), 2);
+        assert_eq!(
+            cands[0].to_string_lossy(),
+            r"D:\WinSys\System32\nvidia-smi.exe"
+        );
+        assert_eq!(
+            cands[1].to_string_lossy(),
+            r"E:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+        );
+        assert!(
+            !cands
+                .iter()
+                .any(|p| p.to_string_lossy().eq_ignore_ascii_case("nvidia-smi")
+                    || p.to_string_lossy().eq_ignore_ascii_case("nvidia-smi.exe")),
+            "Must never include bare relative nvidia-smi on Windows"
+        );
+
+        let defaults = build_windows_nvidia_smi_candidates(None, Some("   "));
+        assert_eq!(
+            defaults[0].to_string_lossy(),
+            r"C:\Windows\System32\nvidia-smi.exe"
+        );
+        assert_eq!(
+            defaults[1].to_string_lossy(),
+            r"C:\Program Files\NVIDIA Corporation\NVSMI\nvidia-smi.exe"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn command_probe_timeout_kills_hanging_child_promptly() {
+        let t0 = Instant::now();
+        let res = run_command_stdout_with_timeout(
+            Path::new("/bin/sleep"),
+            &["10"],
+            Duration::from_millis(120),
+        );
+        assert!(res.is_none(), "Hanging probe must time out and return None");
+        assert!(
+            t0.elapsed() < Duration::from_secs(2),
+            "Timeout took too long: {:?}",
+            t0.elapsed()
+        );
+    }
 
     #[test]
     fn parses_driver_versions_and_validates_cuda_12_4_threshold() {

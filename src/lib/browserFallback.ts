@@ -2,7 +2,6 @@ import type { UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ApiKeyStatus,
   AppConfig,
-  AudioPreviewData,
   BugReportRequest,
   CatalogItem,
   CatalogItemKind,
@@ -16,6 +15,7 @@ import type {
   InstalledComponentStatus,
   JobOptions,
   JobProgressEvent,
+  MediaProbeResult,
   ReportSubmitResult,
   SegmentRules,
   SerbianScript,
@@ -23,14 +23,18 @@ import type {
   SubtitleCue,
   SubtitleProject,
   TranslationProviderKind,
-} from "../types/models";
+  TranslationStyle,
+  WaveformPreviewData,
+} from "../types/models.ts";
 import {
   convertSerbianScriptText,
   getPresetSegmentRules,
+  normalizeSegmentRules,
+  normalizeTranslationStyle,
   parseSubtitleFileText,
   recalculateCue,
-} from "./subtitleUtils";
-import { APP_VERSION } from "./version";
+} from "./subtitleUtils.ts";
+import { APP_VERSION } from "./version.ts";
 
 const FALLBACK_CATALOG_ITEMS: CatalogItem[] = [
   {
@@ -273,16 +277,38 @@ let mockConfig: AppConfig = {
   },
   hasCompletedSetup: true,
   autoSendCrashReports: true,
+  editorSourceFontSize: 19,
+  editorTranslatedFontSize: 22,
+  autoProbeOnImport: true,
+  autoCheckpoints: true,
+  allowLocalEncryptedVault: false,
 };
 
 let mockApiKeyStatus: ApiKeyStatus = {
   hasDeepSeekKey: false,
   hasCustomApiKey: false,
-  storageBackend: "local-file",
+  storageBackend: "memory-session",
 };
 
 const downloadListeners = new Set<(event: DownloadProgressEvent) => void>();
 const jobListeners = new Set<(event: JobProgressEvent) => void>();
+const probeListeners = new Set<(event: MediaProbeResult) => void>();
+let activeProbeControl: { jobId: string; cancelled: boolean } | null = null;
+
+function convertTranslatedVariantsScript(
+  variants: Partial<Record<TranslationStyle, string>> | undefined,
+  targetScript: SerbianScript,
+): Partial<Record<TranslationStyle, string>> | undefined {
+  if (!variants) return undefined;
+  const next: Partial<Record<TranslationStyle, string>> = {};
+  for (const style of ["natural", "formal"] as const) {
+    const val = variants[style];
+    if (typeof val === "string") {
+      next[style] = convertSerbianScriptText(val, targetScript);
+    }
+  }
+  return Object.keys(next).length > 0 ? next : undefined;
+}
 
 export function createDemoProject(
   audioPath = "C:/Media/Podcast_Ep14_AI_Production.mp3",
@@ -292,7 +318,10 @@ export function createDemoProject(
   const effectiveOptions: JobOptions = options
     ? {
         ...options,
+        segmentRules: normalizeSegmentRules(options.segmentRules),
         correctSourceAsr: options.correctSourceAsr ?? false,
+        translationStyle: normalizeTranslationStyle(options.translationStyle),
+        removeFillers: options.removeFillers ?? true,
       }
     : {
         sourceLanguage: "en",
@@ -306,6 +335,8 @@ export function createDemoProject(
         },
         polishSerbian: true,
         correctSourceAsr: false,
+        translationStyle: "natural",
+        removeFillers: true,
         providerOverride: null,
       };
 
@@ -364,16 +395,25 @@ export function createDemoProject(
     },
   ];
 
+  const activeStyle = normalizeTranslationStyle(effectiveOptions.translationStyle);
   const cues = rawCues.map((c) => {
+    const baseText =
+      activeStyle === "formal"
+        ? c.translatedText.replace("Danas testiramo", "Danas ispitujemo")
+        : c.translatedText;
     const text =
       effectiveOptions.script === "cyrillic"
-        ? convertSerbianScriptText(c.translatedText, "cyrillic")
-        : c.translatedText;
+        ? convertSerbianScriptText(baseText, "cyrillic")
+        : baseText;
+    const finalTranslated =
+      effectiveOptions.targetLanguage === "none" ? "" : text;
     return recalculateCue(
       {
         ...c,
-        translatedText:
-          effectiveOptions.targetLanguage === "none" ? "" : text,
+        translatedText: finalTranslated,
+        translatedVariants: finalTranslated
+          ? { [activeStyle]: finalTranslated }
+          : undefined,
         cps: 0,
         warnings: [],
       },
@@ -398,6 +438,9 @@ export function createDemoProject(
     cues,
     phase: "completed",
     completedTranslationBatches: 1,
+    completedTranslationStyle:
+      effectiveOptions.targetLanguage === "none" ? null : activeStyle,
+    topicContext: null,
     errorMessage: null,
     updatedAt: new Date().toISOString(),
   };
@@ -534,7 +577,12 @@ export const browserFallback = {
         await this.installComponent(id);
       }
     }
-    mockConfig = { ...mockConfig, hasCompletedSetup: true };
+    mockConfig = {
+      ...mockConfig,
+      activeWhisperModelId: "whisper-large-v3-turbo-q5_0",
+      activeLlmModelId: "llm-gemma4-e4b-qat",
+      hasCompletedSetup: true,
+    };
     return buildSetupStatus();
   },
 
@@ -571,7 +619,16 @@ export const browserFallback = {
   },
 
   async saveConfig(config: AppConfig): Promise<AppConfig> {
-    mockConfig = { ...config };
+    mockConfig = {
+      ...config,
+      defaultSegmentRules: normalizeSegmentRules(config.defaultSegmentRules),
+    };
+    mockApiKeyStatus = {
+      ...mockApiKeyStatus,
+      storageBackend: mockConfig.allowLocalEncryptedVault
+        ? "local-vault"
+        : "memory-session",
+    };
     return mockConfig;
   },
 
@@ -610,6 +667,13 @@ export const browserFallback = {
   async loadCheckpoint(jobId: string): Promise<SubtitleProject> {
     const found = mockCheckpoints.find((c) => c.jobId === jobId);
     return found ?? createDemoProject(undefined, undefined, jobId);
+  },
+
+  async saveProjectCheckpoint(project: SubtitleProject): Promise<void> {
+    mockCheckpoints = [
+      project,
+      ...mockCheckpoints.filter((c) => c.jobId !== project.jobId),
+    ];
   },
 
   async deleteCheckpoint(jobId: string): Promise<void> {
@@ -660,12 +724,15 @@ export const browserFallback = {
     project: SubtitleProject,
     rules: SegmentRules,
   ): Promise<SubtitleProject> {
-    const updatedCues = project.cues.map((cue) => recalculateCue(cue, rules));
+    const normalizedRules = normalizeSegmentRules(rules);
+    const updatedCues = project.cues.map((cue) =>
+      recalculateCue(cue, normalizedRules),
+    );
     const updated: SubtitleProject = {
       ...project,
       options: {
         ...project.options,
-        segmentRules: rules,
+        segmentRules: normalizedRules,
       },
       cues: updatedCues,
       updatedAt: new Date().toISOString(),
@@ -683,10 +750,14 @@ export const browserFallback = {
       }),
     );
     await new Promise((r) => setTimeout(r, 180));
+    const activeStyle = normalizeTranslationStyle(
+      project.options.translationStyle,
+    );
     const demo = createDemoProject(
       project.audioPath,
       {
         ...project.options,
+        translationStyle: activeStyle,
         targetLanguage:
           project.options.targetLanguage === "none"
             ? "sr"
@@ -697,18 +768,26 @@ export const browserFallback = {
     return {
       ...project,
       cues: project.cues.map((c, idx) => {
+        const existingVariant = c.translatedVariants?.[activeStyle]?.trim();
         const fallbackTranslated =
           demo.cues[idx]?.translatedText ||
           convertSerbianScriptText(c.sourceText, project.options.script);
+        const translatedText = existingVariant || fallbackTranslated;
         return recalculateCue(
           {
             ...c,
-            translatedText: c.translatedText.trim() || fallbackTranslated,
+            translatedText,
+            translatedVariants: {
+              ...(c.translatedVariants ?? {}),
+              [activeStyle]: translatedText,
+            },
           },
           project.options.segmentRules,
         );
       }),
       phase: "completed",
+      completedTranslationBatches: 1,
+      completedTranslationStyle: activeStyle,
       updatedAt: new Date().toISOString(),
     };
   },
@@ -723,21 +802,30 @@ export const browserFallback = {
       }),
     );
     await new Promise((r) => setTimeout(r, 160));
+    const activeStyle = normalizeTranslationStyle(
+      project.options.translationStyle,
+    );
     return {
       ...project,
-      cues: project.cues.map((c) =>
-        recalculateCue(
+      cues: project.cues.map((c) => {
+        const polished = convertSerbianScriptText(
+          c.translatedText.trim() || c.sourceText,
+          project.options.script,
+        );
+        return recalculateCue(
           {
             ...c,
-            translatedText: convertSerbianScriptText(
-              c.translatedText.trim() || c.sourceText,
-              project.options.script,
-            ),
+            translatedText: polished,
+            translatedVariants: {
+              ...(c.translatedVariants ?? {}),
+              [activeStyle]: polished,
+            },
           },
           project.options.segmentRules,
-        ),
-      ),
+        );
+      }),
       phase: "completed",
+      completedTranslationStyle: activeStyle,
       updatedAt: new Date().toISOString(),
     };
   },
@@ -783,9 +871,19 @@ export const browserFallback = {
       const hasTranslated = c.translatedText.trim().length > 0;
       const raw = hasTranslated ? c.translatedText : c.sourceText;
       const condensed = condenseTextToBudget(raw, maxChars);
+      const activeStyle = normalizeTranslationStyle(
+        project.options.translationStyle,
+      );
       return recalculateCue(
         hasTranslated
-          ? { ...c, translatedText: condensed }
+          ? {
+              ...c,
+              translatedText: condensed,
+              translatedVariants: {
+                ...(c.translatedVariants ?? {}),
+                [activeStyle]: condensed,
+              },
+            }
           : { ...c, sourceText: condensed },
         rules,
       );
@@ -975,6 +1073,10 @@ export const browserFallback = {
         cue.translatedText,
         targetScript,
       ),
+      translatedVariants: convertTranslatedVariantsScript(
+        cue.translatedVariants,
+        targetScript,
+      ),
     }));
   },
 
@@ -995,20 +1097,58 @@ export const browserFallback = {
     return { writtenFiles };
   },
 
-  async readAudioPreviewBase64(_audioPath: string): Promise<AudioPreviewData> {
+  async prepareAudioWaveform(
+    audioPath: string,
+    targetBuckets = 2000,
+  ): Promise<WaveformPreviewData> {
+    const durationMs = 24000;
+    const count = Math.max(64, Math.min(4096, Math.round(targetBuckets || 2000)));
+    const speechSpans: Array<[number, number]> = [
+      [400, 3900],
+      [4200, 8100],
+      [8400, 10500],
+      [10900, 14900],
+      [15300, 19400],
+      [19800, 23500],
+    ];
+    const peaks: number[] = new Array(count);
+    for (let i = 0; i < count; i += 1) {
+      const tMs = (i / count) * durationMs;
+      const span = speechSpans.find(([s, e]) => tMs >= s && tMs <= e);
+      if (span) {
+        const [s, e] = span;
+        const pos = (tMs - s) / Math.max(1, e - s);
+        const env = Math.sin(Math.min(1, Math.min(pos * 7, (1 - pos) * 7)) * (Math.PI / 2));
+        const mod =
+          0.5 +
+          0.26 * Math.sin(tMs * 0.017) +
+          0.16 * Math.cos(tMs * 0.043) +
+          0.08 * Math.sin(tMs * 0.097);
+        peaks[i] = Number(
+          Math.max(0.08, Math.min(0.96, mod * (0.45 + 0.55 * env))).toFixed(4),
+        );
+      } else {
+        peaks[i] = 0.025;
+      }
+    }
+    return {
+      canonicalPath: audioPath,
+      durationMs,
+      peaks,
+    };
+  },
+
+  async readAudioPlaybackBytes(_audioPath: string): Promise<ArrayBuffer> {
     const sampleRate = 16000;
-    const durationSec = 24;
-    const numSamples = sampleRate * durationSec;
+    const numSamples = 16000; // 1s minimal valid silent RIFF/WAVE
     const dataSize = numSamples * 2;
     const buffer = new ArrayBuffer(44 + dataSize);
     const view = new DataView(buffer);
-
     const writeAscii = (offset: number, text: string) => {
       for (let i = 0; i < text.length; i += 1) {
         view.setUint8(offset + i, text.charCodeAt(i));
       }
     };
-
     writeAscii(0, "RIFF");
     view.setUint32(4, 36 + dataSize, true);
     writeAscii(8, "WAVE");
@@ -1022,43 +1162,83 @@ export const browserFallback = {
     view.setUint16(34, 16, true);
     writeAscii(36, "data");
     view.setUint32(40, dataSize, true);
+    return buffer;
+  },
 
-    const speechSpans: Array<[number, number, number]> = [
-      [0.4, 3.9, 210],
-      [4.2, 8.1, 240],
-      [8.4, 10.5, 220],
-      [10.9, 14.9, 195],
-      [15.3, 19.4, 230],
-      [19.8, 23.5, 205],
-    ];
-    for (let i = 0; i < numSamples; i += 1) {
-      const t = i / sampleRate;
-      const span = speechSpans.find(([s, e]) => t >= s && t <= e);
-      let sample = 0;
-      if (span) {
-        const [s, e, baseHz] = span;
-        const fade = Math.sin(
-          Math.min(1, Math.min((t - s) * 8, (e - t) * 8)) * (Math.PI / 2),
-        );
-        const mod = 0.65 + 0.35 * Math.sin(2 * Math.PI * 3.2 * t);
-        const tone =
-          0.6 * Math.sin(2 * Math.PI * baseHz * t) +
-          0.3 * Math.sin(2 * Math.PI * baseHz * 1.5 * t);
-        sample = Math.round(tone * fade * mod * 0.14 * 32767);
-      }
-      view.setInt16(44 + i * 2, sample, true);
-    }
+  async probeMediaFile(
+    jobId: string,
+    audioPath: string,
+  ): Promise<MediaProbeResult> {
+    const token = { jobId, cancelled: false };
+    activeProbeControl = token;
 
-    const bytes = new Uint8Array(buffer);
-    let binary = "";
-    const chunk = 0x8000;
-    for (let i = 0; i < bytes.length; i += chunk) {
-      binary += String.fromCharCode(...bytes.subarray(i, i + chunk));
-    }
-    return {
-      mimeType: "audio/wav",
-      base64Data: btoa(binary),
+    const emit = (result: MediaProbeResult) => {
+      probeListeners.forEach((fn) => fn(result));
     };
+
+    const base: MediaProbeResult = {
+      jobId,
+      audioPath,
+      stage: "acoustic",
+      durationMs: 24000,
+      speechRatio: 0.78,
+      estimatedSpeakers: 2,
+      detectedLanguage: null,
+      topic: null,
+      suggestedStyle: null,
+      error: null,
+    };
+
+    await new Promise((r) => setTimeout(r, 90));
+    if (token.cancelled) {
+      const cancelled: MediaProbeResult = { ...base, stage: "cancelled" };
+      emit(cancelled);
+      return cancelled;
+    }
+    emit(base);
+
+    await new Promise((r) => setTimeout(r, 110));
+    if (token.cancelled) {
+      const cancelled: MediaProbeResult = { ...base, stage: "cancelled" };
+      emit(cancelled);
+      return cancelled;
+    }
+    const asrStage: MediaProbeResult = {
+      ...base,
+      stage: "asr",
+      detectedLanguage: "en",
+    };
+    emit(asrStage);
+
+    await new Promise((r) => setTimeout(r, 110));
+    if (token.cancelled) {
+      const cancelled: MediaProbeResult = { ...asrStage, stage: "cancelled" };
+      emit(cancelled);
+      return cancelled;
+    }
+    const completed: MediaProbeResult = {
+      ...asrStage,
+      stage: "completed",
+      topic: "AI & subtitle production studio",
+      suggestedStyle: "natural",
+    };
+    emit(completed);
+    if (activeProbeControl === token) {
+      activeProbeControl = null;
+    }
+    return completed;
+  },
+
+  async cancelMediaProbe(jobId?: string | null): Promise<boolean> {
+    if (!activeProbeControl) {
+      return false;
+    }
+    if (jobId && activeProbeControl.jobId !== jobId) {
+      return false;
+    }
+    activeProbeControl.cancelled = true;
+    activeProbeControl = null;
+    return true;
   },
 
   async collectDiagnosticsPreview(): Promise<DiagnosticsPreview> {
@@ -1131,6 +1311,15 @@ export const browserFallback = {
     jobListeners.add(handler);
     return () => {
       jobListeners.delete(handler);
+    };
+  },
+
+  async onProbeProgress(
+    handler: (event: MediaProbeResult) => void,
+  ): Promise<UnlistenFn> {
+    probeListeners.add(handler);
+    return () => {
+      probeListeners.delete(handler);
     };
   },
 };

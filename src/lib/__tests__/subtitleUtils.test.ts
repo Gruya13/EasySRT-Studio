@@ -4,10 +4,12 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  MIN_INTER_CUE_GAP_MS,
   calculateCps,
   calculateCueMetrics,
   compareSemver,
   computeCueWarnings,
+  computeSplitBoundaries,
   convertSerbianScriptText,
   cyrillicToLatin,
   formatSrtDocument,
@@ -17,6 +19,8 @@ import {
   formatVttDocument,
   getPresetSegmentRules,
   latinToCyrillic,
+  normalizeSegmentRules,
+  normalizeTranslationStyle,
   parseBulkGlossary,
   parseSubtitleFileText,
   parseTimestampSrt,
@@ -24,7 +28,12 @@ import {
   shouldActivateSyncedProject,
   wrapBalancedLines,
 } from "../subtitleUtils.ts";
-import type { SubtitleCue } from "../../types/models.ts";
+import type {
+  JobOptions,
+  SegmentRules,
+  SubtitleCue,
+  TimedWord,
+} from "../../types/models.ts";
 
 describe("Timestamp Formatting & Parsing", () => {
   it("formats SRT and VTT timestamps across hours, minutes, seconds, and milliseconds", () => {
@@ -92,7 +101,16 @@ describe("CPS, Warnings & Balanced Line Wrapping", () => {
     assert.ok(warnings.includes("critical_cps"));
     assert.ok(warnings.includes("line_too_long"));
     assert.ok(warnings.includes("too_many_lines"));
-    assert.ok(warnings.includes("short_duration"));
+    assert.ok(warnings.includes("duration_too_short"));
+
+    const highCpsCue = {
+      startMs: 0,
+      endMs: 2000,
+      sourceText: "Ovo je malo brži titl sa trideset osam", // 38 chars / 2s = 19.0 CPS (high_cps, not critical_cps)
+      translatedText: "",
+    };
+    const highWarnings = computeCueWarnings(highCpsCue, standardRules);
+    assert.deepEqual(highWarnings, ["high_cps"]);
 
     const longDurationCue = {
       startMs: 0,
@@ -101,7 +119,7 @@ describe("CPS, Warnings & Balanced Line Wrapping", () => {
       translatedText: "",
     };
     const longWarnings = computeCueWarnings(longDurationCue, standardRules);
-    assert.ok(longWarnings.includes("long_duration"));
+    assert.ok(longWarnings.includes("duration_too_long"));
   });
 
   it("wraps long sentences into two balanced lines within maxCharsPerLine", () => {
@@ -116,6 +134,355 @@ describe("CPS, Warnings & Balanced Line Wrapping", () => {
     assert.ok([...lines[0]].length <= 45, `Line 1 too long: ${lines[0]}`);
     assert.ok([...lines[1]].length <= 45, `Line 2 too long: ${lines[1]}`);
     assert.equal(lines.join(" "), longText);
+  });
+
+  it("enforces Workstream 7 80 ms inter-cue breathing gap when splitting cues", () => {
+    assert.equal(MIN_INTER_CUE_GAP_MS, 80);
+
+    // Normal cue split leaves exact 80 ms gap (splitMs - 40 / splitMs + 40)
+    const normal = computeSplitBoundaries(1000, 3000, 2000);
+    assert.deepEqual(normal, { leftEndMs: 1960, rightStartMs: 2040 });
+    assert.equal(normal.rightStartMs - normal.leftEndMs, 80);
+
+    // Near left edge of a >= 400 ms cue clamps split to keep >= 160 ms per half AND 80 ms gap
+    const nearLeft = computeSplitBoundaries(1000, 2000, 1100);
+    assert.deepEqual(nearLeft, { leftEndMs: 1160, rightStartMs: 1240 });
+    assert.ok(nearLeft.leftEndMs - 1000 >= 160);
+    assert.ok(2000 - nearLeft.rightStartMs >= 160);
+    assert.equal(nearLeft.rightStartMs - nearLeft.leftEndMs, 80);
+
+    // Near right edge clamps symmetrically
+    const nearRight = computeSplitBoundaries(1000, 2000, 1950);
+    assert.deepEqual(nearRight, { leftEndMs: 1760, rightStartMs: 1840 });
+    assert.ok(2000 - nearRight.rightStartMs >= 160);
+    assert.equal(nearRight.rightStartMs - nearRight.leftEndMs, 80);
+
+    // Tight cue (360 ms total: 320..399 ms) keeps >= 160 ms per half with partial 40 ms gap
+    const tight = computeSplitBoundaries(0, 360, 180);
+    assert.deepEqual(tight, { leftEndMs: 160, rightStartMs: 200 });
+    assert.equal(tight.rightStartMs - tight.leftEndMs, 40);
+
+    // Exact 320 ms cue keeps 160 ms per half with 0 ms gap
+    const minTwoHalves = computeSplitBoundaries(500, 820, 660);
+    assert.deepEqual(minTwoHalves, { leftEndMs: 660, rightStartMs: 660 });
+
+    // Ultra-short cue (< 320 ms) never produces zero-length or inverted halves
+    const ultraShort = computeSplitBoundaries(100, 300, 200);
+    assert.deepEqual(ultraShort, { leftEndMs: 200, rightStartMs: 200 });
+    assert.ok(ultraShort.leftEndMs > 100 && ultraShort.rightStartMs < 300);
+  });
+
+  it("guards negations, prepositions, auxiliaries, and proper-name pairs in wrapBalancedLines", () => {
+    // Negation guard: never leave "ne" at the end of Line 1
+    const negWrapped = wrapBalancedLines(
+      "Rekao mi je da ne dolazim sutra na posao.",
+      28,
+      2,
+    );
+    const negLines = negWrapped.split("\n");
+    assert.equal(negLines.length, 2);
+    assert.notEqual(negLines[0].split(" ").at(-1)?.toLowerCase(), "ne");
+    assert.notEqual(negLines[0].split(" ").at(-1)?.toLowerCase(), "da");
+
+    // Preposition & auxiliary guard: never end Line 1 on "sa", "smo", or "o"
+    const prepWrapped = wrapBalancedLines(
+      "Danas smo razgovarali sa našim kolegama o planu.",
+      42,
+      2,
+    );
+    assert.equal(
+      prepWrapped,
+      "Danas smo razgovarali\nsa našim kolegama o planu.",
+    );
+
+    // Proper-name pair guard keeps "Nikola Tesla" intact on the same line
+    const nameWrapped = wrapBalancedLines(
+      "Ovaj projekat predvodi Nikola Tesla u glavnoj laboratoriji.",
+      42,
+      2,
+    );
+    assert.ok(
+      nameWrapped.includes("Nikola Tesla"),
+      `Expected 'Nikola Tesla' intact on one line, got: ${nameWrapped}`,
+    );
+
+    // Sentence-opening adverb exclusion allows breaking after "Međutim" while
+    // genuine proper-name pair "Aleksandar Tesla" stays together
+    assert.equal(
+      wrapBalancedLines("Međutim Marko radi.", 14, 2),
+      "Međutim\nMarko radi.",
+    );
+    assert.equal(
+      wrapBalancedLines("Aleksandar Tesla radi.", 18, 2),
+      "Aleksandar Tesla\nradi.",
+    );
+
+    // Hard line-width limit (1000/char overflow) still overrides linguistic penalty when unavoidable
+    const forced = wrapBalancedLines(
+      "Danas Marko dolazi ranije u kancelariju da završi izveštaj.",
+      30,
+      2,
+    );
+    assert.equal(
+      forced,
+      "Danas Marko dolazi ranije u\nkancelariju da završi izveštaj.",
+    );
+  });
+
+  it("matches Rust 1:1 on the shared 15-sentence bilingual parity corpus (maxLines 1..=4) and canonical warnings", () => {
+    const corpus: Array<[string, number, [string, string, string, string]]> = [
+      [
+        "Rekao mi je da ne dolazim sutra na posao.",
+        28,
+        [
+          "Rekao mi je da ne dolazim sutra na posao.",
+          "Rekao mi je da ne dolazim\nsutra na posao.",
+          "Rekao mi je da ne dolazim\nsutra na posao.",
+          "Rekao mi je da ne dolazim\nsutra na posao.",
+        ],
+      ],
+      [
+        "Danas smo razgovarali sa našim kolegama o planu.",
+        42,
+        [
+          "Danas smo razgovarali sa našim kolegama o planu.",
+          "Danas smo razgovarali\nsa našim kolegama o planu.",
+          "Danas smo razgovarali\nsa našim kolegama o planu.",
+          "Danas smo razgovarali\nsa našim kolegama o planu.",
+        ],
+      ],
+      [
+        "Ovaj projekat predvodi Nikola Tesla u glavnoj laboratoriji.",
+        38,
+        [
+          "Ovaj projekat predvodi Nikola Tesla u glavnoj laboratoriji.",
+          "Ovaj projekat predvodi Nikola Tesla\nu glavnoj laboratoriji.",
+          "Ovaj projekat predvodi Nikola Tesla\nu glavnoj laboratoriji.",
+          "Ovaj projekat predvodi Nikola Tesla\nu glavnoj laboratoriji.",
+        ],
+      ],
+      [
+        "Danas Marko dolazi ranije u kancelariju da završi izveštaj.",
+        30,
+        [
+          "Danas Marko dolazi ranije u kancelariju da završi izveštaj.",
+          "Danas Marko dolazi ranije u\nkancelariju da završi izveštaj.",
+          "Danas Marko dolazi\nranije u kancelariju\nda završi izveštaj.",
+          "Danas Marko dolazi\nranije u kancelariju\nda završi izveštaj.",
+        ],
+      ],
+      [
+        "Овај пројекат предводи Никола Тесла у главној лабораторији у Београду.",
+        34,
+        [
+          "Овај пројекат предводи Никола Тесла у главној лабораторији у Београду.",
+          "Овај пројекат предводи Никола Тесла\nу главној лабораторији у Београду.",
+          "Овај пројекат предводи\nНикола Тесла у главној\nлабораторији у Београду.",
+          "Овај пројекат предводи\nНикола Тесла у главној\nлабораторији у Београду.",
+        ],
+      ],
+      [
+        "Нисам сигуран да нећемо морати да кренемо раније него што смо планирали.",
+        30,
+        [
+          "Нисам сигуран да нећемо морати да кренемо раније него што смо планирали.",
+          "Нисам сигуран да нећемо морати\nда кренемо раније него што смо планирали.",
+          "Нисам сигуран да нећемо морати\nда кренемо раније\nнего што смо планирали.",
+          "Нисам сигуран да нећемо морати\nда кренемо раније\nнего што смо планирали.",
+        ],
+      ],
+      [
+        "We didn't expect to meet San Francisco engineers at the conference today.",
+        30,
+        [
+          "We didn't expect to meet San Francisco engineers at the conference today.",
+          "We didn't expect to meet San Francisco\nengineers at the conference today.",
+          "We didn't expect to meet\nSan Francisco engineers\nat the conference today.",
+          "We didn't expect to meet\nSan Francisco engineers\nat the conference today.",
+        ],
+      ],
+      [
+        "Today John arrives early, because he wants to review the entire draft before noon.",
+        30,
+        [
+          "Today John arrives early, because he wants to review the entire draft before noon.",
+          "Today John arrives early, because he wants\nto review the entire draft before noon.",
+          "Today John arrives early,\nbecause he wants to review\nthe entire draft before noon.",
+          "Today John arrives early,\nbecause he wants to review\nthe entire draft before noon.",
+        ],
+      ],
+      [
+        "First sentence ends here. Second sentence opens cleanly! Third part wraps onto line three.",
+        36,
+        [
+          "First sentence ends here. Second sentence opens cleanly! Third part wraps onto line three.",
+          "First sentence ends here. Second sentence opens\ncleanly! Third part wraps onto line three.",
+          "First sentence ends here.\nSecond sentence opens cleanly!\nThird part wraps onto line three.",
+          "First sentence ends here.\nSecond sentence opens cleanly!\nThird part wraps onto line three.",
+        ],
+      ],
+      [
+        "Profesor dr. Marko Petrović je objasnio zašto ne smemo da preskočimo ovaj važan korak u analizi podataka.",
+        32,
+        [
+          "Profesor dr. Marko Petrović je objasnio zašto ne smemo da preskočimo ovaj važan korak u analizi podataka.",
+          "Profesor dr. Marko Petrović je objasnio zašto ne smemo\nda preskočimo ovaj važan korak u analizi podataka.",
+          "Profesor dr. Marko Petrović je objasnio\nzašto ne smemo da preskočimo ovaj\nvažan korak u analizi podataka.",
+          "Profesor dr. Marko Petrović\nje objasnio zašto ne smemo\nda preskočimo ovaj važan\nkorak u analizi podataka.",
+        ],
+      ],
+      [
+        "Када смо стигли у Нови Сад, одмах смо отишли на састанак са колегама из централног тима за развој софтвера.",
+        32,
+        [
+          "Када смо стигли у Нови Сад, одмах смо отишли на састанак са колегама из централног тима за развој софтвера.",
+          "Када смо стигли у Нови Сад, одмах смо отишли на састанак\nса колегама из централног тима за развој софтвера.",
+          "Када смо стигли у Нови Сад, одмах\nсмо отишли на састанак са колегама\nиз централног тима за развој софтвера.",
+          "Када смо стигли у Нови Сад,\nодмах смо отишли на састанак\nса колегама из централног\nтима за развој софтвера.",
+        ],
+      ],
+      [
+        "She told us that she can't join the meeting in New York without her manager's final approval.",
+        30,
+        [
+          "She told us that she can't join the meeting in New York without her manager's final approval.",
+          "She told us that she can't join the meeting\nin New York without her manager's final approval.",
+          "She told us that she can't join\nthe meeting in New York without\nher manager's final approval.",
+          "She told us that she can't\njoin the meeting in New York\nwithout her manager's\nfinal approval.",
+        ],
+      ],
+      [
+        "Međutim Marko radi bez prestanka na ovom zadatku.",
+        18,
+        [
+          "Međutim Marko radi bez prestanka na ovom zadatku.",
+          "Međutim Marko radi\nbez prestanka na ovom zadatku.",
+          "Međutim Marko\nradi bez prestanka\nna ovom zadatku.",
+          "Međutim Marko\nradi bez prestanka\nna ovom zadatku.",
+        ],
+      ],
+      [
+        "Aleksandar Tesla radi svakog dana u laboratoriji.",
+        20,
+        [
+          "Aleksandar Tesla radi svakog dana u laboratoriji.",
+          "Aleksandar Tesla radi\nsvakog dana u laboratoriji.",
+          "Aleksandar Tesla\nradi svakog dana\nu laboratoriji.",
+          "Aleksandar Tesla\nradi svakog dana\nu laboratoriji.",
+        ],
+      ],
+      [
+        "Kratak titl u jednom redu.",
+        42,
+        [
+          "Kratak titl u jednom redu.",
+          "Kratak titl u jednom redu.",
+          "Kratak titl u jednom redu.",
+          "Kratak titl u jednom redu.",
+        ],
+      ],
+    ];
+
+    assert.equal(corpus.length, 15);
+    for (const [idx, [text, maxChars, expectedByLines]] of corpus.entries()) {
+      for (let maxLines = 1; maxLines <= 4; maxLines++) {
+        const actual = wrapBalancedLines(text, maxChars, maxLines);
+        assert.equal(
+          actual,
+          expectedByLines[maxLines - 1],
+          `Parity mismatch on sentence #${idx + 1} (maxLines=${maxLines})`,
+        );
+        assert.equal(
+          actual.split("\n").join(" "),
+          text,
+          `Wrapped text must preserve all words on sentence #${idx + 1}`,
+        );
+      }
+    }
+
+    // Canonical cue warning IDs & thresholds parity matrix
+    const standardRules = getPresetSegmentRules("standard");
+    const warningCases: Array<{
+      cue: Pick<
+        SubtitleCue,
+        "startMs" | "endMs" | "sourceText" | "translatedText"
+      >;
+      expectedCps: number;
+      expectedWarnings: string[];
+    }> = [
+      {
+        cue: {
+          startMs: 1000,
+          endMs: 4000,
+          sourceText: "Dobro došli u EasySRT Studio.",
+          translatedText: "",
+        },
+        expectedCps: 9.7,
+        expectedWarnings: [],
+      },
+      {
+        cue: {
+          startMs: 0,
+          endMs: 2000,
+          sourceText: "Ovo je malo brži titl sa trideset osam",
+          translatedText: "",
+        },
+        expectedCps: 19.0,
+        expectedWarnings: ["high_cps"],
+      },
+      {
+        cue: {
+          startMs: 0,
+          endMs: 500,
+          sourceText:
+            "Ovaj prvi red ima mnogo više od četrdeset dva karaktera u jednom redu titla.\nDrugi red.\nTreći red.",
+          translatedText: "",
+        },
+        expectedCps: 192.0,
+        expectedWarnings: [
+          "critical_cps",
+          "line_too_long",
+          "too_many_lines",
+          "duration_too_short",
+        ],
+      },
+      {
+        cue: {
+          startMs: 0,
+          endMs: 8500,
+          sourceText: "Dugačak prikaz na ekranu.",
+          translatedText: "",
+        },
+        expectedCps: 2.9,
+        expectedWarnings: ["duration_too_long"],
+      },
+      {
+        cue: {
+          startMs: 0,
+          endMs: 3000,
+          sourceText: "Prvi red.\nDrugi red.\nTreći red.",
+          translatedText: "",
+        },
+        expectedCps: 9.7,
+        expectedWarnings: ["too_many_lines"],
+      },
+      {
+        cue: {
+          startMs: 0,
+          endMs: 200,
+          sourceText: "   ",
+          translatedText: "",
+        },
+        expectedCps: 0.0,
+        expectedWarnings: [],
+      },
+    ];
+
+    for (const tc of warningCases) {
+      const metrics = calculateCueMetrics(tc.cue, standardRules);
+      assert.equal(metrics.cps, tc.expectedCps);
+      assert.deepEqual(metrics.warnings, tc.expectedWarnings);
+    }
   });
 });
 
@@ -356,5 +723,82 @@ describe("Semantic Version Comparison", () => {
     assert.equal(compareSemver("v0.1.1", "0.1.1"), 0);
     assert.equal(compareSemver("0.1.1-beta", "v0.1.1"), 0);
     assert.equal(compareSemver("v0.1.0", "0.1.1"), -1);
+  });
+});
+
+describe("Speaker-Change Rules & Translation Style Contracts", () => {
+  it("defaults splitOnSpeakerChange to true for all presets and preserves explicit overrides", () => {
+    assert.equal(getPresetSegmentRules("standard").splitOnSpeakerChange, true);
+    assert.equal(getPresetSegmentRules("reels").splitOnSpeakerChange, true);
+    assert.equal(getPresetSegmentRules("custom").splitOnSpeakerChange, true);
+
+    const legacyRules: SegmentRules = {
+      preset: "reels",
+      maxCharsPerLine: 20,
+      maxLines: 1,
+      minDurationMs: 600,
+      maxDurationMs: 3500,
+      maxCps: 18,
+    };
+    assert.equal(
+      getPresetSegmentRules("standard", legacyRules).splitOnSpeakerChange,
+      true,
+    );
+    assert.equal(
+      normalizeSegmentRules(legacyRules).splitOnSpeakerChange,
+      true,
+    );
+    assert.equal(normalizeSegmentRules(legacyRules).preset, "reels");
+
+    const disabledRules: SegmentRules = {
+      ...legacyRules,
+      splitOnSpeakerChange: false,
+    };
+    assert.equal(
+      getPresetSegmentRules("standard", disabledRules).splitOnSpeakerChange,
+      false,
+    );
+    assert.equal(
+      getPresetSegmentRules("reels", disabledRules).splitOnSpeakerChange,
+      false,
+    );
+    assert.equal(
+      getPresetSegmentRules("custom", disabledRules).splitOnSpeakerChange,
+      false,
+    );
+    assert.equal(
+      normalizeSegmentRules(disabledRules).splitOnSpeakerChange,
+      false,
+    );
+  });
+
+  it("normalizes translationStyle with backward-compatible natural default", () => {
+    assert.equal(normalizeTranslationStyle(undefined), "natural");
+    assert.equal(normalizeTranslationStyle(null), "natural");
+    assert.equal(normalizeTranslationStyle(""), "natural");
+    assert.equal(normalizeTranslationStyle("natural"), "natural");
+    assert.equal(normalizeTranslationStyle("formal"), "formal");
+    assert.equal(normalizeTranslationStyle("unknown"), "natural");
+
+    const word: TimedWord = {
+      startMs: 0,
+      endMs: 300,
+      text: "Hello",
+      probability: 0.99,
+      speakerChange: true,
+    };
+    assert.equal(word.speakerChange, true);
+
+    const opts: JobOptions = {
+      sourceLanguage: "en",
+      targetLanguage: "sr",
+      script: "latin",
+      segmentRules: getPresetSegmentRules("standard"),
+      glossary: {},
+      polishSerbian: true,
+      translationStyle: "formal",
+      providerOverride: null,
+    };
+    assert.equal(normalizeTranslationStyle(opts.translationStyle), "formal");
   });
 });

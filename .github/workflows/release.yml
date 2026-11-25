@@ -38,12 +38,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
 
@@ -103,7 +103,18 @@ jobs:
           elif [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             SHOULD_RELEASE="true"
             if [ "$INPUT_PRERELEASE" = "true" ] || [ "$FULL_REF" != "refs/heads/main" ]; then
-              SUFFIX="${INPUT_TAG_SUFFIX:-staging.${SHORT_SHA}}"
+              if [ -n "$INPUT_TAG_SUFFIX" ]; then
+                if [[ ! "$INPUT_TAG_SUFFIX" =~ ^[0-9A-Za-z][0-9A-Za-z.-]{0,48}$ ]] \
+                  || [[ "$INPUT_TAG_SUFFIX" == *..* ]] \
+                  || [[ "$INPUT_TAG_SUFFIX" == *. ]] \
+                  || ! git check-ref-format "refs/tags/v${VERSION}-${INPUT_TAG_SUFFIX}"; then
+                  echo "Invalid tag_suffix '${INPUT_TAG_SUFFIX}': must match ^[0-9A-Za-z][0-9A-Za-z.-]{0,48}$ and be a valid git ref suffix." >&2
+                  exit 1
+                fi
+                SUFFIX="$INPUT_TAG_SUFFIX"
+              else
+                SUFFIX="staging.${SHORT_SHA}"
+              fi
               TAG_NAME="v${VERSION}-${SUFFIX}"
               IS_PRERELEASE="true"
               INCLUDE_UPDATER_JSON="false"
@@ -122,8 +133,8 @@ jobs:
             if ! git rev-parse -q --verify "refs/tags/${TAG_NAME}" >/dev/null; then
               git config user.name "github-actions[bot]"
               git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-              git tag -a "$TAG_NAME" -m "Release ${TAG_NAME}"
-              git push origin "$TAG_NAME"
+              git tag -a -m "Release ${TAG_NAME}" -- "$TAG_NAME"
+              git push origin -- "refs/tags/${TAG_NAME}"
             fi
           fi
 
@@ -168,19 +179,19 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: 22
           cache: "npm"
 
       - name: Setup Rust stable
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@39008827e6b4319a349e9a42dfc90579dd25f1ca # stable
 
       - name: Cache Rust build artifacts
-        uses: swatinem/rust-cache@v2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           workspaces: "./src-tauri -> target"
 
@@ -263,7 +274,7 @@ jobs:
 
       - name: Build and publish Tauri bundles
         id: tauri-build
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@84b9d35b5fc46c1e45415bdb6144030364f7ebc5 # v0.6.2
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
@@ -283,11 +294,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libvulkan-dev cmake build-essential
 
-          # Ubuntu 22.04 ships outdated Vulkan headers and lacks glslc; use the official LunarG Vulkan SDK
-          curl -fsSL -o /tmp/vulkan-sdk.tar.xz https://sdk.lunarg.com/sdk/download/latest/linux/vulkan-sdk.tar.xz
+          # Ubuntu 22.04 ships outdated Vulkan headers and lacks glslc; use a pinned LunarG Vulkan SDK
+          # Verified against https://sdk.lunarg.com/sdk/sha/1.4.363.1/linux/vulkansdk-linux-x86_64-1.4.363.1.tar.xz.json
+          VULKAN_SDK_VERSION="1.4.363.1"
+          VULKAN_SDK_TARBALL="vulkansdk-linux-x86_64-${VULKAN_SDK_VERSION}.tar.xz"
+          VULKAN_SDK_URL="https://sdk.lunarg.com/sdk/download/${VULKAN_SDK_VERSION}/linux/${VULKAN_SDK_TARBALL}"
+          VULKAN_SDK_SHA256="b7867d8ca658563813af666f34b93db87f1b1c7d9d69d97e924c210c7ba33eb8"
+          curl -fsSL -o "/tmp/${VULKAN_SDK_TARBALL}" "$VULKAN_SDK_URL"
+          printf '%s  %s\n' "$VULKAN_SDK_SHA256" "/tmp/${VULKAN_SDK_TARBALL}" | sha256sum -c -
           rm -rf /tmp/vulkan-sdk
           mkdir -p /tmp/vulkan-sdk
-          tar -xf /tmp/vulkan-sdk.tar.xz -C /tmp/vulkan-sdk --strip-components=1
+          tar -xf "/tmp/${VULKAN_SDK_TARBALL}" -C /tmp/vulkan-sdk --strip-components=1
 
           GLSLC_BIN="$(find /tmp/vulkan-sdk -type f -name glslc | head -n 1)"
           test -n "$GLSLC_BIN"
@@ -322,7 +339,7 @@ jobs:
 
           tar -czf whisper-bin-ubuntu-vulkan-x64.tar.gz whisper-bin-ubuntu-vulkan-x64
           sha256sum whisper-bin-ubuntu-vulkan-x64.tar.gz > whisper-bin-ubuntu-vulkan-x64.tar.gz.sha256
-          rm -rf /tmp/whisper-cpp-src /tmp/whisper-cpp-build /tmp/vulkan-sdk /tmp/vulkan-sdk.tar.xz whisper-bin-ubuntu-vulkan-x64
+          rm -rf /tmp/whisper-cpp-src /tmp/whisper-cpp-build /tmp/vulkan-sdk "/tmp/${VULKAN_SDK_TARBALL}" whisper-bin-ubuntu-vulkan-x64
 
       - name: Upload Linux Vulkan whisper-cli tarball to GitHub Release
         if: matrix.platform == 'ubuntu-22.04' && steps.tauri-build.outputs.releaseUploadUrl != ''
@@ -355,7 +372,7 @@ jobs:
 
       - name: Upload Linux Vulkan whisper-cli workflow artifact
         if: matrix.platform == 'ubuntu-22.04'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: whisper-bin-ubuntu-vulkan-x64
           path: |

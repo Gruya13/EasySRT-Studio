@@ -25,6 +25,7 @@ import {
   saveDiagnosticsLocal,
   submitBugReport,
 } from "../lib/tauri";
+import { toSafeExternalHttpsUrl } from "../lib/urlSafety";
 import { useAppStore } from "../stores/appStore";
 import type { DiagnosticsPreview, ReportSubmitResult } from "../types/models";
 
@@ -195,6 +196,7 @@ export function BugReportModal() {
   };
 
   const canSubmit = !submitting && validation.valid;
+  const safeIssueUrl = toSafeExternalHttpsUrl(submitResult?.issueUrl);
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
@@ -257,16 +259,22 @@ export function BugReportModal() {
                       ? ` #${submitResult.issueNumber}`
                       : ""}
                   </span>
-                  {submitResult.issueUrl && (
+                  {safeIssueUrl ? (
                     <a
-                      href={submitResult.issueUrl}
+                      href={safeIssueUrl}
                       target="_blank"
-                      rel="noreferrer"
+                      rel="noopener noreferrer"
                       className="inline-flex items-center gap-1 break-all text-cyan-300 hover:underline select-text"
                     >
-                      <span>{submitResult.issueUrl}</span>
+                      <span>{safeIssueUrl}</span>
                       <ExternalLink className="h-3 w-3 shrink-0" />
                     </a>
+                  ) : (
+                    submitResult.issueUrl && (
+                      <span className="break-all text-slate-300 select-text">
+                        {submitResult.issueUrl}
+                      </span>
+                    )
                   )}
                 </div>
               )}
