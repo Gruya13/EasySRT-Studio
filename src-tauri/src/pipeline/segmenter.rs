@@ -1261,6 +1261,7 @@ pub fn segment_words_with_options(
             end_ms,
             source_text: wrapped_text,
             translated_text: String::new(),
+            translated_variants: std::collections::BTreeMap::new(),
             cps: 0.0,
             warnings: Vec::new(),
         };
@@ -2272,6 +2273,7 @@ mod tests {
             translated_text:
                 "Ово је превод који је превише дугачак за једну линију од четрдесет два карактера.\nДруги ред.\nТрећи ред."
                     .to_string(),
+            translated_variants: std::collections::BTreeMap::new(),
             cps: 0.0,
             warnings: Vec::new(),
         };
@@ -2294,6 +2296,7 @@ mod tests {
             end_ms: 2000,
             source_text: "Ovo je malo brži titl sa trideset osam".to_string(),
             translated_text: String::new(),
+            translated_variants: std::collections::BTreeMap::new(),
             cps: 0.0,
             warnings: Vec::new(),
         };
@@ -2308,6 +2311,7 @@ mod tests {
             end_ms: 8500,
             source_text: "Dugačak prikaz na ekranu.".to_string(),
             translated_text: String::new(),
+            translated_variants: std::collections::BTreeMap::new(),
             cps: 0.0,
             warnings: Vec::new(),
         };
@@ -2609,6 +2613,7 @@ mod tests {
                 end_ms,
                 source_text: text.to_string(),
                 translated_text: String::new(),
+                translated_variants: std::collections::BTreeMap::new(),
                 cps: 0.0,
                 warnings: Vec::new(),
             };
@@ -2835,6 +2840,7 @@ mod tests {
                 end_ms,
                 source_text: text.to_string(),
                 translated_text: String::new(),
+                translated_variants: std::collections::BTreeMap::new(),
                 cps: 0.0,
                 warnings: Vec::new(),
             };
@@ -3191,6 +3197,7 @@ mod tests {
                 end_ms,
                 source_text: text.to_string(),
                 translated_text: String::new(),
+                translated_variants: std::collections::BTreeMap::new(),
                 cps: 0.0,
                 warnings: Vec::new(),
             };
@@ -3490,6 +3497,7 @@ mod tests {
                 end_ms,
                 source_text: source_text.to_string(),
                 translated_text: String::new(),
+                translated_variants: std::collections::BTreeMap::new(),
                 cps: 0.0,
                 warnings: Vec::new(),
             };

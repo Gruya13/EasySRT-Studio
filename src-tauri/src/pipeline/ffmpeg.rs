@@ -24,6 +24,51 @@ const BYTES_PER_SECOND_16KHZ_MONO_S16LE: u64 = SAMPLE_RATE_16KHZ * 2;
 const FFMPEG_PROBE_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_WAVEFORM_BUCKETS: usize = 16_384;
 
+/// Approved audio/video file extensions accepted by `prepare_audio_waveform` and `probe_media_file`.
+pub const APPROVED_MEDIA_EXTENSIONS: &[&str] = &[
+    "mp3", "wav", "m4a", "mp4", "mkv", "mov", "webm", "ogg", "flac", "aac", "wma", "opus", "avi",
+];
+
+/// Verifies `raw_path` resolves to an existing regular file whose canonical target has an
+/// approved audio/video extension (blocking `.json`, `.ssh/id_rsa`, directories, and symlinks
+/// targeting non-media files).
+pub fn validate_approved_media_file(raw_path: &str) -> Result<PathBuf> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return Err(anyhow!("Invalid media file path"));
+    }
+
+    let path = Path::new(trimmed);
+    let canonical = fs::canonicalize(path)
+        .with_context(|| format!("Media file not found or inaccessible: {trimmed}"))?;
+    let meta = fs::metadata(&canonical).with_context(|| {
+        format!(
+            "Failed to inspect media file metadata: {}",
+            canonical.display()
+        )
+    })?;
+    if !meta.is_file() {
+        return Err(anyhow!(
+            "Media path is not a regular file: {}",
+            canonical.display()
+        ));
+    }
+
+    let ext = canonical
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|s| s.to_ascii_lowercase())
+        .unwrap_or_default();
+    if !APPROVED_MEDIA_EXTENSIONS.contains(&ext.as_str()) {
+        return Err(anyhow!(
+            "Disallowed media file extension '.{ext}' for {}",
+            canonical.display()
+        ));
+    }
+
+    Ok(strip_windows_verbatim_prefix(canonical))
+}
+
 #[derive(Debug, Clone)]
 pub struct ConvertedAudio {
     pub wav_path: PathBuf,

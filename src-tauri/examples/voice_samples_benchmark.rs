@@ -9,7 +9,7 @@ use easysrt_studio_lib::models::{
     StoragePaths, SubtitleProject, TranslationProviderKind, TranslationStyle,
 };
 use easysrt_studio_lib::pipeline::{
-    exporter, ffmpeg, llama_server, segmenter, sr_script, translator, whisper,
+    diarizer, exporter, ffmpeg, llama_server, segmenter, sr_script, translator, whisper,
 };
 use easysrt_studio_lib::storage;
 use serde::Serialize;
@@ -28,8 +28,10 @@ struct FileBenchmarkResult {
     operation: String,
     cue_count: usize,
     warning_cues: usize,
+    speaker_changes_detected: usize,
     ffmpeg_ms: u128,
     whisper_ms: u128,
+    diarizer_ms: u128,
     segment_ms: u128,
     llama_start_ms: u128,
     llm_infer_ms: u128,
@@ -81,12 +83,33 @@ async fn main() -> Result<()> {
     fs::create_dir_all(&temp_dir)?;
 
     let args: Vec<String> = std::env::args().collect();
+    let arg_value = |flag: &str| -> Option<String> {
+        let prefix = format!("{flag}=");
+        args.iter()
+            .find_map(|a| a.strip_prefix(&prefix).map(ToString::to_string))
+            .or_else(|| {
+                args.windows(2)
+                    .find(|w| w[0] == flag)
+                    .map(|w| w[1].clone())
+            })
+    };
+
     let use_deepseek = args.iter().any(|a| a == "--provider=deepseek")
         || args.windows(2).any(|w| w == ["--provider", "deepseek"])
         || std::env::var("BENCH_PROVIDER").is_ok_and(|v| v.eq_ignore_ascii_case("deepseek"));
     let pipelined = args.iter().any(|a| a == "--pipelined")
         || std::env::var("BENCH_PIPELINED")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let split_on_speaker_change = !args.iter().any(|a| a == "--no-speaker-split");
+    let translation_style = match arg_value("--style").as_deref() {
+        Some("formal") => TranslationStyle::Formal,
+        _ => TranslationStyle::Natural,
+    };
+    let output_dir_override = arg_value("--output-dir");
+    if let Some(dir) = output_dir_override.as_deref() {
+        fs::create_dir_all(dir)?;
+    }
+    let input_path_override = arg_value("--input").map(PathBuf::from);
 
     let storage_paths = StoragePaths {
         mode: StorageMode::Installed,
@@ -126,26 +149,38 @@ async fn main() -> Result<()> {
         None
     };
 
-    let mut mp3_files: Vec<PathBuf> = fs::read_dir(&samples_dir)?
-        .filter_map(|e| e.ok().map(|entry| entry.path()))
-        .filter(|p| {
-            p.extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| e.eq_ignore_ascii_case("mp3"))
-        })
-        .collect();
+    let input_target = input_path_override.unwrap_or_else(|| samples_dir.clone());
+    let mut mp3_files: Vec<PathBuf> = if input_target.is_file() {
+        vec![input_target.clone()]
+    } else {
+        fs::read_dir(&input_target)?
+            .filter_map(|e| e.ok().map(|entry| entry.path()))
+            .filter(|p| {
+                p.extension()
+                    .and_then(|e| e.to_str())
+                    .is_some_and(|e| {
+                        matches!(
+                            e.to_ascii_lowercase().as_str(),
+                            "mp3" | "wav" | "m4a" | "mp4" | "flac" | "ogg"
+                        )
+                    })
+            })
+            .collect()
+    };
     mp3_files.sort();
 
     if mp3_files.is_empty() {
-        anyhow::bail!("No MP3 files found in {}", samples_dir.display());
+        anyhow::bail!("No audio files found in {}", input_target.display());
     }
 
     println!(
-        "Running EasySRT Studio benchmark (provider={}, pipelined={}) on {} files from {}\n",
+        "Running EasySRT Studio benchmark (provider={}, pipelined={}, speaker_split={}, style={:?}) on {} file(s) from {}\n",
         if use_deepseek { "deepseek" } else { "localLlama" },
         pipelined && use_deepseek,
+        split_on_speaker_change,
+        translation_style,
         mp3_files.len(),
-        samples_dir.display()
+        input_target.display()
     );
 
     if pipelined && !use_deepseek {
@@ -188,7 +223,7 @@ async fn main() -> Result<()> {
 
         // 2. Whisper ASR + Silero VAD
         let wh_t0 = Instant::now();
-        let whisper_out = whisper::run_whisper_cli(
+        let mut whisper_out = whisper::run_whisper_cli(
             &whisper_bin,
             &whisper_model,
             Some(vad_model.as_path()),
@@ -200,11 +235,35 @@ async fn main() -> Result<()> {
         )
         .await?;
         let whisper_ms = wh_t0.elapsed().as_millis();
+
+        // 2b. Pure-Rust acoustic speaker-turn diarizer (runs before temp WAV cleanup)
+        let diar_t0 = Instant::now();
+        let speaker_boundaries = match diarizer::detect_speaker_change_boundaries(
+            &converted.wav_path,
+            &whisper_out.words,
+            &whisper_out.vad_intervals,
+        ) {
+            Ok(indices) => indices,
+            Err(err) => {
+                eprintln!("[{file_name}] diarizer warning: {err:#}");
+                Vec::new()
+            }
+        };
+        for &idx in &speaker_boundaries {
+            if let Some(word) = whisper_out.words.get_mut(idx) {
+                word.speaker_change = true;
+            }
+        }
+        let diarizer_ms = diar_t0.elapsed().as_millis();
+        let speaker_changes_detected = speaker_boundaries.len();
         let _ = fs::remove_file(&converted.wav_path);
 
         // 3. Segment words into cues
         let seg_t0 = Instant::now();
-        let rules = segmenter::normalize_rules(&SegmentRules::default());
+        let rules = segmenter::normalize_rules(&SegmentRules {
+            split_on_speaker_change,
+            ..SegmentRules::default()
+        });
         let mut cues = segmenter::segment_words(&whisper_out.words, &rules);
         let detected_lang = whisper_out
             .detected_language
@@ -231,7 +290,8 @@ async fn main() -> Result<()> {
                 glossary: glossary.clone(),
                 polish_serbian: true,
                 correct_source_asr: false,
-                translation_style: TranslationStyle::default(),
+                translation_style,
+                remove_fillers: true,
                 provider_override: Some(if use_deepseek {
                     TranslationProviderKind::DeepSeek
                 } else {
@@ -242,6 +302,8 @@ async fn main() -> Result<()> {
             cues,
             phase: JobPhase::Translating,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -273,18 +335,19 @@ async fn main() -> Result<()> {
                 },
             )
         } else {
-            let guard = llama_server::LlamaServerGuard::start(
+            let guard = llama_server::LlamaServerGuard::start_in_log_dir(
                 &llama_bin,
                 &llm_model,
                 2048,
                 &cancel_flag,
+                &temp_dir,
             )
             .await?;
             let start_ms = llama_t0.elapsed().as_millis();
             let ep = translator::LlmEndpointConfig {
                 base_url: guard.base_url().to_string(),
                 model: "local-llm".to_string(),
-                api_key: None,
+                api_key: Some(guard.api_key().to_string()),
                 batch_size: 25,
             };
             llama_guard = Some(guard);
@@ -294,6 +357,7 @@ async fn main() -> Result<()> {
         let checkpoint_path = checkpoints_dir.join(format!("{job_id}.easysrt.json"));
         let cancel_clone = Arc::clone(&cancel_flag);
         let duration_ms = converted.duration_ms;
+        let output_dir_clone = output_dir_override.clone();
 
         let finalize_fut = async move {
             let infer_t0 = Instant::now();
@@ -321,13 +385,13 @@ async fn main() -> Result<()> {
             project.updated_at = chrono::Utc::now().to_rfc3339();
             fs::write(&checkpoint_path, serde_json::to_string_pretty(&project)?)?;
 
-            // 5. Export SRT files beside audio
+            // 5. Export SRT files beside audio or into --output-dir
             let exp_t0 = Instant::now();
             let export_res = exporter::export_project_files(
                 &project,
                 &ExportOptions {
-                    output_dir: None,
-                    save_beside_audio: true,
+                    output_dir: output_dir_clone.clone(),
+                    save_beside_audio: output_dir_clone.is_none(),
                     include_source_srt: true,
                     formats: vec![ExportFormat::Srt],
                     utf8_bom: false,
@@ -371,11 +435,12 @@ async fn main() -> Result<()> {
 
             let warm_ms = whisper_ms + llm_infer_ms;
             println!(
-                "[{file_name}] dur={:.1}s lang={detected_lang} op={op_label} cues={} (warn={warning_cues}) | ffmpeg={}ms whisper={}ms seg={}ms llama_start={}ms llm_infer={}ms warm={:.2}s cold_total={:.2}s (RTF={:.2}x)",
+                "[{file_name}] dur={:.1}s lang={detected_lang} op={op_label} cues={} (warn={warning_cues}, spk_turns={speaker_changes_detected}) | ffmpeg={}ms whisper={}ms diar={}ms seg={}ms llama_start={}ms llm_infer={}ms warm={:.2}s cold_total={:.2}s (RTF={:.2}x)",
                 duration_ms as f64 / 1000.0,
                 project.cues.len(),
                 ffmpeg_ms,
                 whisper_ms,
+                diarizer_ms,
                 segment_ms,
                 llama_start_ms,
                 llm_infer_ms,
@@ -391,8 +456,10 @@ async fn main() -> Result<()> {
                 operation: op_label,
                 cue_count: project.cues.len(),
                 warning_cues,
+                speaker_changes_detected,
                 ffmpeg_ms,
                 whisper_ms,
+                diarizer_ms,
                 segment_ms,
                 llama_start_ms,
                 llm_infer_ms,

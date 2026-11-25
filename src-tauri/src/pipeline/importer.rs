@@ -245,6 +245,7 @@ fn parse_subtitle_content_internal(
             end_ms,
             source_text,
             translated_text: String::new(),
+            translated_variants: std::collections::BTreeMap::new(),
             cps: 0.0,
             warnings: Vec::new(),
         };
@@ -326,6 +327,8 @@ pub fn import_subtitle_path(path: &Path, options: &JobOptions) -> Result<Subtitl
         cues,
         phase: JobPhase::Completed,
         completed_translation_batches: 0,
+        topic_context: None,
+        completed_translation_style: None,
         error_message: None,
         updated_at: chrono::Utc::now().to_rfc3339(),
     })
@@ -517,8 +520,13 @@ pub fn try_load_companion_subtitles(
 
                 if cues.len() == target_cues.len() {
                     for (cue, tgt_cue) in cues.iter_mut().zip(target_cues.iter()) {
-                        cue.translated_text =
+                        let converted =
                             sr_script::convert_script(&tgt_cue.source_text, options.script);
+                        cue.translated_text = converted.clone();
+                        if !converted.trim().is_empty() {
+                            cue.translated_variants
+                                .insert(options.translation_style, converted);
+                        }
                         segmenter::compute_cue_metrics(cue, &normalized_rules);
                     }
                 } else {
@@ -533,7 +541,10 @@ pub fn try_load_companion_subtitles(
                             .map(|tc| sr_script::convert_script(&tc.source_text, options.script))
                             .collect();
                         if !overlapping.is_empty() {
-                            cue.translated_text = overlapping.join("\n");
+                            let joined = overlapping.join("\n");
+                            cue.translated_text = joined.clone();
+                            cue.translated_variants
+                                .insert(options.translation_style, joined);
                         }
                         segmenter::compute_cue_metrics(cue, &normalized_rules);
                     }
@@ -560,7 +571,12 @@ pub fn try_load_companion_subtitles(
             (None, Some(tgt)) => {
                 let mut cues = parse_companion_file(tgt, &normalized_rules)?;
                 for cue in &mut cues {
-                    cue.translated_text = sr_script::convert_script(&cue.source_text, options.script);
+                    let converted = sr_script::convert_script(&cue.source_text, options.script);
+                    cue.translated_text = converted.clone();
+                    if !converted.trim().is_empty() {
+                        cue.translated_variants
+                            .insert(options.translation_style, converted);
+                    }
                     segmenter::compute_cue_metrics(cue, &normalized_rules);
                 }
                 (cues, pick_source_tag_language(None, options))
@@ -574,6 +590,7 @@ pub fn try_load_companion_subtitles(
         .and_then(|n| n.to_str())
         .unwrap_or("audio-input")
         .to_string();
+    let has_translations = cues.iter().any(|c| !c.translated_text.trim().is_empty());
 
     Ok(Some(SubtitleProject {
         job_id: uuid::Uuid::new_v4().to_string(),
@@ -589,6 +606,8 @@ pub fn try_load_companion_subtitles(
         cues,
         phase: JobPhase::Completed,
         completed_translation_batches: 0,
+        topic_context: None,
+        completed_translation_style: has_translations.then_some(options.translation_style),
         error_message: None,
         updated_at: chrono::Utc::now().to_rfc3339(),
     }))

@@ -7,6 +7,7 @@ pub mod exporter;
 pub mod ffmpeg;
 pub mod importer;
 pub mod llama_server;
+pub mod probe;
 pub mod segmenter;
 pub mod sr_script;
 pub mod translator;
@@ -28,12 +29,33 @@ use std::sync::{
     Arc,
 };
 use tauri::{AppHandle, Emitter};
-use tokio::sync::Mutex;
+use tokio::sync::{watch, Mutex};
+
+struct ActiveProbeEntry {
+    job_id: String,
+    cancel_flag: Arc<AtomicBool>,
+    done_rx: watch::Receiver<bool>,
+}
+
+/// RAII completion signal held by an active background media intake probe.
+/// Dropping it immediately wakes any caller waiting inside `cancel_active_probe` or `begin_probe`.
+pub struct ProbeRunGuard {
+    done_tx: Option<watch::Sender<bool>>,
+}
+
+impl Drop for ProbeRunGuard {
+    fn drop(&mut self) {
+        if let Some(tx) = self.done_tx.take() {
+            let _ = tx.send(true);
+        }
+    }
+}
 
 /// Shared pipeline runtime state registered via `tauri::Builder::manage`.
 #[derive(Default)]
 pub struct PipelineState {
     active_jobs: Mutex<HashMap<String, Arc<AtomicBool>>>,
+    active_probe: Mutex<Option<ActiveProbeEntry>>,
 }
 
 impl PipelineState {
@@ -57,6 +79,96 @@ impl PipelineState {
     pub async fn finish_job(&self, job_id: &str) {
         let mut jobs = self.active_jobs.lock().await;
         jobs.remove(job_id);
+    }
+
+    pub async fn has_active_jobs(&self) -> bool {
+        !self.active_jobs.lock().await.is_empty()
+    }
+
+    /// Registers a new active media probe, preempting and awaiting clean exit of any prior probe
+    /// so probes are strictly serialized one at a time without GPU/VRAM overlap.
+    pub async fn begin_probe(&self, job_id: &str) -> (Arc<AtomicBool>, ProbeRunGuard) {
+        loop {
+            let prior_rx = {
+                let mut slot = self.active_probe.lock().await;
+                if let Some(entry) = slot.as_ref() {
+                    if !*entry.done_rx.borrow() {
+                        entry.cancel_flag.store(true, Ordering::SeqCst);
+                        let rx = entry.done_rx.clone();
+                        *slot = None;
+                        Some(rx)
+                    } else {
+                        *slot = None;
+                        None
+                    }
+                } else {
+                    None
+                }
+            };
+
+            if let Some(mut rx) = prior_rx {
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(5),
+                    rx.wait_for(|&done| done),
+                )
+                .await;
+                continue;
+            }
+
+            let cancel_flag = Arc::new(AtomicBool::new(false));
+            let (done_tx, done_rx) = watch::channel(false);
+            let mut slot = self.active_probe.lock().await;
+            if let Some(entry) = slot.as_ref() {
+                if !*entry.done_rx.borrow() {
+                    continue;
+                }
+            }
+            *slot = Some(ActiveProbeEntry {
+                job_id: job_id.to_string(),
+                cancel_flag: Arc::clone(&cancel_flag),
+                done_rx,
+            });
+            return (
+                cancel_flag,
+                ProbeRunGuard {
+                    done_tx: Some(done_tx),
+                },
+            );
+        }
+    }
+
+    /// Signals cancellation of the active background media probe (optionally filtered by `job_id`)
+    /// and awaits its clean exit so GPU/VRAM is completely free before starting real jobs.
+    pub async fn cancel_active_probe(&self, job_id: Option<&str>) -> bool {
+        let wait_rx = {
+            let mut slot = self.active_probe.lock().await;
+            let Some(entry) = slot.as_ref() else {
+                return false;
+            };
+            if *entry.done_rx.borrow() {
+                *slot = None;
+                return false;
+            }
+            if let Some(target_id) = job_id {
+                if entry.job_id != target_id {
+                    return false;
+                }
+            }
+            entry.cancel_flag.store(true, Ordering::SeqCst);
+            let rx = entry.done_rx.clone();
+            *slot = None;
+            Some(rx)
+        };
+
+        if let Some(mut rx) = wait_rx {
+            let _ = tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                rx.wait_for(|&done| done),
+            )
+            .await;
+            return true;
+        }
+        false
     }
 }
 
@@ -177,7 +289,19 @@ async fn transcribe_audio_with_flag(
     );
 
     let rules = segmenter::normalize_rules(&options.segment_rules);
-    let mut cues = segmenter::segment_words(&whisper_out.words, &rules);
+    let speaker_change_indices: Vec<usize> = whisper_out
+        .words
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, word)| word.speaker_change.then_some(idx))
+        .collect();
+    let mut cues = segmenter::segment_words_with_options(
+        &whisper_out.words,
+        &rules,
+        &speaker_change_indices,
+        rules.split_on_speaker_change,
+        options.remove_fillers,
+    );
 
     let detected_or_source = whisper_out
         .detected_language
@@ -201,6 +325,8 @@ async fn transcribe_audio_with_flag(
         cues,
         phase: JobPhase::Completed,
         completed_translation_batches: 0,
+        topic_context: None,
+        completed_translation_style: None,
         error_message: None,
         updated_at: chrono::Utc::now().to_rfc3339(),
     };
@@ -242,33 +368,37 @@ fn determine_llm_operation(project: &SubtitleProject) -> Option<BatchOperation> 
     }
 }
 
-fn build_local_endpoint(
+pub(crate) fn build_local_endpoint(
     guard: &llama_server::LlamaServerGuard,
     config: &crate::models::AppConfig,
 ) -> LlmEndpointConfig {
     LlmEndpointConfig {
         base_url: guard.base_url().to_string(),
         model: "local-llm".to_string(),
-        api_key: None,
+        api_key: Some(guard.api_key().to_string()),
         batch_size: config.translation.batch_size,
     }
 }
 
-fn resolve_cloud_endpoint(
+pub(crate) fn resolve_cloud_endpoint(
     app: &AppHandle,
     config: &crate::models::AppConfig,
     provider: TranslationProviderKind,
 ) -> Result<LlmEndpointConfig> {
     match provider {
         TranslationProviderKind::DeepSeek => {
-            let api_key = storage::get_api_key(app, TranslationProviderKind::DeepSeek)?
-                .map(|k| k.trim().to_string())
-                .filter(|k| !k.is_empty())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "DeepSeek API key is not configured. Please add your key in Settings -> Cloud API."
-                    )
-                })?;
+            let api_key = storage::get_api_key_with_opt_in(
+                app,
+                TranslationProviderKind::DeepSeek,
+                config.allow_local_encrypted_vault,
+            )?
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "DeepSeek API key is not configured. Please add your key in Settings -> Cloud API."
+                )
+            })?;
             let model = if config.translation.deepseek_model.trim().is_empty() {
                 "deepseek-chat".to_string()
             } else {
@@ -282,20 +412,28 @@ fn resolve_cloud_endpoint(
             })
         }
         TranslationProviderKind::CustomOpenAi => {
-            let api_key = storage::get_api_key(app, TranslationProviderKind::CustomOpenAi)?;
+            let api_key = storage::get_api_key_with_opt_in(
+                app,
+                TranslationProviderKind::CustomOpenAi,
+                config.allow_local_encrypted_vault,
+            )?
+            .map(|k| k.trim().to_string())
+            .filter(|k| !k.is_empty());
             let base_url = config.translation.custom_base_url.trim().to_string();
             if base_url.is_empty() {
                 return Err(anyhow!(
                     "Custom OpenAI-compatible base URL is not configured in Settings."
                 ));
             }
+            let validated_url =
+                translator::validate_translation_base_url(&base_url, api_key.is_some())?;
             let model = if config.translation.custom_model.trim().is_empty() {
                 "default".to_string()
             } else {
                 config.translation.custom_model.trim().to_string()
             };
             Ok(LlmEndpointConfig {
-                base_url,
+                base_url: validated_url.as_str().trim_end_matches('/').to_string(),
                 model,
                 api_key,
                 batch_size: config.translation.batch_size,
@@ -348,6 +486,8 @@ async fn run_project_llm_stage(
             TranslationProviderKind::LocalLlama => {
                 let llama_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::LlamaBin)?;
                 let llm_model = setup_manager::resolve_active_llm_model_path(app)?;
+                let storage_paths = storage::resolve_storage_paths(app, None)?;
+                let temp_dir = Path::new(&storage_paths.data_dir).join("temp");
                 emit_job_progress(
                     app,
                     &job_id,
@@ -355,11 +495,12 @@ async fn run_project_llm_stage(
                     5.0,
                     "Starting local llama-server...",
                 );
-                let guard = llama_server::LlamaServerGuard::start(
+                let guard = llama_server::LlamaServerGuard::start_in_log_dir(
                     &llama_bin,
                     &llm_model,
                     config.translation.context_window,
                     cancel_flag,
+                    &temp_dir,
                 )
                 .await?;
                 let ep = build_local_endpoint(&guard, &config);
@@ -369,7 +510,9 @@ async fn run_project_llm_stage(
             other => resolve_cloud_endpoint(app, &config, other)?,
         };
 
-        translator::run_batch_operation(
+        let remove_fillers = project.options.remove_fillers;
+        let topic_context = project.topic_context.clone();
+        translator::run_batch_operation_with_options(
             project,
             operation,
             &endpoint,
@@ -378,6 +521,8 @@ async fn run_project_llm_stage(
             |pct, detail| {
                 emit_job_progress(app, &job_id, phase, pct, detail);
             },
+            remove_fillers,
+            topic_context.as_deref(),
         )
         .await
     }
@@ -436,6 +581,8 @@ pub async fn transcribe_audio(
     options: JobOptions,
     job_id: Option<String>,
 ) -> Result<SubtitleProject> {
+    let _ = state.cancel_active_probe(None).await;
+
     let resolved_job_id = job_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -476,7 +623,19 @@ pub fn resegment_project(
     let normalized = segmenter::normalize_rules(&rules);
 
     if !project.words.is_empty() {
-        let mut new_cues = segmenter::segment_words(&project.words, &normalized);
+        let speaker_change_indices: Vec<usize> = project
+            .words
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, word)| word.speaker_change.then_some(idx))
+            .collect();
+        let mut new_cues = segmenter::segment_words_with_options(
+            &project.words,
+            &normalized,
+            &speaker_change_indices,
+            normalized.split_on_speaker_change,
+            project.options.remove_fillers,
+        );
         let detected_or_source = project
             .detected_language
             .as_deref()
@@ -486,6 +645,7 @@ pub fn resegment_project(
         }
         project.cues = new_cues;
         project.completed_translation_batches = 0;
+        project.completed_translation_style = None;
     } else {
         for cue in &mut project.cues {
             cue.source_text = segmenter::wrap_balanced_lines(
@@ -499,6 +659,15 @@ pub fn resegment_project(
                     normalized.max_chars_per_line,
                     normalized.max_lines,
                 );
+            }
+            for variant_text in cue.translated_variants.values_mut() {
+                if !variant_text.trim().is_empty() {
+                    *variant_text = segmenter::wrap_balanced_lines(
+                        variant_text,
+                        normalized.max_chars_per_line,
+                        normalized.max_lines,
+                    );
+                }
             }
             segmenter::compute_cue_metrics(cue, &normalized);
         }
@@ -514,6 +683,8 @@ pub async fn translate_project(
     state: &PipelineState,
     mut project: SubtitleProject,
 ) -> Result<SubtitleProject> {
+    let _ = state.cancel_active_probe(None).await;
+
     let job_id = project.job_id.clone();
     let cancel_flag = state.register_job(&job_id).await;
     let res =
@@ -536,6 +707,8 @@ pub async fn polish_project(
     state: &PipelineState,
     mut project: SubtitleProject,
 ) -> Result<SubtitleProject> {
+    let _ = state.cancel_active_probe(None).await;
+
     let job_id = project.job_id.clone();
     let cancel_flag = state.register_job(&job_id).await;
     let res =
@@ -558,6 +731,8 @@ pub async fn condense_project_cps(
     state: &PipelineState,
     mut project: SubtitleProject,
 ) -> Result<SubtitleProject> {
+    let _ = state.cancel_active_probe(None).await;
+
     let job_id = project.job_id.clone();
     let cancel_flag = state.register_job(&job_id).await;
     let res =
@@ -582,6 +757,8 @@ pub async fn run_full_pipeline(
     options: JobOptions,
     job_id: Option<String>,
 ) -> Result<SubtitleProject> {
+    let _ = state.cancel_active_probe(None).await;
+
     let resolved_job_id = job_id
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -602,6 +779,7 @@ pub async fn run_full_pipeline(
         match determine_llm_operation(&project) {
             Some(operation) => {
                 project.completed_translation_batches = 0;
+                project.completed_translation_style = None;
                 run_project_llm_stage(app, &mut project, operation, &cancel_flag).await?;
             }
             None => {
@@ -655,6 +833,8 @@ pub async fn run_local_llm_batch(
     state: &PipelineState,
     mut projects: Vec<SubtitleProject>,
 ) -> Result<Vec<SubtitleProject>> {
+    let _ = state.cancel_active_probe(None).await;
+
     if projects.is_empty() {
         return Ok(projects);
     }
@@ -682,6 +862,8 @@ pub async fn run_local_llm_batch(
         let local_endpoint = if needs_local_llama {
             let llama_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::LlamaBin)?;
             let llm_model = setup_manager::resolve_active_llm_model_path(app)?;
+            let storage_paths = storage::resolve_storage_paths(app, None)?;
+            let temp_dir = Path::new(&storage_paths.data_dir).join("temp");
 
             for project in &projects {
                 if let Some(op) = determine_llm_operation(project) {
@@ -715,11 +897,12 @@ pub async fn run_local_llm_batch(
                 }
             });
 
-            let guard_res = llama_server::LlamaServerGuard::start(
+            let guard_res = llama_server::LlamaServerGuard::start_in_log_dir(
                 &llama_bin,
                 &llm_model,
                 config.translation.context_window,
                 &startup_cancel,
+                &temp_dir,
             )
             .await;
             watcher.abort();
@@ -780,7 +963,9 @@ pub async fn run_local_llm_batch(
                     },
                 );
 
-                let res = translator::run_batch_operation(
+                let remove_fillers = project.options.remove_fillers;
+                let topic_context = project.topic_context.clone();
+                let res = translator::run_batch_operation_with_options(
                     project,
                     operation,
                     &endpoint,
@@ -789,6 +974,8 @@ pub async fn run_local_llm_batch(
                     |pct, detail| {
                         emit_job_progress(app, &job_id, phase, pct, detail);
                     },
+                    remove_fillers,
+                    topic_context.as_deref(),
                 )
                 .await;
 
@@ -858,6 +1045,7 @@ pub fn convert_cues_script(
         } else {
             cue.source_text = sr_script::convert_script(&cue.source_text, target_script);
         }
+        sr_script::convert_script_values(cue.translated_variants.values_mut(), target_script);
     }
     Ok(cues)
 }
@@ -919,6 +1107,8 @@ mod tests {
             cues: vec![],
             phase: JobPhase::Completed,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T18:00:00Z".to_string(),
         };
@@ -1241,12 +1431,15 @@ EOF
                 polish_serbian: true,
                 correct_source_asr: false,
                 translation_style: TranslationStyle::default(),
+                remove_fillers: true,
                 provider_override: Some(TranslationProviderKind::CustomOpenAi),
             },
             words: whisper_out.words,
             cues: standard_cues,
             phase: JobPhase::Translating,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: chrono::Utc::now().to_rfc3339(),
         };
@@ -1412,6 +1605,8 @@ EOF
             cues: vec![],
             phase: JobPhase::Completed,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T22:00:00Z".to_string(),
         };
@@ -1472,10 +1667,15 @@ with open({startup_log:?}, "a", encoding="utf-8") as f:
     f.write("started\n")
 
 port = int(args[args.index("--port") + 1])
+expected_key = args[args.index("--api-key") + 1]
 
 class Handler(http.server.BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
+            if self.headers.get("Authorization") != f"Bearer {{expected_key}}":
+                self.send_response(401)
+                self.end_headers()
+                return
             self.send_response(200)
             self.end_headers()
             self.wfile.write(b'{{"status":"ok"}}')
@@ -1484,6 +1684,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
             self.end_headers()
 
     def do_POST(self):
+        if self.headers.get("Authorization") != f"Bearer {{expected_key}}":
+            self.send_response(401)
+            self.end_headers()
+            return
         length = int(self.headers.get("Content-Length", "0"))
         body = json.loads(self.rfile.read(length).decode("utf-8"))
         user_payload = json.loads(body["messages"][1]["content"])
@@ -1514,17 +1718,20 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         fs::set_permissions(&mock_bin, perms).unwrap();
 
         let cancel = Arc::new(AtomicBool::new(false));
-        let mut guard = llama_server::LlamaServerGuard::start_with_timeout(
+        let log_dir = data_dir.join("temp");
+        let mut guard = llama_server::LlamaServerGuard::start_with_timeout_and_log_dir(
             &mock_bin,
             &mock_model,
             2048,
             &cancel,
             std::time::Duration::from_secs(10),
+            Some(&log_dir),
         )
         .await
         .unwrap();
 
         let endpoint = build_local_endpoint(&guard, &AppConfig::default());
+        assert_eq!(endpoint.api_key.as_deref(), Some(guard.api_key()));
 
         let mut p1 = SubtitleProject {
             job_id: "batch-p1".to_string(),
@@ -1540,11 +1747,14 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
                 end_ms: 2000,
                 source_text: "Hello world.".to_string(),
                 translated_text: String::new(),
+                translated_variants: BTreeMap::new(),
                 cps: 6.0,
                 warnings: vec![],
             }],
             phase: JobPhase::Translating,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T22:00:00Z".to_string(),
         };
@@ -1563,11 +1773,14 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
                 end_ms: 2000,
                 source_text: "Lijepo vrijeme.".to_string(),
                 translated_text: String::new(),
+                translated_variants: BTreeMap::new(),
                 cps: 7.5,
                 warnings: vec![],
             }],
             phase: JobPhase::Polishing,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T22:00:00Z".to_string(),
         };
@@ -1652,6 +1865,8 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
             cues: vec![],
             phase: JobPhase::Completed,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-24T22:00:00Z".to_string(),
         };
@@ -1682,5 +1897,105 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
         assert!(!merged_project.options.segment_rules.split_on_speaker_change);
         assert_eq!(merged_project.cues.len(), 1);
         assert_eq!(merged_project.cues[0].source_text, "Mislim da jeste tako.");
+    }
+
+    #[test]
+    fn convert_cues_script_updates_translated_text_and_all_dual_style_variants() {
+        let mut variants = BTreeMap::new();
+        variants.insert(TranslationStyle::Natural, "Ljubav i pažnja.".to_string());
+        variants.insert(
+            TranslationStyle::Formal,
+            "Poštovanje i pažnja u Beogradu.".to_string(),
+        );
+        let cues = vec![SubtitleCue {
+            id: 1,
+            start_ms: 0,
+            end_ms: 2000,
+            source_text: "Love and care.".to_string(),
+            translated_text: "Ljubav i pažnja.".to_string(),
+            translated_variants: variants,
+            cps: 8.0,
+            warnings: vec![],
+        }];
+
+        let cyr = convert_cues_script(cues, SerbianScript::Cyrillic).unwrap();
+        assert_eq!(cyr[0].translated_text, "Љубав и пажња.");
+        assert_eq!(
+            cyr[0]
+                .translated_variants
+                .get(&TranslationStyle::Natural)
+                .map(String::as_str),
+            Some("Љубав и пажња.")
+        );
+        assert_eq!(
+            cyr[0]
+                .translated_variants
+                .get(&TranslationStyle::Formal)
+                .map(String::as_str),
+            Some("Поштовање и пажња у Београду.")
+        );
+
+        let lat = convert_cues_script(cyr, SerbianScript::Latin).unwrap();
+        assert_eq!(lat[0].translated_text, "Ljubav i pažnja.");
+        assert_eq!(
+            lat[0]
+                .translated_variants
+                .get(&TranslationStyle::Formal)
+                .map(String::as_str),
+            Some("Poštovanje i pažnja u Beogradu.")
+        );
+    }
+
+    #[test]
+    fn resegment_project_wires_remove_fillers_option() {
+        let words = vec![
+            TimedWord {
+                start_ms: 0,
+                end_ms: 200,
+                text: "Um,".to_string(),
+                probability: 0.9,
+                speaker_change: false,
+            },
+            TimedWord {
+                start_ms: 250,
+                end_ms: 600,
+                text: "hello".to_string(),
+                probability: 0.99,
+                speaker_change: false,
+            },
+            TimedWord {
+                start_ms: 650,
+                end_ms: 950,
+                text: "world.".to_string(),
+                probability: 0.99,
+                speaker_change: false,
+            },
+        ];
+
+        let mk_proj = |remove_fillers: bool| SubtitleProject {
+            job_id: "job-fillers".to_string(),
+            audio_path: "/tmp/f.wav".to_string(),
+            audio_file_name: "f.wav".to_string(),
+            duration_ms: 1500,
+            detected_language: Some("en".to_string()),
+            options: JobOptions {
+                remove_fillers,
+                ..JobOptions::default()
+            },
+            words: words.clone(),
+            cues: vec![],
+            phase: JobPhase::Completed,
+            completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
+            error_message: None,
+            updated_at: "2026-11-25T10:00:00Z".to_string(),
+        };
+
+        let stripped = resegment_project(mk_proj(true), SegmentRules::default()).unwrap();
+        assert_eq!(stripped.cues[0].source_text, "hello world.");
+
+        let verbatim = resegment_project(mk_proj(false), SegmentRules::default()).unwrap();
+        assert_eq!(verbatim.cues[0].source_text, "Um, hello world.");
     }
 }

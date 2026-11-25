@@ -324,6 +324,7 @@ mod tests {
                 end_ms: 2750,
                 source_text: "Hello everyone!".to_string(),
                 translated_text: "Здраво свима!\nЧеститамо Ђорђу.".to_string(),
+                translated_variants: std::collections::BTreeMap::new(),
                 cps: 12.0,
                 warnings: vec![],
             },
@@ -333,6 +334,7 @@ mod tests {
                 end_ms: 5125,
                 source_text: "Testing Serbian characters.".to_string(),
                 translated_text: "Тест слова: čćžšđ ČĆŽŠĐ ЉЊЏ.".to_string(),
+                translated_variants: std::collections::BTreeMap::new(),
                 cps: 13.0,
                 warnings: vec![],
             },
@@ -396,6 +398,8 @@ mod tests {
             cues: sample_cues(),
             phase: JobPhase::Completed,
             completed_translation_batches: 1,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T18:00:00Z".to_string(),
         };
@@ -447,6 +451,8 @@ mod tests {
             cues: sample_cues(),
             phase: JobPhase::Completed,
             completed_translation_batches: 1,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T18:00:00Z".to_string(),
         };

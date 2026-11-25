@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 
 pub const EVENT_DOWNLOAD_PROGRESS: &str = "download-progress";
 pub const EVENT_JOB_PROGRESS: &str = "job-progress";
+pub const EVENT_PROBE_PROGRESS: &str = "probe-progress";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -186,7 +187,7 @@ pub enum SerbianScript {
     Cyrillic,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum TranslationStyle {
     #[default]
@@ -271,6 +272,26 @@ fn default_auto_send_crash_reports() -> bool {
     true
 }
 
+fn default_editor_source_font_size() -> u32 {
+    19
+}
+
+fn default_editor_translated_font_size() -> u32 {
+    22
+}
+
+fn default_auto_probe_on_import() -> bool {
+    true
+}
+
+fn default_auto_checkpoints() -> bool {
+    true
+}
+
+fn default_remove_fillers() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppConfig {
@@ -286,6 +307,16 @@ pub struct AppConfig {
     pub has_completed_setup: bool,
     #[serde(default = "default_auto_send_crash_reports")]
     pub auto_send_crash_reports: bool,
+    #[serde(default = "default_editor_source_font_size")]
+    pub editor_source_font_size: u32,
+    #[serde(default = "default_editor_translated_font_size")]
+    pub editor_translated_font_size: u32,
+    #[serde(default = "default_auto_probe_on_import")]
+    pub auto_probe_on_import: bool,
+    #[serde(default = "default_auto_checkpoints")]
+    pub auto_checkpoints: bool,
+    #[serde(default)]
+    pub allow_local_encrypted_vault: bool,
 }
 
 impl Default for AppConfig {
@@ -302,6 +333,11 @@ impl Default for AppConfig {
             export: ExportOptions::default(),
             has_completed_setup: false,
             auto_send_crash_reports: default_auto_send_crash_reports(),
+            editor_source_font_size: default_editor_source_font_size(),
+            editor_translated_font_size: default_editor_translated_font_size(),
+            auto_probe_on_import: default_auto_probe_on_import(),
+            auto_checkpoints: default_auto_checkpoints(),
+            allow_local_encrypted_vault: false,
         }
     }
 }
@@ -326,6 +362,8 @@ pub struct SubtitleCue {
     pub end_ms: u64,
     pub source_text: String,
     pub translated_text: String,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub translated_variants: BTreeMap<TranslationStyle, String>,
     pub cps: f64,
     pub warnings: Vec<String>,
 }
@@ -343,6 +381,8 @@ pub struct JobOptions {
     pub correct_source_asr: bool,
     #[serde(default)]
     pub translation_style: TranslationStyle,
+    #[serde(default = "default_remove_fillers")]
+    pub remove_fillers: bool,
     pub provider_override: Option<TranslationProviderKind>,
 }
 
@@ -357,6 +397,7 @@ impl Default for JobOptions {
             polish_serbian: true,
             correct_source_asr: false,
             translation_style: TranslationStyle::default(),
+            remove_fillers: default_remove_fillers(),
             provider_override: None,
         }
     }
@@ -389,6 +430,10 @@ pub struct SubtitleProject {
     pub cues: Vec<SubtitleCue>,
     pub phase: JobPhase,
     pub completed_translation_batches: u32,
+    #[serde(default)]
+    pub topic_context: Option<String>,
+    #[serde(default)]
+    pub completed_translation_style: Option<TranslationStyle>,
     pub error_message: Option<String>,
     pub updated_at: String,
 }
@@ -416,11 +461,27 @@ pub struct ApiKeyStatus {
     pub storage_backend: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct AudioPreviewData {
-    pub mime_type: String,
-    pub base64_data: String,
+pub struct WaveformPreviewData {
+    pub canonical_path: String,
+    pub duration_ms: u64,
+    pub peaks: Vec<f32>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MediaProbeResult {
+    pub job_id: String,
+    pub audio_path: String,
+    pub stage: String,
+    pub duration_ms: Option<u64>,
+    pub speech_ratio: Option<f64>,
+    pub estimated_speakers: Option<u32>,
+    pub detected_language: Option<String>,
+    pub topic: Option<String>,
+    pub suggested_style: Option<TranslationStyle>,
+    pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -738,5 +799,177 @@ mod tests {
         assert!(preview.get("installedComponents").is_some());
         assert!(preview.get("logExcerpt").is_some());
         assert!(preview.get("telemetryEndpoint").is_some());
+    }
+
+    #[test]
+    fn v040_models_preserve_backward_compat_and_camel_case_roundtrip() {
+        assert_eq!(EVENT_PROBE_PROGRESS, "probe-progress");
+        assert!(TranslationStyle::Natural < TranslationStyle::Formal);
+
+        // 1. Legacy AppConfig without v0.4.0 fields must deserialize with exact defaults
+        let legacy_cfg_json = json!({
+            "uiLanguage": "sr",
+            "modelsDirOverride": null,
+            "activeWhisperModelId": null,
+            "activeLlmModelId": null,
+            "customModels": [],
+            "translation": TranslationConfig::default(),
+            "defaultSegmentRules": SegmentRules::default(),
+            "defaultScript": "latin",
+            "export": ExportOptions::default(),
+            "hasCompletedSetup": true
+        });
+        let legacy_cfg: AppConfig = serde_json::from_value(legacy_cfg_json).unwrap();
+        assert_eq!(legacy_cfg.editor_source_font_size, 19);
+        assert_eq!(legacy_cfg.editor_translated_font_size, 22);
+        assert!(legacy_cfg.auto_probe_on_import);
+        assert!(legacy_cfg.auto_checkpoints);
+        assert!(!legacy_cfg.allow_local_encrypted_vault);
+
+        let cfg_val = serde_json::to_value(&legacy_cfg).unwrap();
+        assert_eq!(cfg_val.get("editorSourceFontSize"), Some(&json!(19)));
+        assert_eq!(cfg_val.get("editorTranslatedFontSize"), Some(&json!(22)));
+        assert_eq!(cfg_val.get("autoProbeOnImport"), Some(&json!(true)));
+        assert_eq!(cfg_val.get("autoCheckpoints"), Some(&json!(true)));
+        assert_eq!(cfg_val.get("allowLocalEncryptedVault"), Some(&json!(false)));
+
+        // 2. Legacy SubtitleProject checkpoint (v0.3.x) without removeFillers, translatedVariants,
+        //    topicContext, or completedTranslationStyle
+        let legacy_project_json = json!({
+            "jobId": "legacy-job-01",
+            "audioPath": "/tmp/episode.mp3",
+            "audioFileName": "episode.mp3",
+            "durationMs": 5000,
+            "detectedLanguage": "en",
+            "options": {
+                "sourceLanguage": "en",
+                "targetLanguage": "sr",
+                "script": "latin",
+                "segmentRules": {
+                    "preset": "standard",
+                    "maxCharsPerLine": 42,
+                    "maxLines": 2,
+                    "minDurationMs": 1000,
+                    "maxDurationMs": 7000,
+                    "maxCps": 17.0
+                },
+                "glossary": {},
+                "polishSerbian": true,
+                "providerOverride": null
+            },
+            "words": [],
+            "cues": [
+                {
+                    "id": 1,
+                    "startMs": 0,
+                    "endMs": 2000,
+                    "sourceText": "Hello world.",
+                    "translatedText": "Zdravo svete.",
+                    "cps": 6.5,
+                    "warnings": []
+                }
+            ],
+            "phase": "completed",
+            "completedTranslationBatches": 1,
+            "errorMessage": null,
+            "updatedAt": "2026-11-22T12:00:00Z"
+        });
+        let legacy_project: SubtitleProject = serde_json::from_value(legacy_project_json).unwrap();
+        assert!(legacy_project.options.remove_fillers);
+        assert_eq!(legacy_project.topic_context, None);
+        assert_eq!(legacy_project.completed_translation_style, None);
+        assert!(legacy_project.cues[0].translated_variants.is_empty());
+
+        // Empty `translatedVariants` must be omitted on serialization
+        let empty_cue_val = serde_json::to_value(&legacy_project.cues[0]).unwrap();
+        assert!(empty_cue_val.get("translatedVariants").is_none());
+
+        // Populated `translatedVariants`, `topicContext`, `completedTranslationStyle` round-trip cleanly
+        let mut v040_project = legacy_project;
+        v040_project.topic_context = Some("Tehnološki podkast o AI".to_string());
+        v040_project.completed_translation_style = Some(TranslationStyle::Formal);
+        v040_project.options.remove_fillers = false;
+        v040_project.cues[0]
+            .translated_variants
+            .insert(TranslationStyle::Natural, "Ćao svima.".to_string());
+        v040_project.cues[0]
+            .translated_variants
+            .insert(TranslationStyle::Formal, "Pozdrav svima.".to_string());
+
+        let v040_val = serde_json::to_value(&v040_project).unwrap();
+        assert_eq!(
+            v040_val.get("topicContext"),
+            Some(&json!("Tehnološki podkast o AI"))
+        );
+        assert_eq!(
+            v040_val.get("completedTranslationStyle"),
+            Some(&json!("formal"))
+        );
+        assert_eq!(
+            v040_val["options"].get("removeFillers"),
+            Some(&json!(false))
+        );
+        assert_eq!(
+            v040_val["cues"][0]["translatedVariants"].get("natural"),
+            Some(&json!("Ćao svima."))
+        );
+        assert_eq!(
+            v040_val["cues"][0]["translatedVariants"].get("formal"),
+            Some(&json!("Pozdrav svima."))
+        );
+        let roundtripped: SubtitleProject = serde_json::from_value(v040_val).unwrap();
+        assert_eq!(roundtripped, v040_project);
+
+        // 3. WaveformPreviewData & MediaProbeResult camelCase contract
+        let wf = WaveformPreviewData {
+            canonical_path: "/home/user/clip.mp3".to_string(),
+            duration_ms: 12_345,
+            peaks: vec![0.0, 0.5, 1.0],
+        };
+        let wf_val = serde_json::to_value(&wf).unwrap();
+        assert_eq!(
+            wf_val.get("canonicalPath"),
+            Some(&json!("/home/user/clip.mp3"))
+        );
+        assert_eq!(wf_val.get("durationMs"), Some(&json!(12_345)));
+        assert_eq!(wf_val.get("peaks"), Some(&json!([0.0, 0.5, 1.0])));
+        assert_eq!(
+            serde_json::from_value::<WaveformPreviewData>(wf_val).unwrap(),
+            wf
+        );
+
+        let probe = MediaProbeResult {
+            job_id: "job-probe-1".to_string(),
+            audio_path: "/home/user/clip.mp3".to_string(),
+            stage: "completed".to_string(),
+            duration_ms: Some(90_000),
+            speech_ratio: Some(0.84),
+            estimated_speakers: Some(2),
+            detected_language: Some("en".to_string()),
+            topic: Some("AI engineering interview".to_string()),
+            suggested_style: Some(TranslationStyle::Natural),
+            error: None,
+        };
+        let probe_val = serde_json::to_value(&probe).unwrap();
+        assert_eq!(probe_val.get("jobId"), Some(&json!("job-probe-1")));
+        assert_eq!(
+            probe_val.get("audioPath"),
+            Some(&json!("/home/user/clip.mp3"))
+        );
+        assert_eq!(probe_val.get("stage"), Some(&json!("completed")));
+        assert_eq!(probe_val.get("durationMs"), Some(&json!(90_000)));
+        assert_eq!(probe_val.get("speechRatio"), Some(&json!(0.84)));
+        assert_eq!(probe_val.get("estimatedSpeakers"), Some(&json!(2)));
+        assert_eq!(probe_val.get("detectedLanguage"), Some(&json!("en")));
+        assert_eq!(
+            probe_val.get("topic"),
+            Some(&json!("AI engineering interview"))
+        );
+        assert_eq!(probe_val.get("suggestedStyle"), Some(&json!("natural")));
+        assert!(probe_val.get("error").is_some());
+        assert_eq!(
+            serde_json::from_value::<MediaProbeResult>(probe_val).unwrap(),
+            probe
+        );
     }
 }

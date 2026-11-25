@@ -1630,6 +1630,40 @@ where
             && (project.detected_language.as_deref().is_some_and(is_serbian_lang)
                 || is_serbian_lang(&project.options.source_language)));
     let rules = segmenter::normalize_rules(&project.options.segment_rules);
+    let active_style = project.options.translation_style;
+
+    if operation != BatchOperation::CondenseCps {
+        match project.completed_translation_style {
+            Some(prev_style) if prev_style != active_style => {
+                // Switching styles: preserve previous cached translations and re-translate from batch 0
+                for cue in &mut project.cues {
+                    if !cue.translated_text.trim().is_empty()
+                        && !cue.translated_variants.contains_key(&prev_style)
+                    {
+                        cue.translated_variants
+                            .insert(prev_style, cue.translated_text.clone());
+                    }
+                }
+                project.completed_translation_batches = 0;
+                project.completed_translation_style = Some(active_style);
+            }
+            None if project.completed_translation_batches > 0 => {
+                // Legacy pre-v0.4.0 checkpoint resuming without a style tag
+                for cue in &mut project.cues {
+                    if cue.translated_variants.is_empty() && !cue.translated_text.trim().is_empty()
+                    {
+                        cue.translated_variants
+                            .insert(active_style, cue.translated_text.clone());
+                    }
+                }
+                project.completed_translation_style = Some(active_style);
+            }
+            None => {
+                project.completed_translation_style = Some(active_style);
+            }
+            Some(_) => {}
+        }
+    }
 
     for batch_idx in 0..total_batches {
         if cancel_flag.load(Ordering::SeqCst) {
@@ -1639,15 +1673,26 @@ where
         let start = batch_idx * batch_size;
         let end = ((batch_idx + 1) * batch_size).min(project.cues.len());
 
-        // Resume support: skip already completed batches from a saved checkpoint
-        // (CondenseCps operates on cues that may already have completed_translation_batches set).
+        // Resume support: skip already completed batches from a saved checkpoint ONLY when
+        // they were generated for `active_style` (CondenseCps always inspects high-CPS cues).
         if operation != BatchOperation::CondenseCps {
-            let already_translated = (batch_idx as u32) < project.completed_translation_batches
-                && project.cues[start..end]
-                    .iter()
-                    .all(|c| !c.translated_text.trim().is_empty());
+            let already_translated = project.completed_translation_style == Some(active_style)
+                && (batch_idx as u32) < project.completed_translation_batches
+                && project.cues[start..end].iter().all(|c| {
+                    c.translated_variants
+                        .get(&active_style)
+                        .is_some_and(|v| !v.trim().is_empty())
+                });
 
             if already_translated {
+                for cue in &mut project.cues[start..end] {
+                    if let Some(cached) = cue.translated_variants.get(&active_style).cloned() {
+                        if cue.translated_text != cached {
+                            cue.translated_text = cached;
+                            segmenter::compute_cue_metrics(cue, &rules);
+                        }
+                    }
+                }
                 let pct = ((batch_idx + 1) as f64 / total_batches as f64) * 100.0;
                 on_progress(
                     pct,
@@ -1711,6 +1756,7 @@ where
                 }
                 if parsed.text.is_empty() && operation != BatchOperation::CondenseCps {
                     cue.translated_text.clear();
+                    cue.translated_variants.remove(&active_style);
                     segmenter::compute_cue_metrics(cue, &rules);
                     continue;
                 }
@@ -1730,7 +1776,8 @@ where
                 {
                     cue.source_text = wrapped;
                 } else {
-                    cue.translated_text = wrapped;
+                    cue.translated_text = wrapped.clone();
+                    cue.translated_variants.insert(active_style, wrapped);
                 }
                 segmenter::compute_cue_metrics(cue, &rules);
             }
@@ -1738,6 +1785,7 @@ where
 
         if operation != BatchOperation::CondenseCps {
             project.completed_translation_batches = (batch_idx + 1) as u32;
+            project.completed_translation_style = Some(active_style);
         }
         project.updated_at = chrono::Utc::now().to_rfc3339();
         on_checkpoint(project)?;
@@ -1772,6 +1820,26 @@ where
             }
         }
         if shift_trailing_orphan_starters_inner(&mut project.cues, &rules) {
+            for cue in &mut project.cues {
+                if !cue.translated_text.trim().is_empty() {
+                    cue.translated_variants
+                        .insert(active_style, cue.translated_text.clone());
+                }
+            }
+            post_pass_changed = true;
+        }
+        let timing_snapshot: Vec<(u64, u64)> = project
+            .cues
+            .iter()
+            .map(|c| (c.start_ms, c.end_ms))
+            .collect();
+        segmenter::enforce_min_inter_cue_gap(&mut project.cues, &rules);
+        if project
+            .cues
+            .iter()
+            .zip(timing_snapshot.iter())
+            .any(|(c, &(s, e))| c.start_ms != s || c.end_ms != e)
+        {
             post_pass_changed = true;
         }
         if post_pass_changed {
@@ -1784,7 +1852,8 @@ where
 }
 
 /// Runs the ID-locked overlapping context-window batch protocol across `project.cues`.
-/// Delegates to `run_batch_operation_with_options` with `remove_fillers = true` and `topic_context = None`.
+/// Delegates to `run_batch_operation_with_options` using `project.options.remove_fillers`
+/// and `project.topic_context`.
 pub async fn run_batch_operation<FCheckpoint, FProgress>(
     project: &mut SubtitleProject,
     operation: BatchOperation,
@@ -1797,6 +1866,8 @@ where
     FCheckpoint: FnMut(&SubtitleProject) -> Result<()>,
     FProgress: FnMut(f64, String),
 {
+    let remove_fillers = project.options.remove_fillers;
+    let topic_context = project.topic_context.clone();
     run_batch_operation_with_options(
         project,
         operation,
@@ -1804,8 +1875,8 @@ where
         cancel_flag,
         on_checkpoint,
         on_progress,
-        true,
-        None,
+        remove_fillers,
+        topic_context.as_deref(),
     )
     .await
 }
@@ -1908,6 +1979,7 @@ mod tests {
                     end_ms: 2000,
                     source_text: "Good morning everyone.".to_string(),
                     translated_text: String::new(),
+                    translated_variants: BTreeMap::new(),
                     cps: 11.0,
                     warnings: vec![],
                 },
@@ -1917,6 +1989,7 @@ mod tests {
                     end_ms: 4000,
                     source_text: "Welcome to Belgrade.".to_string(),
                     translated_text: String::new(),
+                    translated_variants: BTreeMap::new(),
                     cps: 10.0,
                     warnings: vec![],
                 },
@@ -1926,6 +1999,7 @@ mod tests {
                     end_ms: 6000,
                     source_text: "Love and attention plays an important role in our lives today.".to_string(),
                     translated_text: String::new(),
+                    translated_variants: BTreeMap::new(),
                     cps: 15.0,
                     warnings: vec![],
                 },
@@ -1935,12 +2009,15 @@ mod tests {
                     end_ms: 8000,
                     source_text: "Thank you for watching!".to_string(),
                     translated_text: String::new(),
+                    translated_variants: BTreeMap::new(),
                     cps: 11.5,
                     warnings: vec![],
                 },
             ],
             phase: JobPhase::Translating,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T18:00:00Z".to_string(),
         }
@@ -2087,11 +2164,18 @@ mod tests {
         server_task.abort();
 
         // Batch 1 failed with 2 cues, subdivided into 2 single-cue calls (1 + 2 = 3 calls),
-        // Batch 2 succeeded on first try (1 call) => 4 total HTTP calls
+        // Batch 2 succeeded on first try (1 call) => 4 total HTTP calls.
+        // Checkpoints: 2 batch checkpoints + 1 post-pass checkpoint after enforcing 80ms gap on 0ms fixture cues.
         assert_eq!(call_counter.load(Ordering::SeqCst), 4);
-        assert_eq!(checkpoints_saved, 2);
+        assert_eq!(checkpoints_saved, 3);
         assert_eq!(progress_events, 2);
         assert_eq!(project.completed_translation_batches, 2);
+        for pair in project.cues.windows(2) {
+            assert!(
+                pair[1].start_ms.saturating_sub(pair[0].end_ms) >= MIN_GAP_MS,
+                "expected >= 80ms inter-cue gap after post-pass"
+            );
+        }
 
         // Verify Serbian Cyrillic script conversion and balanced 2-line wrapping
         assert_eq!(project.cues[0].translated_text, "Добро јутрo свима.".replace('o', "о"));
@@ -2437,6 +2521,7 @@ mod tests {
                     source_text: "Section 37 of the Aesip for Children, and this is a classic fable."
                         .to_string(),
                     translated_text: String::new(),
+                    translated_variants: BTreeMap::new(),
                     cps: 16.0,
                     warnings: vec![],
                 },
@@ -2446,12 +2531,15 @@ mod tests {
                     end_ms: 6500,
                     source_text: "Welcome to Bellgrade!".to_string(),
                     translated_text: String::new(),
+                    translated_variants: BTreeMap::new(),
                     cps: 8.0,
                     warnings: vec![],
                 },
             ],
             phase: JobPhase::Translating,
             completed_translation_batches: 0,
+            topic_context: None,
+            completed_translation_style: None,
             error_message: None,
             updated_at: "2026-11-22T22:00:00Z".to_string(),
         };
@@ -2480,8 +2568,13 @@ mod tests {
 
         server_task.abort();
 
-        assert_eq!(checkpoints, 1);
+        // 1 batch checkpoint + 1 post-pass checkpoint after enforcing >= 80ms gap on 0ms fixture boundary
+        assert_eq!(checkpoints, 2);
         assert_eq!(project.completed_translation_batches, 1);
+        assert!(
+            project.cues[1].start_ms.saturating_sub(project.cues[0].end_ms) >= MIN_GAP_MS,
+            "expected >= 80ms inter-cue gap after post-pass"
+        );
 
         // Verify local json_schema enforced {"source": string, "text": string} per cue ID
         let reqs = captured_requests.lock().await;
@@ -3136,6 +3229,7 @@ mod tests {
                 end_ms: 1500,
                 source_text: "Good morning.".to_string(),
                 translated_text: "Dobro jutro.".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 8.0,
                 warnings: vec![],
             },
@@ -3145,6 +3239,7 @@ mod tests {
                 end_ms: 2200,
                 source_text: "Um, you know...".to_string(),
                 translated_text: String::new(),
+                translated_variants: BTreeMap::new(),
                 cps: 0.0,
                 warnings: vec![],
             },
@@ -3154,6 +3249,7 @@ mod tests {
                 end_ms: 2800,
                 source_text: "Znači, ovaj...".to_string(),
                 translated_text: "[EMPTY]".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 0.0,
                 warnings: vec![],
             },
@@ -3163,6 +3259,7 @@ mod tests {
                 end_ms: 4500,
                 source_text: "Welcome to Belgrade.".to_string(),
                 translated_text: "Dobrodošli u Beograd.".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 12.9,
                 warnings: vec![],
             },
@@ -3181,6 +3278,7 @@ mod tests {
             end_ms: 900,
             source_text: "Um, you know...".to_string(),
             translated_text: String::new(),
+            translated_variants: BTreeMap::new(),
             cps: 0.0,
             warnings: vec![],
         }];
@@ -3261,6 +3359,7 @@ mod tests {
                 end_ms: 800,
                 source_text: "Um, you know...".to_string(),
                 translated_text: String::new(),
+                translated_variants: BTreeMap::new(),
                 cps: 10.0,
                 warnings: vec![],
             },
@@ -3270,6 +3369,7 @@ mod tests {
                 end_ms: 2500,
                 source_text: "I don't know. What".to_string(),
                 translated_text: String::new(),
+                translated_variants: BTreeMap::new(),
                 cps: 11.0,
                 warnings: vec![],
             },
@@ -3279,6 +3379,7 @@ mod tests {
                 end_ms: 4200,
                 source_text: "are we doing here?".to_string(),
                 translated_text: String::new(),
+                translated_variants: BTreeMap::new(),
                 cps: 11.0,
                 warnings: vec![],
             },
@@ -3343,6 +3444,7 @@ mod tests {
                 end_ms: 2000,
                 source_text: "I don't know. What".to_string(),
                 translated_text: "Ne znam. Šta".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 6.0,
                 warnings: vec![],
             },
@@ -3352,6 +3454,7 @@ mod tests {
                 end_ms: 4000,
                 source_text: "are we doing here?".to_string(),
                 translated_text: "radimo ovde?".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 6.0,
                 warnings: vec![],
             },
@@ -3388,6 +3491,7 @@ mod tests {
                 end_ms: 1800,
                 source_text: "Okay, alright, what".to_string(),
                 translated_text: "Dobro, u redu, šta".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 10.0,
                 warnings: vec![],
             },
@@ -3397,6 +3501,7 @@ mod tests {
                 end_ms: 3600,
                 source_text: "do we do now?".to_string(),
                 translated_text: "ćemo sada?".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 6.0,
                 warnings: vec![],
             },
@@ -3414,6 +3519,7 @@ mod tests {
                 end_ms: 1500,
                 source_text: "Thanks, bro.".to_string(),
                 translated_text: "Hvala ti, brate.".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 10.0,
                 warnings: vec![],
             },
@@ -3423,6 +3529,7 @@ mod tests {
                 end_ms: 3000,
                 source_text: "See you tomorrow.".to_string(),
                 translated_text: "Vidimo se sutra.".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 11.0,
                 warnings: vec![],
             },
@@ -3439,6 +3546,7 @@ mod tests {
                 end_ms: 1500,
                 source_text: "With Dr. Marko".to_string(),
                 translated_text: "Pričao sam sa dr. Markom".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 12.0,
                 warnings: vec![],
             },
@@ -3448,6 +3556,7 @@ mod tests {
                 end_ms: 3000,
                 source_text: "yesterday. What".to_string(),
                 translated_text: "juče. Šta".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 7.0,
                 warnings: vec![],
             },
@@ -3457,6 +3566,7 @@ mod tests {
                 end_ms: 6000,
                 source_text: "happened next?".to_string(),
                 translated_text: "je bilo dalje?".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 8.0,
                 warnings: vec![],
             },
@@ -3483,6 +3593,7 @@ mod tests {
                 end_ms: 1500,
                 source_text: "Done. Tomorrow".to_string(),
                 translated_text: "Gotovo. Sutra".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 9.0,
                 warnings: vec![],
             },
@@ -3492,6 +3603,7 @@ mod tests {
                 end_ms: 3200,
                 source_text: "we start the project".to_string(),
                 translated_text: "krećemo novi projekat".to_string(),
+                translated_variants: BTreeMap::new(),
                 cps: 13.0,
                 warnings: vec![],
             },
@@ -3673,5 +3785,197 @@ mod tests {
                 .await
                 .is_err()
         );
+    }
+
+    #[tokio::test]
+    async fn dual_style_cache_scopes_resume_preserves_both_variants_and_syncs_condense() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let http_calls = Arc::new(AtomicUsize::new(0));
+        let http_calls_clone = Arc::clone(&http_calls);
+
+        let server = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                http_calls_clone.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; 32768];
+                    let mut total_read = 0usize;
+                    let mut header_end = None;
+                    let mut content_len = 0usize;
+                    loop {
+                        let n = socket.read(&mut buf[total_read..]).await.unwrap_or(0);
+                        if n == 0 {
+                            break;
+                        }
+                        total_read += n;
+                        let s = String::from_utf8_lossy(&buf[..total_read]);
+                        if header_end.is_none() {
+                            if let Some(pos) = s.find("\r\n\r\n") {
+                                header_end = Some(pos + 4);
+                                for line in s[..pos].lines() {
+                                    if let Some(v) =
+                                        line.to_ascii_lowercase().strip_prefix("content-length:")
+                                    {
+                                        content_len = v.trim().parse().unwrap_or(0);
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(h_end) = header_end {
+                            if total_read >= h_end + content_len {
+                                break;
+                            }
+                        }
+                    }
+
+                    let req_str = String::from_utf8_lossy(&buf[..total_read]);
+                    let body_part = req_str.split("\r\n\r\n").nth(1).unwrap_or("{}");
+                    let req_json: serde_json::Value =
+                        serde_json::from_str(body_part).unwrap_or_default();
+                    let sys_prompt = req_json["messages"][0]["content"].as_str().unwrap_or("");
+                    let user_content = req_json["messages"][1]["content"].as_str().unwrap_or("{}");
+                    let payload: serde_json::Value =
+                        serde_json::from_str(user_content).unwrap_or_default();
+                    let targets = payload["translate_cues"]
+                        .as_array()
+                        .cloned()
+                        .unwrap_or_default();
+
+                    let is_condense = sys_prompt.contains("tightening verbose subtitles");
+                    let is_formal = sys_prompt.contains("standardni književni stil");
+
+                    let mut map_out = serde_json::Map::new();
+                    for t in &targets {
+                        let id = t["id"].as_u64().unwrap_or(1);
+                        let text = if is_condense {
+                            "Sažet formalni titl.".to_string()
+                        } else if is_formal {
+                            if id == 1 {
+                                "Poštovani gledaoci, ovo je veoma opširan formalan uvod u današnju temu."
+                                    .to_string()
+                            } else {
+                                "Srdačan pozdrav iz Beograda.".to_string()
+                            }
+                        } else if id == 1 {
+                            "Ćao svima, idemo dalje.".to_string()
+                        } else {
+                            "Pozdrav iz Beograda.".to_string()
+                        };
+                        map_out.insert(id.to_string(), serde_json::Value::String(text));
+                    }
+
+                    let resp_json = serde_json::json!({
+                        "choices": [{
+                            "message": {
+                                "role": "assistant",
+                                "content": serde_json::Value::Object(map_out).to_string()
+                            }
+                        }]
+                    });
+                    let resp_body = serde_json::to_string(&resp_json).unwrap();
+                    let http_resp = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        resp_body.len(),
+                        resp_body
+                    );
+                    let _ = socket.write_all(http_resp.as_bytes()).await;
+                });
+            }
+        });
+
+        let mut project = sample_project(SerbianScript::Latin);
+        project.cues.truncate(2);
+        project.cues[0].start_ms = 0;
+        project.cues[0].end_ms = 1900;
+        project.cues[1].start_ms = 2000;
+        project.cues[1].end_ms = 4000;
+
+        let endpoint = LlmEndpointConfig {
+            base_url: format!("http://127.0.0.1:{}/v1", addr.port()),
+            model: "local-llm".to_string(),
+            api_key: None,
+            batch_size: 2,
+        };
+        let cancel = Arc::new(AtomicBool::new(false));
+
+        // 1. Translate in Natural style
+        project.options.translation_style = TranslationStyle::Natural;
+        translate_cues(&mut project, &endpoint, &cancel, |_| Ok(()), |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(http_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            project.completed_translation_style,
+            Some(TranslationStyle::Natural)
+        );
+        assert_eq!(project.cues[0].translated_text, "Ćao svima, idemo dalje.");
+        assert_eq!(
+            project.cues[0]
+                .translated_variants
+                .get(&TranslationStyle::Natural)
+                .map(String::as_str),
+            Some("Ćao svima, idemo dalje.")
+        );
+
+        // 2. Re-running Translate in same Natural style skips completed batch (0 new HTTP calls)
+        translate_cues(&mut project, &endpoint, &cancel, |_| Ok(()), |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(http_calls.load(Ordering::SeqCst), 1);
+
+        // 3. Switching to Formal style resets resume and translates into Formal while keeping Natural!
+        project.options.translation_style = TranslationStyle::Formal;
+        translate_cues(&mut project, &endpoint, &cancel, |_| Ok(()), |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(http_calls.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            project.completed_translation_style,
+            Some(TranslationStyle::Formal)
+        );
+        assert_eq!(
+            project.cues[0]
+                .translated_variants
+                .get(&TranslationStyle::Natural)
+                .map(String::as_str),
+            Some("Ćao svima, idemo dalje.")
+        );
+        assert!(project.cues[0]
+            .translated_variants
+            .get(&TranslationStyle::Formal)
+            .is_some_and(|s| s.contains("Poštovani gledaoci")));
+        assert_eq!(
+            project.cues[1]
+                .translated_variants
+                .get(&TranslationStyle::Formal)
+                .map(String::as_str),
+            Some("Srdačan pozdrav iz Beograda.")
+        );
+
+        // 4. CondenseCps in Formal style updates Formal variant + translated_text without touching Natural!
+        condense_cps_cues(&mut project, &endpoint, &cancel, |_| Ok(()), |_, _| {})
+            .await
+            .unwrap();
+        assert_eq!(http_calls.load(Ordering::SeqCst), 3);
+        assert_eq!(project.cues[0].translated_text, "Sažet formalni titl.");
+        assert_eq!(
+            project.cues[0]
+                .translated_variants
+                .get(&TranslationStyle::Formal)
+                .map(String::as_str),
+            Some("Sažet formalni titl.")
+        );
+        assert_eq!(
+            project.cues[0]
+                .translated_variants
+                .get(&TranslationStyle::Natural)
+                .map(String::as_str),
+            Some("Ćao svima, idemo dalje.")
+        );
+
+        server.abort();
     }
 }

@@ -345,10 +345,25 @@ pub fn load_config(app: &AppHandle) -> Result<AppConfig> {
     load_config_from_path(Path::new(&paths.config_path))
 }
 
-/// Atomically persist `AppConfig` to `<root>/config.json`.
+/// Atomically persist `AppConfig` to `<root>/config.json` for resolved `StoragePaths`,
+/// migrating RAM session API keys to the local encrypted vault or removing disk vault files
+/// whenever `allow_local_encrypted_vault` is toggled.
+pub fn save_config_for_paths(paths: &StoragePaths, config: &AppConfig) -> Result<AppConfig> {
+    let config_path = Path::new(&paths.config_path);
+    let prev_allow = load_config_from_path(config_path)
+        .map(|c| c.allow_local_encrypted_vault)
+        .unwrap_or(false);
+    let saved = save_config_to_path(config_path, config)?;
+    if prev_allow != saved.allow_local_encrypted_vault {
+        sync_local_vault_opt_in_for_paths(paths, saved.allow_local_encrypted_vault)?;
+    }
+    Ok(saved)
+}
+
+/// Atomically persist `AppConfig` to `<root>/config.json` and sync local vault opt-in transitions.
 pub fn save_config(app: &AppHandle, config: &AppConfig) -> Result<AppConfig> {
     let paths = resolve_storage_paths(app, config.models_dir_override.as_deref())?;
-    save_config_to_path(Path::new(&paths.config_path), config)
+    save_config_for_paths(&paths, config)
 }
 
 // ---------------------------------------------------------------------------
@@ -1080,28 +1095,120 @@ pub fn clear_api_key_with_opt_in(
     clear_api_key_for_paths_with_opt_in(&paths, provider, true, allow_local_vault)
 }
 
-/// Retrieve an API key for `DeepSeek` or `CustomOpenAi` (used by `pipeline::translator`).
+/// Migrates RAM session keys into the opt-in encrypted local vault when `allow_local_vault`
+/// is enabled, or moves decrypted vault keys back into the RAM session vault and removes
+/// local disk vault files (`.credentials.json` and Unix `.vault.key`) when disabled.
+pub fn sync_local_vault_opt_in_for_paths(
+    paths: &StoragePaths,
+    allow_local_vault: bool,
+) -> Result<()> {
+    let cred_path = credentials_file_path(paths);
+    let users = [KEYRING_USER_DEEPSEEK, KEYRING_USER_CUSTOM_OPENAI];
+
+    if allow_local_vault {
+        let mut to_migrate: Vec<(&str, String)> = Vec::new();
+        for user in users {
+            if let Some(secret) = session_vault_get(paths, user) {
+                to_migrate.push((user, secret));
+            }
+        }
+        if !to_migrate.is_empty() {
+            let _cred_guard = lock_credentials_io();
+            let mut creds = read_credentials_file(&cred_path);
+            for (user, secret) in &to_migrate {
+                let envelope = encrypt_vault_secret(paths, user, secret)?;
+                creds.entries.insert((*user).to_string(), envelope);
+            }
+            write_credentials_file(&cred_path, &creds)?;
+            drop(_cred_guard);
+            for (user, _) in to_migrate {
+                session_vault_remove(paths, user);
+            }
+        }
+    } else {
+        let _cred_guard = lock_credentials_io();
+        if cred_path.is_file() {
+            let creds = read_credentials_file(&cred_path);
+            for user in users {
+                if session_vault_get(paths, user).is_none() {
+                    if let Some(plain) = creds
+                        .entries
+                        .get(user)
+                        .and_then(|stored| decrypt_vault_secret(paths, user, stored))
+                    {
+                        session_vault_set(paths, user, &plain);
+                    }
+                }
+            }
+            if let Err(err) = fs::remove_file(&cred_path) {
+                if err.kind() != std::io::ErrorKind::NotFound {
+                    return Err(err).with_context(|| {
+                        format!(
+                            "Failed to remove local credentials file: {}",
+                            cred_path.display()
+                        )
+                    });
+                }
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let key_path = vault_key_file_path(paths);
+            if key_path.exists() {
+                if let Err(err) = fs::remove_file(&key_path) {
+                    if err.kind() != std::io::ErrorKind::NotFound {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "Failed to remove local vault key file: {}",
+                                key_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn load_allow_local_vault_flag(paths: &StoragePaths) -> bool {
+    load_config_from_path(Path::new(&paths.config_path))
+        .map(|cfg| cfg.allow_local_encrypted_vault)
+        .unwrap_or(false)
+}
+
+/// Retrieve an API key for `DeepSeek` or `CustomOpenAi` (honoring `AppConfig.allow_local_encrypted_vault`).
 pub fn get_api_key(app: &AppHandle, provider: TranslationProviderKind) -> Result<Option<String>> {
-    get_api_key_with_opt_in(app, provider, false)
+    let paths = resolve_storage_paths(app, None)?;
+    let allow = load_allow_local_vault_flag(&paths);
+    get_api_key_for_paths_with_opt_in(&paths, provider, true, allow)
 }
 
-/// Return current API key presence and active backend (`"keyring"`, `"memory-session"`, or `"local-vault"`).
+/// Return current API key presence and active backend (`"keyring"`, `"memory-session"`, or `"local-vault"`),
+/// honoring `AppConfig.allow_local_encrypted_vault`.
 pub fn get_api_key_status(app: &AppHandle) -> Result<ApiKeyStatus> {
-    get_api_key_status_with_opt_in(app, false)
+    let paths = resolve_storage_paths(app, None)?;
+    let allow = load_allow_local_vault_flag(&paths);
+    get_api_key_status_for_paths_with_opt_in(&paths, true, allow)
 }
 
-/// Save an API key for `DeepSeek` or `CustomOpenAi`.
+/// Save an API key for `DeepSeek` or `CustomOpenAi` (honoring `AppConfig.allow_local_encrypted_vault`).
 pub fn set_api_key(
     app: &AppHandle,
     provider: TranslationProviderKind,
     api_key: &str,
 ) -> Result<ApiKeyStatus> {
-    set_api_key_with_opt_in(app, provider, api_key, false)
+    let paths = resolve_storage_paths(app, None)?;
+    let allow = load_allow_local_vault_flag(&paths);
+    set_api_key_for_paths_with_opt_in(&paths, provider, api_key, true, allow)
 }
 
-/// Clear an API key for `DeepSeek` or `CustomOpenAi`.
+/// Clear an API key for `DeepSeek` or `CustomOpenAi` (honoring `AppConfig.allow_local_encrypted_vault`).
 pub fn clear_api_key(app: &AppHandle, provider: TranslationProviderKind) -> Result<ApiKeyStatus> {
-    clear_api_key_with_opt_in(app, provider, false)
+    let paths = resolve_storage_paths(app, None)?;
+    let allow = load_allow_local_vault_flag(&paths);
+    clear_api_key_for_paths_with_opt_in(&paths, provider, true, allow)
 }
 
 // ---------------------------------------------------------------------------
@@ -1155,6 +1262,27 @@ pub fn save_checkpoint_for_paths(paths: &StoragePaths, project: &SubtitleProject
     save_checkpoint_to_data_dir(Path::new(&paths.data_dir), project)
 }
 
+/// Seeds `cue.translated_variants` from legacy v0.3.x checkpoints where `translated_text`
+/// is populated but `translated_variants` is empty.
+pub fn seed_legacy_translated_variants(project: &mut SubtitleProject) {
+    let style = project
+        .completed_translation_style
+        .unwrap_or(project.options.translation_style);
+    let mut seeded_any = false;
+    for cue in &mut project.cues {
+        if cue.translated_variants.is_empty() && !cue.translated_text.trim().is_empty() {
+            cue.translated_variants
+                .insert(style, cue.translated_text.clone());
+            seeded_any = true;
+        }
+    }
+    if project.completed_translation_style.is_none()
+        && (seeded_any || project.completed_translation_batches > 0)
+    {
+        project.completed_translation_style = Some(style);
+    }
+}
+
 /// List all saved `SubtitleProject` checkpoints in `<data_dir>/checkpoints/`, sorted by `updated_at` descending.
 pub fn list_checkpoints_in_data_dir(data_dir: &Path) -> Result<Vec<SubtitleProject>> {
     let dir = data_dir.join("checkpoints");
@@ -1185,7 +1313,10 @@ pub fn list_checkpoints_in_data_dir(data_dir: &Path) -> Result<Vec<SubtitleProje
             .ok()
             .and_then(|raw| serde_json::from_str::<SubtitleProject>(&raw).ok())
         {
-            Some(project) => projects.push(project),
+            Some(mut project) => {
+                seed_legacy_translated_variants(&mut project);
+                projects.push(project);
+            }
             None => {
                 tracing::warn!("Skipping unreadable checkpoint file: {}", path.display());
             }
@@ -1208,8 +1339,9 @@ pub fn load_checkpoint_from_data_dir(data_dir: &Path, job_id: &str) -> Result<Su
     }
     let raw = fs::read_to_string(&path)
         .with_context(|| format!("Failed to read checkpoint file: {}", path.display()))?;
-    let project: SubtitleProject = serde_json::from_str(&raw)
+    let mut project: SubtitleProject = serde_json::from_str(&raw)
         .with_context(|| format!("Failed to parse checkpoint JSON: {}", path.display()))?;
+    seed_legacy_translated_variants(&mut project);
     Ok(project)
 }
 
@@ -1273,6 +1405,11 @@ mod tests {
     }
 
     fn sample_project(job_id: &str) -> SubtitleProject {
+        let mut variants = BTreeMap::new();
+        variants.insert(
+            crate::models::TranslationStyle::Natural,
+            "Zdravo svete".to_string(),
+        );
         SubtitleProject {
             job_id: job_id.to_string(),
             audio_path: "/tmp/a.mp3".to_string(),
@@ -1293,11 +1430,14 @@ mod tests {
                 end_ms: 1500,
                 source_text: "Hello world".to_string(),
                 translated_text: "Zdravo svete".to_string(),
+                translated_variants: variants,
                 cps: 8.0,
                 warnings: vec![],
             }],
             phase: JobPhase::Completed,
             completed_translation_batches: 1,
+            topic_context: None,
+            completed_translation_style: Some(crate::models::TranslationStyle::Natural),
             error_message: None,
             updated_at: "2026-11-22T10:00:00Z".to_string(),
         }
@@ -1748,5 +1888,151 @@ mod tests {
             hex::encode(mac2),
             "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
         );
+    }
+
+    #[test]
+    fn save_config_toggle_migrates_ram_keys_to_local_vault_and_cleans_up_on_disable() {
+        let base = make_temp_dir("vault_toggle");
+        let paths = resolve_storage_paths_from_root(&base, StorageMode::Installed, None).unwrap();
+        let cred_file = credentials_file_path(&paths);
+
+        // 1. Store key with allow_local_vault = false -> stays strictly in RAM
+        let status_ram = set_api_key_for_paths_with_opt_in(
+            &paths,
+            TranslationProviderKind::DeepSeek,
+            "sk-migrate-secret-999",
+            false,
+            false,
+        )
+        .unwrap();
+        assert_eq!(status_ram.storage_backend, "memory-session");
+        assert!(!cred_file.exists());
+
+        // 2. Toggle allow_local_encrypted_vault = true via save_config_for_paths -> migrates RAM to disk vault
+        let mut cfg = default_app_config();
+        cfg.allow_local_encrypted_vault = true;
+        save_config_for_paths(&paths, &cfg).unwrap();
+
+        assert!(cred_file.is_file(), "Expected .credentials.json after opt-in migration");
+        let status_disk = get_api_key_status_for_paths_with_opt_in(&paths, false, true).unwrap();
+        assert!(status_disk.has_deep_seek_key);
+        assert_eq!(status_disk.storage_backend, "local-vault");
+        assert_eq!(
+            get_api_key_for_paths_with_opt_in(&paths, TranslationProviderKind::DeepSeek, false, true)
+                .unwrap()
+                .as_deref(),
+            Some("sk-migrate-secret-999")
+        );
+
+        // 3. Toggle allow_local_encrypted_vault = false -> removes disk vault files & preserves RAM session
+        cfg.allow_local_encrypted_vault = false;
+        save_config_for_paths(&paths, &cfg).unwrap();
+
+        assert!(
+            !cred_file.exists(),
+            "Disabling local encrypted vault must delete .credentials.json"
+        );
+        #[cfg(not(windows))]
+        assert!(
+            !vault_key_file_path(&paths).exists(),
+            "Disabling local encrypted vault must delete .vault.key"
+        );
+        let status_back_ram =
+            get_api_key_status_for_paths_with_opt_in(&paths, false, false).unwrap();
+        assert!(status_back_ram.has_deep_seek_key);
+        assert_eq!(status_back_ram.storage_backend, "memory-session");
+        assert_eq!(
+            get_api_key_for_paths_with_opt_in(
+                &paths,
+                TranslationProviderKind::DeepSeek,
+                false,
+                false,
+            )
+            .unwrap()
+            .as_deref(),
+            Some("sk-migrate-secret-999")
+        );
+
+        let _ = clear_api_key_for_paths_with_opt_in(
+            &paths,
+            TranslationProviderKind::DeepSeek,
+            false,
+            false,
+        );
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn legacy_checkpoint_seeds_translated_variants_on_load() {
+        let base = make_temp_dir("legacy_cp_seed");
+        let paths = resolve_storage_paths_from_root(&base, StorageMode::Installed, None).unwrap();
+        let cp_path = Path::new(&paths.data_dir)
+            .join("checkpoints")
+            .join("legacy-seed-job.easysrt.json");
+
+        let legacy_json = serde_json::json!({
+            "jobId": "legacy-seed-job",
+            "audioPath": "/tmp/a.mp3",
+            "audioFileName": "a.mp3",
+            "durationMs": 2000,
+            "detectedLanguage": "en",
+            "options": {
+                "sourceLanguage": "en",
+                "targetLanguage": "sr",
+                "script": "latin",
+                "segmentRules": {
+                    "preset": "standard",
+                    "maxCharsPerLine": 42,
+                    "maxLines": 2,
+                    "minDurationMs": 1000,
+                    "maxDurationMs": 7000,
+                    "maxCps": 17.0
+                },
+                "glossary": {},
+                "polishSerbian": true,
+                "translationStyle": "formal",
+                "providerOverride": null
+            },
+            "words": [],
+            "cues": [{
+                "id": 1,
+                "startMs": 0,
+                "endMs": 2000,
+                "sourceText": "Good morning.",
+                "translatedText": "Dobro jutro.",
+                "cps": 6.0,
+                "warnings": []
+            }],
+            "phase": "completed",
+            "completedTranslationBatches": 1,
+            "errorMessage": null,
+            "updatedAt": "2026-11-22T12:00:00Z"
+        });
+        fs::write(&cp_path, serde_json::to_vec_pretty(&legacy_json).unwrap()).unwrap();
+
+        let loaded = load_checkpoint_for_paths(&paths, "legacy-seed-job").unwrap();
+        assert_eq!(
+            loaded.completed_translation_style,
+            Some(crate::models::TranslationStyle::Formal)
+        );
+        assert_eq!(
+            loaded.cues[0]
+                .translated_variants
+                .get(&crate::models::TranslationStyle::Formal)
+                .map(String::as_str),
+            Some("Dobro jutro.")
+        );
+
+        let listed = list_checkpoints_in_data_dir(Path::new(&paths.data_dir)).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(
+            listed[0].cues[0]
+                .translated_variants
+                .get(&crate::models::TranslationStyle::Formal)
+                .map(String::as_str),
+            Some("Dobro jutro.")
+        );
+
+        let _ = fs::remove_dir_all(&base);
     }
 }
