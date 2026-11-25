@@ -538,6 +538,12 @@ fn is_leading_conjunction_or_filler(text: &str) -> bool {
             | "so"
             | "or"
             | "well"
+            | "like"
+            | "znači"
+            | "znaci"
+            | "ovaj"
+            | "значи"
+            | "овај"
     )
 }
 
@@ -552,7 +558,10 @@ fn is_sentence_capable_filler(word: &str) -> bool {
         .trim()
         .trim_matches(|c: char| !c.is_alphanumeric())
         .to_lowercase();
-    matches!(core.as_str(), "da" | "да" | "well")
+    matches!(
+        core.as_str(),
+        "da" | "да" | "well" | "like" | "znači" | "znaci" | "ovaj" | "значи" | "овај"
+    )
 }
 
 /// Returns `true` if `conj` is a leading conjunction/filler that should stay attached
@@ -3506,5 +3515,37 @@ mod tests {
             let expected: Vec<String> = expected_warnings.iter().map(|s| (*s).to_string()).collect();
             assert_eq!(cue.warnings, expected);
         }
+    }
+
+    #[test]
+    fn keeps_leading_discourse_fillers_like_znaci_ovaj_attached_to_continuing_clause() {
+        let rules = SegmentRules::default();
+
+        let en_words = vec![
+            word(9_830, 10_120, "Like,"),
+            word(10_550, 10_800, "you"),
+            word(10_820, 11_100, "know,"),
+            word(11_150, 11_400, "you"),
+            word(11_420, 11_650, "got"),
+            word(11_670, 11_800, "to"),
+            word(11_820, 12_100, "take"),
+            word(12_120, 12_400, "care"),
+            word(12_420, 12_550, "of"),
+            word(12_570, 12_800, "your"),
+            word(12_820, 13_300, "bodies."),
+        ];
+        let en_cues = segment_words(&en_words, &rules);
+        assert_eq!(en_cues.len(), 1, "isolated 'Like,' should not become its own cue: {en_cues:?}");
+        assert!(en_cues[0].source_text.starts_with("Like, you know,"));
+
+        let sr_words = vec![
+            word(1_000, 1_300, "Znači,"),
+            word(1_900, 2_300, "krećemo"),
+            word(2_350, 2_800, "sutra"),
+            word(2_850, 3_300, "ujutru."),
+        ];
+        let sr_cues = segment_words(&sr_words, &rules);
+        assert_eq!(sr_cues.len(), 1, "isolated 'Znači,' should stay attached: {sr_cues:?}");
+        assert!(sr_cues[0].source_text.starts_with("Znači, krećemo"));
     }
 }

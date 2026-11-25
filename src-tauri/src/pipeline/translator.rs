@@ -837,14 +837,14 @@ fn build_filler_guidelines(serbian_examples: bool, remove_fillers: bool) -> &'st
              ('znači', 'ovaj', 'onaj', 'kako se zove', 'mislim', 'you know', 'like', 'I mean', 'sort of', 'basically', 'um', 'uh') \
              whenever they carry zero semantic meaning in context.\n\
              - STRICTLY PRESERVE lexical/semantic uses of these words (e.g., \"Ovaj čovek\", \"Šta to znači?\", \"Mislim da grešiš\", \"I like it\", \"What do you mean?\").\n\
-             - If a short cue consists exclusively of spoken fillers with no remaining meaning, keep its cue ID key in the JSON and output \"[EMPTY]\" (or \"\")."
+             - If a short cue consists exclusively of spoken fillers (e.g., \"Like,\", \"You know,\", \"Um,\", \"Znači,\", \"Ovaj,\") with no remaining semantic meaning, keep its cue ID key in the JSON and output \"[EMPTY]\" (or \"\") — NEVER translate an isolated filler literally (e.g., do NOT output \"Kao,\" or \"Znate,\")."
         } else {
             "SPOKEN FILLER & DISFLUENCY REMOVAL:\n\
              - Omit pure conversational fillers, vocal hesitations, false starts, and stutters \
              ('you know', 'like', 'I mean', 'sort of', 'basically', 'um', 'uh') \
              whenever they carry zero semantic meaning in context.\n\
              - STRICTLY PRESERVE lexical/semantic uses of these words (e.g., \"I like it\", \"What do you mean?\").\n\
-             - If a short cue consists exclusively of spoken fillers with no remaining meaning, keep its cue ID key in the JSON and output \"[EMPTY]\" (or \"\")."
+             - If a short cue consists exclusively of spoken fillers (e.g., \"Like,\", \"You know,\", \"Um,\") with no remaining semantic meaning, keep its cue ID key in the JSON and output \"[EMPTY]\" (or \"\") — NEVER translate an isolated filler literally."
         }
     } else {
         "DISCOURSE MARKER PRESERVATION:\n\

@@ -127,7 +127,53 @@ fn is_windows_reserved_device_name(token: &str) -> bool {
     )
 }
 
-/// Sanitizes an untrusted filename token (`stem`, `target_language`, `source_language`,
+/// Sanitizes an untrusted filename stem while preserving safe single internal dots
+/// (e.g. `16.9.mp3` -> `16.9`, `S01.E02.mp4` -> `S01.E02`), while stripping path
+/// separators, NUL/control characters, consecutive dots (`..`), leading/trailing dots,
+/// and Windows reserved device names (including `CON.1` / `NUL.ext`).
+pub fn sanitize_filename_stem(raw: &str, fallback: &str) -> String {
+    let mut cleaned = String::with_capacity(raw.len().min(128));
+    let mut prev_underscore = false;
+    let mut prev_dot = false;
+
+    for ch in raw.chars() {
+        if ch == '\0' || ch.is_control() || matches!(ch, '/' | '\\') {
+            continue;
+        }
+        if ch == '.' {
+            if !cleaned.is_empty() && !prev_dot {
+                cleaned.push('.');
+                prev_dot = true;
+                prev_underscore = false;
+            }
+        } else if ch.is_alphanumeric() || ch == '_' || ch == '-' {
+            cleaned.push(ch);
+            prev_underscore = ch == '_';
+            prev_dot = false;
+        } else if ch.is_whitespace() && !prev_underscore && !cleaned.is_empty() {
+            cleaned.push('_');
+            prev_underscore = true;
+            prev_dot = false;
+        }
+        if cleaned.chars().count() >= 120 {
+            break;
+        }
+    }
+
+    let trimmed = cleaned.trim_matches(|c| matches!(c, '.' | '_' | '-'));
+    let first_segment = trimmed.split('.').next().unwrap_or("");
+    if trimmed.is_empty()
+        || trimmed.contains("..")
+        || is_windows_reserved_device_name(trimmed)
+        || is_windows_reserved_device_name(first_segment)
+    {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+/// Sanitizes an untrusted filename token (`target_language`, `source_language`,
 /// `detected_language`) by allowing only safe alphanumeric characters, `_`, and `-`,
 /// stripping `..`, `/`, `\`, NUL, and control characters, and falling back to `fallback`.
 pub fn sanitize_filename_token(raw: &str, fallback: &str) -> String {
@@ -216,7 +262,7 @@ fn resolve_stem(project: &SubtitleProject) -> String {
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .unwrap_or("subtitles");
-    sanitize_filename_token(raw_stem, "subtitles")
+    sanitize_filename_stem(raw_stem, "subtitles")
 }
 
 /// Exports `project` subtitles according to `options` and returns the written file paths.
@@ -485,5 +531,61 @@ mod tests {
         assert!(!outer_dir.join("nested").join("escape.srt").exists());
 
         let _ = fs::remove_dir_all(&outer_dir);
+    }
+
+    #[test]
+    fn preserves_safe_single_dots_in_stem_while_blocking_traversal_and_reserved_names() {
+        assert_eq!(sanitize_filename_stem("16.9", "subtitles"), "16.9");
+        assert_eq!(
+            sanitize_filename_stem("S01.E02.Final", "subtitles"),
+            "S01.E02.Final"
+        );
+        assert_eq!(sanitize_filename_stem("..a..b..", "subtitles"), "a.b");
+        assert_eq!(sanitize_filename_stem(".hidden", "subtitles"), "hidden");
+        assert_eq!(sanitize_filename_stem("...", "subtitles"), "subtitles");
+        assert_eq!(sanitize_filename_stem("CON.1", "subtitles"), "subtitles");
+        assert_eq!(sanitize_filename_stem("NUL.mp3", "subtitles"), "subtitles");
+        assert_eq!(
+            sanitize_filename_stem("../../evil_stem\0", "subtitles"),
+            "evil_stem"
+        );
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_export_dots_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let project = SubtitleProject {
+            job_id: "job-dots".to_string(),
+            audio_path: temp_dir.join("16.9.mp3").to_string_lossy().to_string(),
+            audio_file_name: "16.9.mp3".to_string(),
+            duration_ms: 6000,
+            detected_language: Some("en".to_string()),
+            options: JobOptions::default(),
+            words: vec![],
+            cues: sample_cues(),
+            phase: JobPhase::Completed,
+            completed_translation_batches: 1,
+            topic_context: None,
+            completed_translation_style: None,
+            error_message: None,
+            updated_at: "2026-11-25T11:00:00Z".to_string(),
+        };
+
+        let opts = ExportOptions {
+            output_dir: None,
+            save_beside_audio: true,
+            include_source_srt: true,
+            formats: vec![ExportFormat::Srt],
+            utf8_bom: false,
+        };
+
+        let res = export_project_files(&project, &opts).unwrap();
+        assert_eq!(res.written_files.len(), 2);
+        assert!(temp_dir.join("16.9.sr.srt").is_file());
+        assert!(temp_dir.join("16.9.en.srt").is_file());
+
+        let _ = fs::remove_dir_all(&temp_dir);
     }
 }
