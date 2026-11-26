@@ -53,4 +53,18 @@ Brza rešenja za GPU ubrzanje, memoriju lokalnih AI modela, bezbednost API klju�
 - **Kako da prijavim grešku ili pošaljem predlog za novu funkciju?**
   - Kliknite na dugme za prijavu greške / predloga u donjem podnožju (footeru) aplikacije.
 - **Da li se moji audio snimci ili tekstovi titlova šalju uz izveštaj o grešci?**
-  - **Nikada.** Dijagnostički modul automatski uklanja korisničko ime računara, lokalne putanje, API ključeve i tokene, i nikada ne prilaže vaše snimke niti tekst titlova. Ako radite bez interneta, izveštaj možete sačuvati lokalno i sami pregledati pre slanja.
+  - **Nikada.** Dijagnostički modul automatski uklanja korisničko ime računara, lokalne putanje, API ključeve i tokene, i nikada ne prilaže vaše snimke niti tekst titlova. Ako radite bez interneta, izveštaj možete sačuvati lokalno i sami pregledati pre slanja. Pogledajte [`PRIVACY.md`](../../../PRIVACY.md) za sve detalje.
+
+---
+
+## 6. Automatsko ažuriranje i potpuno isključivanje telemetrije (`DO_NOT_TRACK` / `EASYSRT_TELEMETRY_URL`)
+
+- **Kako da u potpunosti blokiram svaku telemetriju i pozadinsku proveru ažuriranja preko okruženja?**
+  - Pokrenite EasySRT Studio sa promenljivom okruženja **`DO_NOT_TRACK=1`** ili **`EASYSRT_TELEMETRY_URL=off`** (prihvata i `""`, `none` ili `disabled`).
+  - Oba prekidača trenutno blokiraju slanje izveštaja o padovima, metrika brzine, strukturnih brojača i parova za obuku, isključuju automatsku 24-časovnu proveru pri pokretanju i preusmeravaju ručnu proveru ažuriranja direktno na GitHub Releases (`github.com`) umesto na `easysrt-telemetry.ig-systems.rs`.
+- **Kako da isključim automatsku 24h proveru ažuriranja u aplikaciji?**
+  - Otvorite **Podešavanja → Opšte** i isključite opciju **Automatski proveravaj ažuriranja pri pokretanju (jednom u 24h)** (`autoCheckUpdates`). Ručna provera u prozoru za ažuriranja ostaje dostupna u svakom trenutku.
+- **Zašto je automatsko slanje izveštaja o padovima isključeno nakon nadogradnje sa `v0.4.0`?**
+  - Od verzije `v0.5.0`, svi nivoi telemetrije i izveštaji o padovima zahtevaju izričit pristanak (`privacyConsentVersion >= 1`). Otvorite **Podešavanja → Opšte**, pregledajte tačan primer JSON-a i uključite samo ono što želite da delite.
+- **Šta ako je proksi za ažuriranja nedostupan na mojoj mreži?**
+  - Pozadinski updater u Rust-u automatski prelazi sa `easysrt-telemetry.ig-systems.rs/v1/update/latest.json` na `https://github.com/Gruya13/EasySRT-Studio/releases/latest/download/latest.json` uz identičnu `minisign` proveru potpisa.

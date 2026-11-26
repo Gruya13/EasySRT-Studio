@@ -53,4 +53,18 @@ Quick solutions for GPU acceleration, local AI memory limits, API key security, 
 - **How do I report a problem or request a feature?**
   - Click the **Bug / Feedback** button in the bottom footer of the app.
 - **Are my audio files or subtitle texts ever included in bug reports?**
-  - **Never.** Diagnostics automatically redact local usernames, file paths, API keys, and bearer tokens, and never attach your media recordings or subtitle content. If you are offline, you can also export the sanitized diagnostic report locally to inspect every line yourself before sharing.
+  - **Never.** Diagnostics automatically redact local usernames, file paths, API keys, and bearer tokens, and never attach your media recordings or subtitle content. If you are offline, you can also export the sanitized diagnostic report locally to inspect every line yourself before sharing. See [`PRIVACY.md`](../../../PRIVACY.md) for full details.
+
+---
+
+## 6. Auto-Updater & Telemetry Kill-Switches (`DO_NOT_TRACK` / `EASYSRT_TELEMETRY_URL`)
+
+- **How do I disable all telemetry and background update checks at the OS/environment level?**
+  - Launch EasySRT Studio with either **`DO_NOT_TRACK=1`** or **`EASYSRT_TELEMETRY_URL=off`** (also accepts `""`, `none`, or `disabled`).
+  - Both kill-switches immediately block all crash, performance, structural, and edit-pair uploads, suppress automatic 24-hour startup update checks, and route manual **Check for Updates** requests directly to GitHub Releases (`github.com`) instead of `easysrt-telemetry.ig-systems.rs`.
+- **How do I turn off automatic 24-hour update checks in the UI?**
+  - Open **Settings → General** and toggle off **Automatically check for updates on startup (once every 24h)** (`autoCheckUpdates`). You can still check manually anytime from the **Updates** modal.
+- **Why did automatic crash reporting turn off after upgrading from `v0.4.0`?**
+  - Starting in `v0.5.0`, crash reports and all telemetry tiers require explicit opt-in consent (`privacyConsentVersion >= 1`). Open **Settings → General** to review the live JSON sample inspector and enable only the tiers you wish to share.
+- **What if the telemetry update proxy is unreachable on my network?**
+  - The Rust backend updater automatically falls back from `easysrt-telemetry.ig-systems.rs/v1/update/latest.json` to `https://github.com/Gruya13/EasySRT-Studio/releases/latest/download/latest.json` and verifies `minisign` signatures identically.

@@ -11,7 +11,7 @@ Sve što vam je potrebno za instalaciju programa EasySRT Studio, izbor idealnog 
 ### Windows 10 / 11 (x64)
 1. Preuzmite **`EasySRT.Studio_<version>_x64-setup.exe`** sa stranice [GitHub Releases](https://github.com/Gruya13/EasySRT-Studio/releases/latest) i pokrenite instalaciju.
 2. Tokom instalacije program automatski postavlja FFmpeg, odgovarajuće Whisper komponente za vašu grafičku karticu (CUDA 12.4 GPU ili CPU), Silero VAD i podrazumevani **Whisper Large V3 Turbo (Q5_0)** model za prepoznavanje govora.
-3. Pri prvom pokretanju **Čarobnjak za podešavanje (Setup Wizard)** prepoznaje memoriju vaše grafičke kartice (VRAM) i nudi preuzimanje besplatnog lokalnog modela za prevođenje ili povezivanje Cloud API ključa.
+3. Pri prvom pokretanju **Čarobnjak za podešavanje (Setup Wizard)** prepoznaje memoriju vaše grafičke kartice (VRAM), nudi preuzimanje lokalnog modela ili unos Cloud API ključa i prikazuje korak **Privatnost i dobrovoljna telemetrija** (svi prekidači telemetrije su podrazumevano isključeni, uz pregled tačnog primera JSON-a).
 
 ### Linux (x64)
 1. Preuzmite **`EasySRT.Studio_<version>_amd64.AppImage`**, dodelite dozvolu za izvršavanje (`chmod +x EasySRT.Studio_*.AppImage`) i pokrenite aplikaciju.
@@ -79,4 +79,15 @@ Radni prostor spaja paralelni editor za **Original** i **Prevod** (uz nezavisno 
 - **Trenutna promena stila `Prirodni` ↔ `Formalni` (`0 ms`):** Uporedite ili jednim klikom prebacite između živog govornog srpskog jezika (`Natural`) i zvaničnog/televizijskog registra (`Formal`). Keširane varijante se menjaju trenutno uz čuvanje vaših ručnih izmena za svaki stil posebno.
 - **Ekavski standard i determinističko preslovljavanje `Latinica ↔ Ćirilica`:** Ugrađeni normalizator osigurava čist ekavski izgovor i preslovljava tekst uz pravilno pisanje digrafa (`Ljubav` ↔ `Љубав`, `LJUBAV` ↔ `ЉУБАВ`), morfološke izuzetke na granici prefiksa (`injekcija` → `инјекција`, `konjugacija` → `конјугација`, `Tanjug` → `Танјуг`) i netaknute HTML/ASS oznake i linkove.
 - **Auto-Fit CPS jednim klikom:** Ciljano sažima samo one titlove koji prelaze dozvoljenu brzinu čitanja (`high_cps` / `line_too_long`), dok ostale titlove ne dira.
-- **Višeformati izvoz:** Izvezite **`.SRT`**, **`.VTT`** ili čist **`.TXT`** transkript, uz opcioni **UTF-8 BOM** (za starije Windows programe za montažu) i opcioni dvostruki izvoz (prevedeni `.srt` + izvorni `.srt` odjednom).
+- **Višeformati izvoz:** Izvezite **`.SRT`**, **`.VTT`** ili čist **`.TXT`** transkript, uz opcioni **UTF-8 BOM** (za starije Windows programe za montažu) i opcioni dvostruki izvoz (prevedeni `.srt` + izvorni `.srt` odjednom). Ako ste uključili dobrovoljno deljenje anonimizovanih parova izmena, prozor za izvoz prikazuje broj izmenjenih titlova (maskiranih pomoću `[NAME]`/`[NUM]`) uz opciju **„Preskoči za ovaj izvoz“** jednim klikom.
+
+---
+
+## 6. Privatnost, dobrovoljna telemetrija i automatska ažuriranja
+
+EasySRT Studio čuva audio i video snimke, kompletne transkripte i API ključeve isključivo na vašem računaru (pogledajte [`PRIVACY.md`](../../../PRIVACY.md) za detaljne šeme i rokove čuvanja):
+
+- **Čarobnjak za podešavanje i prelazak sa `v0.4.0`:** Sva tri opciona prekidača telemetrije (**Izveštaji o padovima**, **Anonimne metrike korišćenja i kvaliteta** i **Anonimizovani parovi prevoda**) su **podrazumevano isključena**. Korisnici koji nadograđuju sa verzije `v0.4.0` moraju izričito potvrditi izbor u **Podešavanja → Opšte** pre nego što bilo kakav izveštaj o padu bude poslat.
+- **Podešavanja (`Opšte`) i pregled tačnog JSON-a:** Promenite bilo koji od tri prekidača telemetrije ili prekidač za **24-časovnu proveru ažuriranja** u **Podešavanja → Opšte**. Kliknite na **„Pogledaj tačan primer JSON-a“** da vidite tačan anonimizovani JSON format za svaki nivo (i da li su aktivni `DO_NOT_TRACK=1` ili `EASYSRT_TELEMETRY_URL=off`).
+- **Preskakanje za pojedinačni izvoz:** Čak i ako ste uključili deljenje anonimizovanih parova izmena (Nivo 3), u prozoru za izvoz možete jednim klikom izabrati **„Preskoči za ovaj izvoz“** kada obrađujete poverljive materijale.
+- **Potpisano 24h automatsko ažuriranje:** Proverava nova izdanja jednom u 24 sata iz Rust pozadine (`easysrt-telemetry.ig-systems.rs/v1/update/latest.json`, uz automatski prelazak na GitHub Releases ako je potrebno) uz `minisign` kriptografsku proveru i bez čuvanja IP adresa.
