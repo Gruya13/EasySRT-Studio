@@ -182,6 +182,95 @@ fn is_special_whisper_token(raw: &str) -> bool {
         || (trimmed.starts_with("<|") && trimmed.ends_with("|>"))
 }
 
+const BPE_INVALID_BYTE_PUA_BASE: u32 = 0x10_EE00;
+const BPE_INVALID_BYTE_PUA_MIN: u32 = BPE_INVALID_BYTE_PUA_BASE + 0x80;
+const BPE_INVALID_BYTE_PUA_MAX: u32 = BPE_INVALID_BYTE_PUA_BASE + 0xFF;
+
+/// Converts raw bytes emitted by `whisper-cli -ojf` into valid UTF-8 JSON while preserving
+/// lone invalid UTF-8 bytes from byte-level BPE tokens using Plane-16 Private Use Area
+/// sentinels (`U+10EE80..=U+10EEFF`) so split multi-byte characters can be reassembled later.
+pub(crate) fn sanitize_whisper_json_bytes(raw: &[u8]) -> String {
+    use std::fmt::Write;
+
+    let mut out = String::with_capacity(raw.len());
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for chunk in raw.utf8_chunks() {
+        for ch in chunk.valid().chars() {
+            if in_string {
+                if escaped {
+                    out.push(ch);
+                    escaped = false;
+                } else if ch == '\\' {
+                    out.push('\\');
+                    escaped = true;
+                } else if ch == '"' {
+                    out.push('"');
+                    in_string = false;
+                } else if (ch as u32) < 0x20 {
+                    let _ = write!(out, "\\u{:04x}", ch as u32);
+                } else {
+                    out.push(ch);
+                }
+            } else {
+                if ch == '"' {
+                    in_string = true;
+                    escaped = false;
+                }
+                out.push(ch);
+            }
+        }
+
+        for &b in chunk.invalid() {
+            escaped = false;
+            if let Some(sentinel) = char::from_u32(BPE_INVALID_BYTE_PUA_BASE + u32::from(b)) {
+                out.push(sentinel);
+            }
+        }
+    }
+
+    out
+}
+
+/// Reassembles preserved raw BPE bytes back into UTF-8 text and strips any orphaned
+/// non-UTF-8 byte sequences so split multi-byte characters decode losslessly.
+fn decode_whisper_bpe_text(text: &str) -> String {
+    if !text
+        .chars()
+        .any(|c| (BPE_INVALID_BYTE_PUA_MIN..=BPE_INVALID_BYTE_PUA_MAX).contains(&(c as u32)))
+    {
+        return text.to_string();
+    }
+
+    let mut raw_bytes = Vec::with_capacity(text.len());
+    let mut utf8_buf = [0u8; 4];
+    for ch in text.chars() {
+        let cp = ch as u32;
+        if (BPE_INVALID_BYTE_PUA_MIN..=BPE_INVALID_BYTE_PUA_MAX).contains(&cp) {
+            raw_bytes.push((cp - BPE_INVALID_BYTE_PUA_BASE) as u8);
+        } else {
+            raw_bytes.extend_from_slice(ch.encode_utf8(&mut utf8_buf).as_bytes());
+        }
+    }
+
+    let mut decoded = String::with_capacity(raw_bytes.len());
+    for chunk in raw_bytes.utf8_chunks() {
+        decoded.push_str(chunk.valid());
+    }
+    decoded
+}
+
+fn finalize_bpe_word(text: &str) -> Option<String> {
+    let decoded = decode_whisper_bpe_text(text);
+    let trimmed = decoded.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
 /// Maps a GGML Whisper model filename to its corresponding `whisper-cli -dtw` architecture preset.
 pub fn infer_dtw_model_preset(whisper_model_path: &Path) -> Option<&'static str> {
     let name = whisper_model_path
@@ -260,12 +349,14 @@ fn split_text_proportionally(
 ) -> Vec<TimedWord> {
     let mut out: Vec<TimedWord> = text
         .split_whitespace()
-        .map(|part| TimedWord {
-            start_ms: from_ms,
-            end_ms: from_ms,
-            text: part.to_string(),
-            probability: prob,
-            speaker_change: false,
+        .filter_map(|part| {
+            finalize_bpe_word(part).map(|clean| TimedWord {
+                start_ms: from_ms,
+                end_ms: from_ms,
+                text: clean,
+                probability: prob,
+                speaker_change: false,
+            })
         })
         .collect();
     distribute_range_proportionally(&mut out, from_ms, to_ms);
@@ -440,6 +531,15 @@ pub fn parse_whisper_ojf_json(json_str: &str) -> Result<WhisperOutput> {
     parse_whisper_ojf_json_with_vad(json_str, &[])
 }
 
+/// Sanitizes raw bytes from a `whisper-cli -ojf` JSON file and parses word timestamps.
+pub fn parse_whisper_ojf_json_bytes_with_vad(
+    raw_bytes: &[u8],
+    vad_intervals: &[(u64, u64)],
+) -> Result<WhisperOutput> {
+    let sanitized = sanitize_whisper_json_bytes(raw_bytes);
+    parse_whisper_ojf_json_with_vad(&sanitized, vad_intervals)
+}
+
 /// Parses `whisper.cpp` `-ojf` JSON using Silero VAD speech sub-intervals from stderr when
 /// available so stripped silence gaps are preserved piecewise and DTW timestamps stay frame-accurate.
 pub fn parse_whisper_ojf_json_with_vad(
@@ -461,6 +561,7 @@ pub fn parse_whisper_ojf_json_with_vad(
     let mut last_consumed_vad_idx: Option<usize> = None;
 
     for (seg_idx, seg) in root.transcription.iter().enumerate() {
+        let seg_text = decode_whisper_bpe_text(&seg.text);
         let raw_seg_from = seg.offsets.from.max(0) as u64;
         let raw_seg_to = seg.offsets.to.max(seg.offsets.from).max(0) as u64;
 
@@ -535,11 +636,11 @@ pub fn parse_whisper_ojf_json_with_vad(
 
                 if trimmed.split_whitespace().count() > 1 {
                     if let Some((s, e, txt, p_sum, p_cnt)) = current.take() {
-                        if !txt.is_empty() {
+                        if let Some(clean) = finalize_bpe_word(&txt) {
                             raw_words.push(VadTokenWord {
                                 start_vad: s,
                                 end_vad: e.max(s),
-                                text: txt,
+                                text: clean,
                                 probability: p_sum / (p_cnt.max(1) as f64),
                             });
                         }
@@ -558,11 +659,11 @@ pub fn parse_whisper_ojf_json_with_vad(
 
                 if starts_with_space {
                     if let Some((s, e, txt, p_sum, p_cnt)) = current.take() {
-                        if !txt.is_empty() {
+                        if let Some(clean) = finalize_bpe_word(&txt) {
                             raw_words.push(VadTokenWord {
                                 start_vad: s,
                                 end_vad: e.max(s),
-                                text: txt,
+                                text: clean,
                                 probability: p_sum / (p_cnt.max(1) as f64),
                             });
                         }
@@ -581,11 +682,11 @@ pub fn parse_whisper_ojf_json_with_vad(
             }
 
             if let Some((s, e, txt, p_sum, p_cnt)) = current.take() {
-                if !txt.is_empty() {
+                if let Some(clean) = finalize_bpe_word(&txt) {
                     raw_words.push(VadTokenWord {
                         start_vad: s,
                         end_vad: e.max(s),
-                        text: txt,
+                        text: clean,
                         probability: p_sum / (p_cnt.max(1) as f64),
                     });
                 }
@@ -593,11 +694,11 @@ pub fn parse_whisper_ojf_json_with_vad(
 
             let mut seg_words: Vec<TimedWord> = Vec::new();
             if raw_words.is_empty() {
-                if !seg.text.trim().is_empty() {
+                if !seg_text.trim().is_empty() {
                     let sub_start = subs.first().map(|s| s.0).unwrap_or(raw_seg_from);
                     let sub_end = subs.last().map(|s| s.1).unwrap_or(raw_seg_to);
                     seg_words =
-                        split_text_proportionally(seg.text.trim(), sub_start, sub_end, 1.0);
+                        split_text_proportionally(seg_text.trim(), sub_start, sub_end, 1.0);
                 }
             } else {
                 let eff_vad_min =
@@ -646,7 +747,7 @@ pub fn parse_whisper_ojf_json_with_vad(
                 seg_count,
                 raw_seg_from,
                 raw_seg_to,
-                &seg.text,
+                &seg_text,
                 &seg_words,
             ) {
                 continue;
@@ -723,11 +824,11 @@ pub fn parse_whisper_ojf_json_with_vad(
             // Check if a single token contains multiple whitespace-separated words
             if trimmed.split_whitespace().count() > 1 {
                 if let Some((s, e, txt, p_sum, p_cnt)) = current_word.take() {
-                    if !txt.is_empty() {
+                    if let Some(clean) = finalize_bpe_word(&txt) {
                         seg_words.push(TimedWord {
                             start_ms: s,
                             end_ms: e.max(s),
-                            text: txt,
+                            text: clean,
                             probability: p_sum / (p_cnt.max(1) as f64),
                             speaker_change: false,
                         });
@@ -739,11 +840,11 @@ pub fn parse_whisper_ojf_json_with_vad(
 
             if starts_with_space {
                 if let Some((s, e, txt, p_sum, p_cnt)) = current_word.take() {
-                    if !txt.is_empty() {
+                    if let Some(clean) = finalize_bpe_word(&txt) {
                         seg_words.push(TimedWord {
                             start_ms: s,
                             end_ms: e.max(s),
-                            text: txt,
+                            text: clean,
                             probability: p_sum / (p_cnt.max(1) as f64),
                             speaker_change: false,
                         });
@@ -763,19 +864,19 @@ pub fn parse_whisper_ojf_json_with_vad(
         }
 
         if let Some((s, e, txt, p_sum, p_cnt)) = current_word.take() {
-            if !txt.is_empty() {
+            if let Some(clean) = finalize_bpe_word(&txt) {
                 seg_words.push(TimedWord {
                     start_ms: s,
                     end_ms: e.max(s),
-                    text: txt,
+                    text: clean,
                     probability: p_sum / (p_cnt.max(1) as f64),
                     speaker_change: false,
                 });
             }
         }
 
-        if seg_words.is_empty() && !seg.text.trim().is_empty() {
-            seg_words = split_text_proportionally(seg.text.trim(), seg_from, seg_to, 1.0);
+        if seg_words.is_empty() && !seg_text.trim().is_empty() {
+            seg_words = split_text_proportionally(seg_text.trim(), seg_from, seg_to, 1.0);
         }
 
         align_segment_words_to_offsets(&mut seg_words, seg_from, seg_to);
@@ -784,7 +885,7 @@ pub fn parse_whisper_ojf_json_with_vad(
             seg_count,
             seg_from,
             seg_to,
-            &seg.text,
+            &seg_text,
             &seg_words,
         ) {
             continue;
@@ -926,6 +1027,7 @@ async fn find_fallback_whisper_binary(failed_bin: &Path) -> Option<PathBuf> {
     None
 }
 
+#[derive(Debug)]
 enum WhisperExecError {
     MissingSharedLibrary(String),
     Other(anyhow::Error),
@@ -1023,6 +1125,75 @@ pub fn extract_pcm16_wav_slice(
         format!("Failed to write WAV slice at {}", dst_wav.to_string_lossy())
     })?;
     Ok(())
+}
+
+const MAX_WHISPER_JSON_BYTES: u64 = 64 * 1024 * 1024;
+
+fn read_whisper_json_file_with_limit(
+    expected_json_path: &Path,
+    max_bytes: u64,
+) -> std::result::Result<String, WhisperExecError> {
+    let meta = fs::metadata(expected_json_path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            WhisperExecError::Other(anyhow!(
+                "whisper-cli exited cleanly but JSON output was not found at {}: {err}",
+                expected_json_path.to_string_lossy()
+            ))
+        } else {
+            WhisperExecError::Other(anyhow!(
+                "whisper-cli exited cleanly but failed to inspect JSON output metadata at {}: {err}",
+                expected_json_path.to_string_lossy()
+            ))
+        }
+    })?;
+
+    if meta.len() > max_bytes {
+        return Err(WhisperExecError::Other(anyhow!(
+            "whisper-cli JSON output at {} exceeds safety limit ({} bytes > {} bytes)",
+            expected_json_path.to_string_lossy(),
+            meta.len(),
+            max_bytes
+        )));
+    }
+
+    let raw_bytes = fs::read(expected_json_path).map_err(|err| {
+        if err.kind() == std::io::ErrorKind::NotFound {
+            WhisperExecError::Other(anyhow!(
+                "whisper-cli exited cleanly but JSON output was not found at {}: {err}",
+                expected_json_path.to_string_lossy()
+            ))
+        } else {
+            WhisperExecError::Other(anyhow!(
+                "whisper-cli exited cleanly but failed to read JSON output at {}: {err}",
+                expected_json_path.to_string_lossy()
+            ))
+        }
+    })?;
+
+    if raw_bytes.iter().all(|b| b.is_ascii_whitespace()) {
+        return Err(WhisperExecError::Other(anyhow!(
+            "whisper-cli exited cleanly but JSON output at {} was empty",
+            expected_json_path.to_string_lossy()
+        )));
+    }
+
+    if std::str::from_utf8(&raw_bytes).is_err() {
+        tracing::warn!(
+            path = %expected_json_path.display(),
+            bytes = raw_bytes.len(),
+            "whisper-cli JSON output contained non-UTF-8 BPE byte sequences; sanitizing losslessly before parsing"
+        );
+    }
+
+    Ok(sanitize_whisper_json_bytes(&raw_bytes))
+}
+
+/// Reads `-ojf` JSON output emitted by `whisper-cli` as raw bytes so files containing
+/// non-UTF-8 byte-level BPE tokens are losslessly sanitized rather than failing with UTF-8 errors.
+fn read_whisper_json_file(
+    expected_json_path: &Path,
+) -> std::result::Result<String, WhisperExecError> {
+    read_whisper_json_file_with_limit(expected_json_path, MAX_WHISPER_JSON_BYTES)
 }
 
 async fn run_whisper_process<F>(
@@ -1150,13 +1321,9 @@ where
         )));
     }
 
-    let raw_json = fs::read_to_string(&expected_json_path).map_err(|err| {
-        WhisperExecError::Other(anyhow!(
-            "whisper-cli exited cleanly but JSON output was not found at {}: {err}",
-            expected_json_path.to_string_lossy()
-        ))
-    })?;
+    let raw_json_res = read_whisper_json_file(&expected_json_path);
     let _ = fs::remove_file(&expected_json_path);
+    let raw_json = raw_json_res?;
 
     Ok((raw_json, stderr_buf))
 }
@@ -3351,6 +3518,261 @@ esac
         );
         let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
         assert_eq!(texts, vec!["Pitanje.", "English", "reply.", "Hvala."]);
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    fn has_bpe_sentinel_or_replacement(s: &str) -> bool {
+        s.chars().any(|c| {
+            c == '\u{FFFD}'
+                || (BPE_INVALID_BYTE_PUA_MIN..=BPE_INVALID_BYTE_PUA_MAX).contains(&(c as u32))
+        })
+    }
+
+    #[test]
+    fn parses_whisper_ojf_bytes_with_split_multibyte_bpe_tokens_losslessly() {
+        let mut raw_json = Vec::new();
+        raw_json.extend_from_slice(
+            br#"{
+                "result": { "language": "sr" },
+                "transcription": [
+                    {
+                        "offsets": { "from": 0, "to": 3000 },
+                        "text": " po"#,
+        );
+        raw_json.extend_from_slice(b"\xC4\x8Detak \xD0\xB4\xD0\xB0 it\xE2\x80\x99s");
+        raw_json.extend_from_slice(
+            br#"",
+                        "tokens": [
+                            { "text": " po"#,
+        );
+        raw_json.extend_from_slice(b"\xC4");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 100, "to": 400 }, "p": 0.91 },
+                            { "text": ""#,
+        );
+        raw_json.extend_from_slice(b"\x8Detak");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 400, "to": 900 }, "p": 0.95 },
+                            { "text": " "#,
+        );
+        raw_json.extend_from_slice(b"\xD0");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 1000, "to": 1200 }, "p": 0.89 },
+                            { "text": ""#,
+        );
+        raw_json.extend_from_slice(b"\xB4\xD0\xB0");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 1200, "to": 1500 }, "p": 0.93 },
+                            { "text": " it"#,
+        );
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 1600, "to": 2000 }, "p": 0.94 },
+                            { "text": ""#,
+        );
+        raw_json.extend_from_slice(b"\xE2\x80");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 2000, "to": 2200 }, "p": 0.90 },
+                            { "text": ""#,
+        );
+        raw_json.extend_from_slice(b"\x99s");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 2200, "to": 2800 }, "p": 0.96 }
+                        ]
+                    }
+                ]
+            }"#,
+        );
+
+        for vad in [Vec::new(), vec![(0, 3_000)]] {
+            let out = parse_whisper_ojf_json_bytes_with_vad(&raw_json, &vad).unwrap();
+            let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+            assert_eq!(texts, vec!["početak", "да", "it’s"]);
+            assert!(out
+                .words
+                .iter()
+                .all(|w| !has_bpe_sentinel_or_replacement(&w.text)));
+        }
+    }
+
+    #[test]
+    fn parses_whisper_ojf_bytes_with_orphaned_invalid_utf8_and_control_bytes() {
+        let mut raw_json = Vec::new();
+        raw_json.extend_from_slice(
+            br#"{
+                "result": { "language": "sr" },
+                "transcription": [
+                    {
+                        "offsets": { "from": 0, "to": 2500 },
+                        "text": " "#,
+        );
+        raw_json.extend_from_slice(b"\xEB\x8B\xA4\xEBNE \xD5 tribe");
+        raw_json.extend_from_slice(
+            br#"",
+                        "tokens": [
+                            { "text": " "#,
+        );
+        raw_json.extend_from_slice(b"\xEB\x8B\xA4\xEBNE\x0B");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 100, "to": 700 }, "p": 0.85 },
+                            { "text": " "#,
+        );
+        raw_json.extend_from_slice(b"\xA6\xB0");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 750, "to": 900 }, "p": 0.40 },
+                            { "text": " "#,
+        );
+        raw_json.extend_from_slice(b"\xD5 tribe");
+        raw_json.extend_from_slice(
+            br#"", "offsets": { "from": 1000, "to": 1900 }, "p": 0.88 }
+                        ]
+                    },
+                    {
+                        "offsets": { "from": 2600, "to": 4200 },
+                        "text": " slo"#,
+        );
+        raw_json.extend_from_slice(b"\xC5\xBE\x8F\x84");
+        raw_json.extend_from_slice(
+            br#"",
+                        "tokens": []
+                    }
+                ]
+            }"#,
+        );
+
+        for vad in [Vec::new(), vec![(0, 2_500), (2_600, 4_200)]] {
+            let out = parse_whisper_ojf_json_bytes_with_vad(&raw_json, &vad).unwrap();
+            let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+            assert_eq!(texts, vec!["다NE", "tribe", "slož"]);
+            assert!(out
+                .words
+                .iter()
+                .all(|w| !has_bpe_sentinel_or_replacement(&w.text)));
+        }
+    }
+
+    #[test]
+    fn read_whisper_json_file_handles_invalid_utf8_missing_and_empty_files() {
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_whisper_read_json_test_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let valid_invalid_utf8_path = temp_dir.join("bpe.whisper_out.json");
+        let mut payload = Vec::new();
+        payload.extend_from_slice(
+            br#"{"result":{"language":"sr"},"transcription":[{"offsets":{"from":0,"to":1200},"text":" zdravo","tokens":[{"text":" po"#,
+        );
+        payload.extend_from_slice(b"\xC4");
+        payload.extend_from_slice(br#"","offsets":{"from":100,"to":400},"p":0.9},{"text":""#);
+        payload.extend_from_slice(b"\x8Detak");
+        payload.extend_from_slice(br#"","offsets":{"from":400,"to":1100},"p":0.95}]}]}"#);
+        fs::write(&valid_invalid_utf8_path, &payload).unwrap();
+
+        let sanitized = read_whisper_json_file(&valid_invalid_utf8_path).unwrap();
+        let out = parse_whisper_ojf_json(&sanitized).unwrap();
+        let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["početak"]);
+
+        let missing_path = temp_dir.join("missing.whisper_out.json");
+        let missing_err = read_whisper_json_file(&missing_path).unwrap_err();
+        let missing_msg = match missing_err {
+            WhisperExecError::Other(e) => e.to_string(),
+            WhisperExecError::MissingSharedLibrary(s) => s,
+        };
+        assert!(
+            missing_msg.contains("JSON output was not found"),
+            "unexpected missing file error: {missing_msg}"
+        );
+
+        let empty_path = temp_dir.join("empty.whisper_out.json");
+        fs::write(&empty_path, b"   \n\t ").unwrap();
+        let empty_err = read_whisper_json_file(&empty_path).unwrap_err();
+        let empty_msg = match empty_err {
+            WhisperExecError::Other(e) => e.to_string(),
+            WhisperExecError::MissingSharedLibrary(s) => s,
+        };
+        assert!(
+            empty_msg.contains("was empty"),
+            "unexpected empty file error: {empty_msg}"
+        );
+
+        let oversized_path = temp_dir.join("oversized.whisper_out.json");
+        fs::write(&oversized_path, &vec![b'{'; 128]).unwrap();
+        let oversized_err = read_whisper_json_file_with_limit(&oversized_path, 64).unwrap_err();
+        let oversized_msg = match oversized_err {
+            WhisperExecError::Other(e) => e.to_string(),
+            WhisperExecError::MissingSharedLibrary(s) => s,
+        };
+        assert!(
+            oversized_msg.contains("exceeds safety limit"),
+            "unexpected oversized file error: {oversized_msg}"
+        );
+
+        let _ = fs::remove_dir_all(&temp_dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn run_whisper_cli_succeeds_when_subprocess_emits_invalid_utf8_json_and_cleans_up_temp() {
+        use std::io::Write;
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp_dir = std::env::temp_dir().join(format!(
+            "easysrt_whisper_bpe_e2e_{}",
+            uuid::Uuid::new_v4()
+        ));
+        fs::create_dir_all(&temp_dir).unwrap();
+
+        let bin_path = temp_dir.join("whisper-invalid-utf8");
+        let model = temp_dir.join("model.bin");
+        let wav = temp_dir.join("probe.wav");
+        fs::write(&model, b"model").unwrap();
+        write_test_pcm16_wav(&wav, 2_000);
+
+        {
+            let mut f = fs::File::create(&bin_path).unwrap();
+            f.write_all(
+                br#"#!/usr/bin/env sh
+if [ "$1" = "--help" ]; then exit 0; fi
+OUT=""
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = "-of" ]; then OUT="$2"; shift 2; else shift 1; fi
+done
+printf '{"result":{"language":"sr"},"transcription":[{"offsets":{"from":0,"to":2000},"text":" \353\213\244\353NE po\304\215etak","tokens":[{"text":" \353\213\244\353NE","offsets":{"from":100,"to":800},"p":0.88},{"text":" po\304","offsets":{"from":900,"to":1300},"p":0.92},{"text":"\215etak","offsets":{"from":1300,"to":1900},"p":0.95}]}]}' > "${OUT}.json"
+"#,
+            )
+            .unwrap();
+            f.sync_all().unwrap();
+        }
+        fs::set_permissions(&bin_path, fs::Permissions::from_mode(0o755)).unwrap();
+        tokio::time::sleep(Duration::from_millis(15)).await;
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let out = run_whisper_cli(
+            &bin_path,
+            &model,
+            None,
+            &wav,
+            "sr",
+            &BTreeMap::new(),
+            &cancel,
+            |_, _| {},
+        )
+        .await
+        .unwrap();
+
+        let texts: Vec<&str> = out.words.iter().map(|w| w.text.as_str()).collect();
+        assert_eq!(texts, vec!["다NE", "početak"]);
+        assert!(out
+            .words
+            .iter()
+            .all(|w| !has_bpe_sentinel_or_replacement(&w.text)));
+        assert!(
+            !wav.with_extension("whisper_out.json").exists(),
+            "temporary whisper_out.json file should be removed after parsing"
+        );
 
         let _ = fs::remove_dir_all(&temp_dir);
     }
