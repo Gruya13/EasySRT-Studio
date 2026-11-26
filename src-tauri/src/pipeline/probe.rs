@@ -286,6 +286,7 @@ pub async fn probe_media_file(
         detected_language: None,
         topic: None,
         suggested_style: None,
+        suggested_address: None,
         error: None,
     };
 
@@ -670,6 +671,9 @@ pub async fn probe_media_file(
                     Ok(classification) => {
                         result.topic = Some(classification.topic);
                         result.suggested_style = Some(classification.suggested_style);
+                        if classification.suggested_address.is_some() {
+                            result.suggested_address = classification.suggested_address;
+                        }
                         if let Some(llm_speakers) = classification.estimated_speakers {
                             let merged = result
                                 .estimated_speakers

@@ -195,6 +195,15 @@ pub enum TranslationStyle {
     Formal,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum AddressForm {
+    #[default]
+    Auto,
+    PoliteVi,
+    InformalTi,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "camelCase")]
 pub enum TranslationProviderKind {
@@ -288,6 +297,10 @@ fn default_auto_checkpoints() -> bool {
     true
 }
 
+fn default_follow_playhead() -> bool {
+    true
+}
+
 fn default_remove_fillers() -> bool {
     true
 }
@@ -315,6 +328,8 @@ pub struct AppConfig {
     pub auto_probe_on_import: bool,
     #[serde(default = "default_auto_checkpoints")]
     pub auto_checkpoints: bool,
+    #[serde(default = "default_follow_playhead")]
+    pub follow_playhead: bool,
     #[serde(default)]
     pub allow_local_encrypted_vault: bool,
 }
@@ -337,6 +352,7 @@ impl Default for AppConfig {
             editor_translated_font_size: default_editor_translated_font_size(),
             auto_probe_on_import: default_auto_probe_on_import(),
             auto_checkpoints: default_auto_checkpoints(),
+            follow_playhead: default_follow_playhead(),
             allow_local_encrypted_vault: false,
         }
     }
@@ -381,6 +397,8 @@ pub struct JobOptions {
     pub correct_source_asr: bool,
     #[serde(default)]
     pub translation_style: TranslationStyle,
+    #[serde(default)]
+    pub address_form: AddressForm,
     #[serde(default = "default_remove_fillers")]
     pub remove_fillers: bool,
     pub provider_override: Option<TranslationProviderKind>,
@@ -397,6 +415,7 @@ impl Default for JobOptions {
             polish_serbian: true,
             correct_source_asr: false,
             translation_style: TranslationStyle::default(),
+            address_form: AddressForm::default(),
             remove_fillers: default_remove_fillers(),
             provider_override: None,
         }
@@ -481,6 +500,8 @@ pub struct MediaProbeResult {
     pub detected_language: Option<String>,
     pub topic: Option<String>,
     pub suggested_style: Option<TranslationStyle>,
+    #[serde(default)]
+    pub suggested_address: Option<AddressForm>,
     pub error: Option<String>,
 }
 
@@ -824,6 +845,7 @@ mod tests {
         assert_eq!(legacy_cfg.editor_translated_font_size, 22);
         assert!(legacy_cfg.auto_probe_on_import);
         assert!(legacy_cfg.auto_checkpoints);
+        assert!(legacy_cfg.follow_playhead);
         assert!(!legacy_cfg.allow_local_encrypted_vault);
 
         let cfg_val = serde_json::to_value(&legacy_cfg).unwrap();
@@ -831,6 +853,7 @@ mod tests {
         assert_eq!(cfg_val.get("editorTranslatedFontSize"), Some(&json!(22)));
         assert_eq!(cfg_val.get("autoProbeOnImport"), Some(&json!(true)));
         assert_eq!(cfg_val.get("autoCheckpoints"), Some(&json!(true)));
+        assert_eq!(cfg_val.get("followPlayhead"), Some(&json!(true)));
         assert_eq!(cfg_val.get("allowLocalEncryptedVault"), Some(&json!(false)));
 
         // 2. Legacy SubtitleProject checkpoint (v0.3.x) without removeFillers, translatedVariants,
@@ -876,6 +899,7 @@ mod tests {
         });
         let legacy_project: SubtitleProject = serde_json::from_value(legacy_project_json).unwrap();
         assert!(legacy_project.options.remove_fillers);
+        assert_eq!(legacy_project.options.address_form, AddressForm::Auto);
         assert_eq!(legacy_project.topic_context, None);
         assert_eq!(legacy_project.completed_translation_style, None);
         assert!(legacy_project.cues[0].translated_variants.is_empty());
@@ -948,9 +972,11 @@ mod tests {
             detected_language: Some("en".to_string()),
             topic: Some("AI engineering interview".to_string()),
             suggested_style: Some(TranslationStyle::Natural),
+            suggested_address: Some(AddressForm::PoliteVi),
             error: None,
         };
         let probe_val = serde_json::to_value(&probe).unwrap();
+        assert_eq!(probe_val.get("suggestedAddress"), Some(&json!("politeVi")));
         assert_eq!(probe_val.get("jobId"), Some(&json!("job-probe-1")));
         assert_eq!(
             probe_val.get("audioPath"),

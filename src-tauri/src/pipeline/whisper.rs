@@ -115,6 +115,33 @@ pub fn validate_whisper_lang(lang: &str) -> Result<&str> {
     Ok(trimmed)
 }
 
+const MAX_WHISPER_PROMPT_CHARS: usize = 400;
+
+fn sanitize_whisper_prompt(raw: &str) -> Option<String> {
+    let cleaned: String = raw
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let collapsed = cleaned.split_whitespace().collect::<Vec<_>>().join(" ");
+    let no_leading_dash = collapsed
+        .trim_start_matches(|c: char| !c.is_alphanumeric())
+        .trim();
+    if no_leading_dash.is_empty() {
+        return None;
+    }
+    let capped: String = no_leading_dash
+        .chars()
+        .take(MAX_WHISPER_PROMPT_CHARS)
+        .collect::<String>()
+        .trim()
+        .to_string();
+    if capped.is_empty() {
+        None
+    } else {
+        Some(capped)
+    }
+}
+
 /// Formats the user's glossary terms into a concise `--prompt` string for Whisper.
 pub fn build_whisper_prompt(glossary: &BTreeMap<String, String>) -> Option<String> {
     if glossary.is_empty() {
@@ -136,7 +163,62 @@ pub fn build_whisper_prompt(glossary: &BTreeMap<String, String>) -> Option<Strin
     if terms.is_empty() {
         None
     } else {
-        Some(format!("Glossary: {}.", terms.join(", ")))
+        sanitize_whisper_prompt(&format!("Glossary: {}.", terms.join(", ")))
+    }
+}
+
+/// Builds a Whisper `--prompt` string combining optional probed `topic_context`, glossary terms,
+/// and a minimal language-matched punctuation style primer, strictly bounded to `<= 400` chars
+/// with an alphanumeric prefix so `--prompt` can never be parsed as a CLI flag (`V05-M3`).
+pub fn build_whisper_prompt_for_lang_with_topic(
+    lang: &str,
+    glossary: &BTreeMap<String, String>,
+    topic_context: Option<&str>,
+) -> Option<String> {
+    let clean_topic = topic_context.and_then(|raw| {
+        let no_ctrl: String = raw
+            .chars()
+            .map(|c| if c.is_control() { ' ' } else { c })
+            .collect();
+        let collapsed = no_ctrl.split_whitespace().collect::<Vec<_>>().join(" ");
+        let trimmed = collapsed
+            .trim_start_matches(|c: char| c == '-' || c.is_whitespace())
+            .trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    });
+
+    let base_glossary = build_whisper_prompt(glossary);
+
+    let primary = lang
+        .trim()
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase();
+
+    let primer = match primary.as_str() {
+        "en" => Some("Hello. How are you? Well, let's see."),
+        "sr" | "hr" | "bs" => Some("Zdravo. Kako ste? Dobro, hvala."),
+        "de" => Some("Hallo. Wie geht es Ihnen? Gut, danke."),
+        "fr" => Some("Bonjour. Comment allez-vous ? Bien, merci."),
+        "es" => Some("Hola. ¿Cómo estás? Bien, gracias."),
+        "it" => Some("Ciao. Come stai? Bene, grazie."),
+        "pt" => Some("Olá. Como vai? Bem, obrigado."),
+        "ru" => Some("Привет. Как дела? Хорошо, спасибо."),
+        _ => None,
+    };
+
+    match (clean_topic, base_glossary, primer) {
+        (Some(topic), Some(g), _) => sanitize_whisper_prompt(&format!("Topic: {topic}. {g}")),
+        (Some(topic), None, Some(p)) => sanitize_whisper_prompt(&format!("Topic: {topic}. {p}")),
+        (Some(topic), None, None) => sanitize_whisper_prompt(&format!("Topic: {topic}.")),
+        (None, Some(g), _) => Some(g),
+        (None, None, Some(p)) => sanitize_whisper_prompt(p),
+        (None, None, None) => None,
     }
 }
 
@@ -147,30 +229,7 @@ pub fn build_whisper_prompt_for_lang(
     lang: &str,
     glossary: &BTreeMap<String, String>,
 ) -> Option<String> {
-    if let Some(glossary_prompt) = build_whisper_prompt(glossary) {
-        return Some(glossary_prompt);
-    }
-
-    let primary = lang
-        .trim()
-        .split('-')
-        .next()
-        .unwrap_or("")
-        .to_ascii_lowercase();
-
-    let primer = match primary.as_str() {
-        "en" => "Hello. How are you? Well, let's see.",
-        "sr" | "hr" | "bs" => "Zdravo. Kako ste? Dobro, hvala.",
-        "de" => "Hallo. Wie geht es Ihnen? Gut, danke.",
-        "fr" => "Bonjour. Comment allez-vous ? Bien, merci.",
-        "es" => "Hola. ¿Cómo estás? Bien, gracias.",
-        "it" => "Ciao. Come stai? Bene, grazie.",
-        "pt" => "Olá. Como vai? Bem, obrigado.",
-        "ru" => "Привет. Как дела? Хорошо, спасибо.",
-        _ => return None,
-    };
-
-    Some(primer.to_string())
+    build_whisper_prompt_for_lang_with_topic(lang, glossary, None)
 }
 
 fn is_special_whisper_token(raw: &str) -> bool {
@@ -1041,6 +1100,7 @@ struct WhisperProcessSpec<'a> {
     output_prefix: &'a Path,
     lang: &'a str,
     glossary: &'a BTreeMap<String, String>,
+    topic_context: Option<&'a str>,
     cancel_flag: &'a Arc<AtomicBool>,
     tick_base_progress: f64,
     emit_progress: bool,
@@ -1243,7 +1303,9 @@ where
         }
     }
 
-    if let Some(prompt) = build_whisper_prompt_for_lang(validated_lang, spec.glossary) {
+    if let Some(prompt) =
+        build_whisper_prompt_for_lang_with_topic(validated_lang, spec.glossary, spec.topic_context)
+    {
         cmd.arg("--prompt").arg(prompt);
     }
 
@@ -1357,6 +1419,7 @@ async fn transcribe_wav_slice(
                 output_prefix: &slice_out_prefix,
                 lang,
                 glossary,
+                topic_context: None,
                 cancel_flag,
                 tick_base_progress: 88.0,
                 emit_progress: false,
@@ -1680,6 +1743,7 @@ async fn decode_wav_silent(
             output_prefix,
             lang,
             glossary,
+            topic_context: None,
             cancel_flag,
             tick_base_progress: 89.0,
             emit_progress: false,
@@ -2077,6 +2141,7 @@ async fn execute_whisper_once<F>(
     wav_path: &Path,
     source_language: &str,
     glossary: &BTreeMap<String, String>,
+    topic_context: Option<&str>,
     cancel_flag: &Arc<AtomicBool>,
     on_progress: &mut F,
 ) -> std::result::Result<WhisperOutput, WhisperExecError>
@@ -2097,6 +2162,7 @@ where
                 output_prefix: &output_prefix,
                 lang: trimmed,
                 glossary,
+                topic_context,
                 cancel_flag,
                 tick_base_progress: 15.0,
                 emit_progress: true,
@@ -2153,6 +2219,7 @@ where
             output_prefix: &output_prefix,
             lang: effective_lang,
             glossary,
+            topic_context,
             cancel_flag,
             tick_base_progress: 15.0,
             emit_progress: true,
@@ -2197,6 +2264,7 @@ where
                         output_prefix: &output_prefix,
                         lang: forced,
                         glossary,
+                        topic_context,
                         cancel_flag,
                         tick_base_progress: 15.0,
                         emit_progress: true,
@@ -2250,6 +2318,36 @@ pub async fn run_whisper_cli<F>(
     wav_path: &Path,
     source_language: &str,
     glossary: &BTreeMap<String, String>,
+    cancel_flag: &Arc<AtomicBool>,
+    on_progress: F,
+) -> Result<WhisperOutput>
+where
+    F: FnMut(f64, String),
+{
+    run_whisper_cli_with_topic(
+        whisper_bin,
+        whisper_model_path,
+        vad_model_path,
+        wav_path,
+        source_language,
+        glossary,
+        None,
+        cancel_flag,
+        on_progress,
+    )
+    .await
+}
+
+/// Runs `whisper-cli` on a 16 kHz mono WAV file with an optional sanitized topic prompt (`V05-M3`).
+#[allow(clippy::too_many_arguments)]
+pub async fn run_whisper_cli_with_topic<F>(
+    whisper_bin: &Path,
+    whisper_model_path: &Path,
+    vad_model_path: Option<&Path>,
+    wav_path: &Path,
+    source_language: &str,
+    glossary: &BTreeMap<String, String>,
+    topic_context: Option<&str>,
     cancel_flag: &Arc<AtomicBool>,
     mut on_progress: F,
 ) -> Result<WhisperOutput>
@@ -2329,6 +2427,7 @@ where
         wav_path,
         source_language,
         glossary,
+        topic_context,
         cancel_flag,
         &mut on_progress,
     )
@@ -2357,6 +2456,7 @@ where
                         wav_path,
                         source_language,
                         glossary,
+                        topic_context,
                         cancel_flag,
                         &mut on_progress,
                     )
@@ -2535,6 +2635,24 @@ mod tests {
             build_whisper_prompt_for_lang("en", &glossary).as_deref(),
             Some("Glossary: EasySRT, EasySRT Studio.")
         );
+
+        // Topic prompt sanitization & bounds (V05-M3): <= 400 chars, no control chars, no leading '-'
+        let with_topic = build_whisper_prompt_for_lang_with_topic(
+            "en",
+            &glossary,
+            Some("Basketball post-game strategy interview"),
+        )
+        .unwrap();
+        assert!(with_topic.starts_with("Topic: Basketball post-game strategy interview."));
+        assert!(with_topic.contains("Glossary: EasySRT, EasySRT Studio."));
+
+        let adversarial_topic = format!("--flag-injection\n\r{}", "x".repeat(500));
+        let sanitized =
+            build_whisper_prompt_for_lang_with_topic("en", &empty, Some(&adversarial_topic))
+                .unwrap();
+        assert!(!sanitized.starts_with('-'));
+        assert!(!sanitized.contains('\n') && !sanitized.contains('\r'));
+        assert!(sanitized.chars().count() <= MAX_WHISPER_PROMPT_CHARS);
     }
 
     #[tokio::test]
@@ -3699,7 +3817,7 @@ esac
         );
 
         let oversized_path = temp_dir.join("oversized.whisper_out.json");
-        fs::write(&oversized_path, &vec![b'{'; 128]).unwrap();
+        fs::write(&oversized_path, vec![b'{'; 128]).unwrap();
         let oversized_err = read_whisper_json_file_with_limit(&oversized_path, 64).unwrap_err();
         let oversized_msg = match oversized_err {
             WhisperExecError::Other(e) => e.to_string(),

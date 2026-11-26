@@ -103,6 +103,8 @@ export type SerbianScript = "latin" | "cyrillic";
 
 export type TranslationStyle = "natural" | "formal";
 
+export type AddressForm = "auto" | "politeVi" | "informalTi";
+
 export type TranslationProviderKind =
   | "localLlama"
   | "deepSeek"
@@ -151,6 +153,7 @@ export interface AppConfig {
   editorTranslatedFontSize?: number;
   autoProbeOnImport?: boolean;
   autoCheckpoints?: boolean;
+  followPlayhead?: boolean;
   allowLocalEncryptedVault?: boolean;
 }
 
@@ -182,6 +185,7 @@ export interface JobOptions {
   polishSerbian: boolean;
   correctSourceAsr?: boolean;
   translationStyle?: TranslationStyle;
+  addressForm?: AddressForm;
   removeFillers?: boolean;
   providerOverride: TranslationProviderKind | null;
 }
@@ -255,6 +259,7 @@ export interface MediaProbeResult {
   detectedLanguage: string | null;
   topic: string | null;
   suggestedStyle: TranslationStyle | null;
+  suggestedAddress?: AddressForm | null;
   error: string | null;
 }
 

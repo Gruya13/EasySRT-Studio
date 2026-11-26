@@ -14,9 +14,9 @@ pub mod translator;
 pub mod whisper;
 
 use crate::models::{
-    CatalogItemKind, ExportOptions, ExportResult, JobOptions, JobPhase, JobProgressEvent,
-    SegmentRules, SerbianScript, SubtitleCue, SubtitleProject, TranslationProviderKind,
-    EVENT_JOB_PROGRESS,
+    AddressForm, CatalogItemKind, ExportOptions, ExportResult, JobOptions, JobPhase,
+    JobProgressEvent, SegmentRules, SerbianScript, SubtitleCue, SubtitleProject,
+    TranslationProviderKind, EVENT_JOB_PROGRESS,
 };
 use crate::pipeline::translator::{BatchOperation, LlmEndpointConfig};
 use crate::{setup_manager, storage};
@@ -215,6 +215,7 @@ async fn transcribe_audio_with_flag(
     job_id: &str,
     audio_path: &str,
     options: JobOptions,
+    topic_context: Option<String>,
     cancel_flag: &Arc<AtomicBool>,
 ) -> Result<SubtitleProject> {
     let ffmpeg_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::Ffmpeg)?;
@@ -253,13 +254,20 @@ async fn transcribe_audio_with_flag(
         "Running Whisper ASR transcription...",
     );
 
-    let whisper_res = whisper::run_whisper_cli(
+    let clean_topic_context = topic_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    let whisper_res = whisper::run_whisper_cli_with_topic(
         &whisper_bin,
         &whisper_model,
         vad_model.as_deref(),
         &converted.wav_path,
         &options.source_language,
         &options.glossary,
+        clean_topic_context.as_deref(),
         cancel_flag,
         |pct, detail| {
             emit_job_progress(app, job_id, JobPhase::Transcribing, pct, detail);
@@ -325,7 +333,7 @@ async fn transcribe_audio_with_flag(
         cues,
         phase: JobPhase::Completed,
         completed_translation_batches: 0,
-        topic_context: None,
+        topic_context: clean_topic_context,
         completed_translation_style: None,
         error_message: None,
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -445,6 +453,80 @@ pub(crate) fn resolve_cloud_endpoint(
     }
 }
 
+async fn execute_llm_operation_with_brief(
+    app: &AppHandle,
+    project: &mut SubtitleProject,
+    operation: BatchOperation,
+    phase: JobPhase,
+    endpoint: &LlmEndpointConfig,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<()> {
+    let job_id = project.job_id.clone();
+    let remove_fillers = project.options.remove_fillers;
+    let mut merged_glossary: Option<std::collections::BTreeMap<String, String>> = None;
+    let mut inferred_address: Option<AddressForm> = None;
+
+    if matches!(
+        operation,
+        BatchOperation::Translate | BatchOperation::PolishSerbian
+    ) && project.completed_translation_batches == 0
+        && !project.cues.is_empty()
+    {
+        let (eff_src, _) = resolved_source_and_target_lang(project);
+        match translator::build_translation_context_brief(
+            endpoint,
+            &project.cues,
+            &eff_src,
+            &project.options.target_language,
+            project.topic_context.as_deref(),
+            cancel_flag,
+        )
+        .await
+        {
+            Ok(brief) => {
+                if project.topic_context.is_none() && brief.topic.is_some() {
+                    project.topic_context = brief.topic;
+                }
+                if !brief.domain_glossary.is_empty() {
+                    merged_glossary = Some(translator::merge_glossaries(
+                        &project.options.glossary,
+                        &brief.domain_glossary,
+                    ));
+                }
+                if project.options.address_form == AddressForm::Auto {
+                    inferred_address = brief.suggested_address;
+                }
+            }
+            Err(err) => {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    job_id = %job_id,
+                    "Pre-translation domain brief skipped due to error: {err:#}"
+                );
+            }
+        }
+    }
+
+    let topic_context = project.topic_context.clone();
+    translator::run_batch_operation_with_overrides(
+        project,
+        operation,
+        endpoint,
+        cancel_flag,
+        |proj| storage::save_checkpoint(app, proj),
+        |pct, detail| {
+            emit_job_progress(app, &job_id, phase, pct, detail);
+        },
+        remove_fillers,
+        topic_context.as_deref(),
+        merged_glossary.as_ref(),
+        inferred_address,
+    )
+    .await
+}
+
 async fn run_project_llm_stage(
     app: &AppHandle,
     project: &mut SubtitleProject,
@@ -510,21 +592,7 @@ async fn run_project_llm_stage(
             other => resolve_cloud_endpoint(app, &config, other)?,
         };
 
-        let remove_fillers = project.options.remove_fillers;
-        let topic_context = project.topic_context.clone();
-        translator::run_batch_operation_with_options(
-            project,
-            operation,
-            &endpoint,
-            cancel_flag,
-            |proj| storage::save_checkpoint(app, proj),
-            |pct, detail| {
-                emit_job_progress(app, &job_id, phase, pct, detail);
-            },
-            remove_fillers,
-            topic_context.as_deref(),
-        )
-        .await
+        execute_llm_operation_with_brief(app, project, operation, phase, &endpoint, cancel_flag).await
     }
     .await;
 
@@ -580,6 +648,7 @@ pub async fn transcribe_audio(
     audio_path: String,
     options: JobOptions,
     job_id: Option<String>,
+    topic_context: Option<String>,
 ) -> Result<SubtitleProject> {
     let _ = state.cancel_active_probe(None).await;
 
@@ -589,8 +658,15 @@ pub async fn transcribe_audio(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let cancel_flag = state.register_job(&resolved_job_id).await;
-    let res =
-        transcribe_audio_with_flag(app, &resolved_job_id, &audio_path, options, &cancel_flag).await;
+    let res = transcribe_audio_with_flag(
+        app,
+        &resolved_job_id,
+        &audio_path,
+        options,
+        topic_context,
+        &cancel_flag,
+    )
+    .await;
     state.finish_job(&resolved_job_id).await;
 
     match res {
@@ -756,6 +832,7 @@ pub async fn run_full_pipeline(
     audio_path: String,
     options: JobOptions,
     job_id: Option<String>,
+    topic_context: Option<String>,
 ) -> Result<SubtitleProject> {
     let _ = state.cancel_active_probe(None).await;
 
@@ -772,6 +849,7 @@ pub async fn run_full_pipeline(
             &resolved_job_id,
             &audio_path,
             options,
+            topic_context,
             &cancel_flag,
         )
         .await?;
@@ -963,19 +1041,13 @@ pub async fn run_local_llm_batch(
                     },
                 );
 
-                let remove_fillers = project.options.remove_fillers;
-                let topic_context = project.topic_context.clone();
-                let res = translator::run_batch_operation_with_options(
+                let res = execute_llm_operation_with_brief(
+                    app,
                     project,
                     operation,
+                    phase,
                     &endpoint,
                     cancel_flag,
-                    |proj| storage::save_checkpoint(app, proj),
-                    |pct, detail| {
-                        emit_job_progress(app, &job_id, phase, pct, detail);
-                    },
-                    remove_fillers,
-                    topic_context.as_deref(),
                 )
                 .await;
 
@@ -1431,6 +1503,7 @@ EOF
                 polish_serbian: true,
                 correct_source_asr: false,
                 translation_style: TranslationStyle::default(),
+                address_form: AddressForm::Auto,
                 remove_fillers: true,
                 provider_override: Some(TranslationProviderKind::CustomOpenAi),
             },

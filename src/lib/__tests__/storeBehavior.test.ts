@@ -1096,4 +1096,45 @@ describe("appStore v0.4.0 behaviors", () => {
     );
     assert.equal(store.getState().isRunningBatch, false);
   });
+
+  it("defaults followPlayhead to true and auto-enables correctSourceAsr when switching to Cloud providers", async () => {
+    const store = createAppStore(
+      makeNoopDeps({
+        getConfig: async () =>
+          makeBaseConfig({
+            translation: {
+              provider: "deepSeek",
+              deepseekModel: "deepseek-chat",
+              customBaseUrl: "https://api.openai.com/v1",
+              customModel: "gpt-4o-mini",
+              batchSize: 20,
+              contextWindow: 4096,
+            },
+          }),
+      }),
+    );
+
+    await store.getState().initApp();
+    assert.equal(store.getState().config.followPlayhead, true);
+    assert.equal(store.getState().jobOptions.addressForm, "auto");
+    assert.equal(
+      store.getState().jobOptions.correctSourceAsr,
+      true,
+      "Cloud provider active on startup should auto-enable correctSourceAsr",
+    );
+
+    await store.getState().setEffectiveProvider("localLlama");
+    assert.equal(
+      store.getState().jobOptions.correctSourceAsr,
+      false,
+      "Switching back to localLlama should default correctSourceAsr off",
+    );
+
+    await store.getState().setEffectiveProvider("customOpenAi");
+    assert.equal(
+      store.getState().jobOptions.correctSourceAsr,
+      true,
+      "Switching to customOpenAi should auto-enable correctSourceAsr",
+    );
+  });
 });

@@ -684,6 +684,7 @@ export const browserFallback = {
     audioPath: string,
     options: JobOptions,
     jobId?: string | null,
+    topicContext?: string | null,
   ): Promise<SubtitleProject> {
     const id = jobId ?? `job-${Date.now()}`;
     const phases: Array<{ phase: JobProgressEvent["phase"]; pct: number; detail: string }> = [
@@ -705,6 +706,7 @@ export const browserFallback = {
     const baseProject = createDemoProject(audioPath, options, id);
     const project: SubtitleProject = {
       ...baseProject,
+      topicContext: topicContext ?? baseProject.topicContext ?? null,
       options: {
         ...baseProject.options,
         ...options,
@@ -906,6 +908,7 @@ export const browserFallback = {
     audioPath: string,
     options: JobOptions,
     jobId?: string | null,
+    topicContext?: string | null,
   ): Promise<SubtitleProject> {
     const id = jobId ?? `job-${Date.now()}`;
     const phases: Array<{ phase: JobProgressEvent["phase"]; pct: number; detail: string }> = [
@@ -925,7 +928,11 @@ export const browserFallback = {
         }),
       );
     }
-    const project = createDemoProject(audioPath, options, id);
+    const baseProject = createDemoProject(audioPath, options, id);
+    const project: SubtitleProject = {
+      ...baseProject,
+      topicContext: topicContext ?? baseProject.topicContext ?? null,
+    };
     mockCheckpoints = [
       project,
       ...mockCheckpoints.filter((c) => c.jobId !== id),

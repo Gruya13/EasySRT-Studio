@@ -1012,6 +1012,90 @@ pub fn normalize_ekavian(text: &str) -> String {
     out
 }
 
+fn conjunction_comma_regex() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(r"(?m)(^|[.!?…]\s+|(?:^|\s)[—–-]\s+)(Tako da|Тако да|Ali|Али|Pa|Па|I|И|A|А)(,)(\s+)")
+            .expect("valid conjunction comma regex")
+    })
+}
+
+fn has_closing_parenthetical_comma(rest_of_sentence: &str) -> bool {
+    let end = rest_of_sentence
+        .find(['.', '!', '?', '…', '\n', ';'])
+        .unwrap_or(rest_of_sentence.len());
+    let clause_slice = &rest_of_sentence[..end];
+    let Some(comma_idx) = clause_slice.find(',') else {
+        return false;
+    };
+    let between = clause_slice[..comma_idx].trim();
+    if between.is_empty() {
+        return false;
+    }
+    let words: Vec<&str> = between.split_whitespace().collect();
+    if words.len() > 3 {
+        return false;
+    }
+    // If the slice between the conjunction and the next comma already introduces a finite subordinate/clause verb
+    // rather than a short parenthetical adverbial ("naravno", "iskreno govoreći", "znate"), don't treat it as parenthetical.
+    !words.iter().any(|w| {
+        let norm = to_latin(w).to_lowercase();
+        matches!(norm.as_str(), "da" | "što" | "jer" | "ako" | "kad" | "kada")
+    })
+}
+
+fn clean_serbian_conjunction_commas_segment(text: &str) -> String {
+    let re = conjunction_comma_regex();
+    let mut out = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for caps in re.captures_iter(text) {
+        let whole = caps.get(0).unwrap();
+        let prefix = caps.get(1).unwrap().as_str();
+        let conj = caps.get(2).unwrap().as_str();
+        let space = caps.get(4).unwrap().as_str();
+        let after = &text[whole.end()..];
+
+        if !has_closing_parenthetical_comma(after) {
+            out.push_str(&text[last_end..whole.start()]);
+            out.push_str(prefix);
+            out.push_str(conj);
+            out.push_str(space);
+            last_end = whole.end();
+        }
+    }
+
+    if last_end < text.len() {
+        out.push_str(&text[last_end..]);
+    }
+    out
+}
+
+/// Removes unambiguous English-calque commas directly after sentence-initial Serbian conjunctions
+/// (`I,`, `A,`, `Ali,`, `Pa,`, `Tako da,` and Cyrillic equivalents) while preserving genuine
+/// parenthetical insertions (`I, naravno, idemo dalje.`, `Ali, iskreno govoreći, nije bilo lako.`).
+pub fn clean_serbian_conjunction_commas(text: &str) -> String {
+    let re = protected_span_regex();
+    let mut out = String::with_capacity(text.len());
+    let mut last_end = 0;
+
+    for m in re.find_iter(text) {
+        if m.start() > last_end {
+            out.push_str(&clean_serbian_conjunction_commas_segment(
+                &text[last_end..m.start()],
+            ));
+        }
+        out.push_str(m.as_str());
+        last_end = m.end();
+    }
+
+    if last_end < text.len() {
+        out.push_str(&clean_serbian_conjunction_commas_segment(&text[last_end..]));
+    }
+
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1377,5 +1461,52 @@ mod tests {
             Some("Gospodin Đorđe prisustvuje projekciji u Nišu.")
         );
         assert_eq!(variants.get("empty").map(String::as_str), Some(""));
+    }
+
+    #[test]
+    fn cleans_stray_english_conjunction_commas_while_preserving_parentheticals() {
+        // Unambiguous English calques -> stripped (Latin & Cyrillic)
+        assert_eq!(
+            clean_serbian_conjunction_commas("I, mislim da možemo."),
+            "I mislim da možemo."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("Tako da, težak je poraz."),
+            "Tako da težak je poraz."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("Ali, nismo odustali."),
+            "Ali nismo odustali."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("Pa, dobro je počelo. A, onda smo stali."),
+            "Pa dobro je počelo. A onda smo stali."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("И, мислим да можемо. Тако да, идемо даље."),
+            "И мислим да можемо. Тако да идемо даље."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("— I, tako smo rešili problem."),
+            "— I tako smo rešili problem."
+        );
+
+        // Genuine Serbian parenthetical insertions -> preserved intact
+        assert_eq!(
+            clean_serbian_conjunction_commas("I, naravno, idemo dalje."),
+            "I, naravno, idemo dalje."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("Ali, iskreno govoreći, nije bilo lako."),
+            "Ali, iskreno govoreći, nije bilo lako."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("Pa, znate, sezona je duga."),
+            "Pa, znate, sezona je duga."
+        );
+        assert_eq!(
+            clean_serbian_conjunction_commas("И, наравно, успели смо."),
+            "И, наравно, успели смо."
+        );
     }
 }

@@ -184,8 +184,9 @@ pub async fn transcribe_audio(
     audio_path: String,
     options: JobOptions,
     job_id: Option<String>,
+    topic_context: Option<String>,
 ) -> Result<SubtitleProject, String> {
-    pipeline::transcribe_audio(&app, state.inner(), audio_path, options, job_id)
+    pipeline::transcribe_audio(&app, state.inner(), audio_path, options, job_id, topic_context)
         .await
         .map_err(map_err)
 }
@@ -238,8 +239,9 @@ pub async fn run_full_pipeline(
     audio_path: String,
     options: JobOptions,
     job_id: Option<String>,
+    topic_context: Option<String>,
 ) -> Result<SubtitleProject, String> {
-    pipeline::run_full_pipeline(&app, state.inner(), audio_path, options, job_id)
+    pipeline::run_full_pipeline(&app, state.inner(), audio_path, options, job_id, topic_context)
         .await
         .map_err(map_err)
 }

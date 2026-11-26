@@ -53,6 +53,7 @@ import {
   tryLoadCompanionSubtitles,
 } from "../lib/tauri.ts";
 import type {
+  AddressForm,
   ApiKeyStatus,
   AppConfig,
   CatalogItemKind,
@@ -124,6 +125,19 @@ export const EDITOR_TRANSLATED_FONT_MAX = 36;
 export const EDITOR_TRANSLATED_FONT_DEFAULT = 22;
 export const CHECKPOINT_AUTOSAVE_DEBOUNCE_MS = 600;
 
+export function isCloudTranslationProvider(
+  provider: TranslationProviderKind,
+): boolean {
+  return provider === "deepSeek" || provider === "customOpenAi";
+}
+
+export function normalizeAddressForm(value?: AddressForm | null): AddressForm {
+  if (value === "politeVi" || value === "informalTi") {
+    return value;
+  }
+  return "auto";
+}
+
 export function clampEditorFontSize(
   target: "source" | "translated",
   size: number,
@@ -184,6 +198,7 @@ export function seedProjectTranslatedVariants(
     translationStyle: normalizeTranslationStyle(
       project.options.translationStyle,
     ),
+    addressForm: normalizeAddressForm(project.options.addressForm),
     removeFillers: project.options.removeFillers ?? true,
   };
 
@@ -207,6 +222,7 @@ export function seedProjectTranslatedVariants(
     !changed &&
     project.options.removeFillers !== undefined &&
     project.options.translationStyle !== undefined &&
+    project.options.addressForm !== undefined &&
     project.topicContext !== undefined
   ) {
     return project;
@@ -273,6 +289,7 @@ const DEFAULT_CONFIG: AppConfig = {
   editorTranslatedFontSize: EDITOR_TRANSLATED_FONT_DEFAULT,
   autoProbeOnImport: true,
   autoCheckpoints: true,
+  followPlayhead: true,
   allowLocalEncryptedVault: false,
 };
 
@@ -285,6 +302,7 @@ const DEFAULT_JOB_OPTIONS: JobOptions = {
   polishSerbian: true,
   correctSourceAsr: false,
   translationStyle: "natural",
+  addressForm: "auto",
   removeFillers: true,
   providerOverride: null,
 };
@@ -561,6 +579,7 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
     ),
     autoProbeOnImport: loaded.autoProbeOnImport ?? true,
     autoCheckpoints: loaded.autoCheckpoints ?? true,
+    followPlayhead: loaded.followPlayhead ?? true,
     allowLocalEncryptedVault: loaded.allowLocalEncryptedVault ?? false,
     uiLanguage: normalizeUiLanguage(loaded.uiLanguage),
   });
@@ -948,6 +967,9 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
           ...DEFAULT_JOB_OPTIONS,
           script: config.defaultScript,
           segmentRules: config.defaultSegmentRules,
+          correctSourceAsr: isCloudTranslationProvider(
+            config.translation.provider,
+          ),
           providerOverride: config.translation.provider,
         };
 
@@ -1036,6 +1058,7 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
     },
 
     updateConfig: async (patch) => {
+      const prevProvider = get().config.translation.provider;
       const nextConfig: AppConfig = {
         ...get().config,
         ...patch,
@@ -1055,7 +1078,23 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
             EDITOR_TRANSLATED_FONT_DEFAULT,
         ),
       };
-      set({ config: nextConfig });
+      const providerChanged =
+        patch.translation?.provider !== undefined &&
+        nextConfig.translation.provider !== prevProvider;
+      set((state) => ({
+        config: nextConfig,
+        ...(providerChanged
+          ? {
+              jobOptions: {
+                ...state.jobOptions,
+                providerOverride: nextConfig.translation.provider,
+                correctSourceAsr: isCloudTranslationProvider(
+                  nextConfig.translation.provider,
+                ),
+              },
+            }
+          : {}),
+      }));
       try {
         const saved = await deps.saveConfig(nextConfig);
         const normalized = normalizeLoadedConfig(
@@ -1399,6 +1438,7 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
         jobOptions: {
           ...state.jobOptions,
           providerOverride: provider,
+          correctSourceAsr: isCloudTranslationProvider(provider),
         },
       }));
       await get().updateConfig({
@@ -1967,6 +2007,7 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
             translationStyle: normalizeTranslationStyle(
               project.options.translationStyle,
             ),
+            addressForm: normalizeAddressForm(project.options.addressForm),
             removeFillers: project.options.removeFillers ?? true,
           },
           isCheckpointsOpen: false,
@@ -2358,12 +2399,17 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                 ),
               }));
 
+              const cloudTopic =
+                get().probeResults[item.jobId]?.topic?.trim() ||
+                item.project?.topicContext?.trim() ||
+                null;
               try {
                 const transcribed = attachTopicContext(
                   await deps.transcribeAudio(
                     item.audioPath,
                     currentOptions,
                     item.jobId,
+                    cloudTopic,
                   ),
                   item.jobId,
                 );
@@ -2463,12 +2509,17 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                 ),
               }));
 
+              const cloudTopic =
+                get().probeResults[item.jobId]?.topic?.trim() ||
+                item.project?.topicContext?.trim() ||
+                null;
               try {
                 const transcribed = attachTopicContext(
                   await deps.transcribeAudio(
                     item.audioPath,
                     currentOptions,
                     item.jobId,
+                    cloudTopic,
                   ),
                   item.jobId,
                 );
@@ -2634,6 +2685,7 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                       item.audioPath,
                       currentOptions,
                       item.jobId,
+                      itemTopic,
                     ),
                     item.jobId,
                   );
@@ -2698,11 +2750,13 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
                           item.audioPath,
                           currentOptions,
                           item.jobId,
+                          itemTopic,
                         )
                       : await deps.transcribeAudio(
                           item.audioPath,
                           currentOptions,
                           item.jobId,
+                          itemTopic,
                         ),
                     item.jobId,
                   );

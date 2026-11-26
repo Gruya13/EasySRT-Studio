@@ -9,6 +9,7 @@ import {
 import { openDialogPreservingMaximize } from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
 import type {
+  AddressForm,
   CatalogItemKind,
   ExportFormat,
   SegmentPreset,
@@ -652,6 +653,52 @@ export function SettingsPanel() {
                     {t.workspace.translationStyleFormal}
                   </button>
                 </div>
+              </div>
+            </div>
+
+            <div className="s-field">
+              <span className="s-label">{t.workspace.addressForm}</span>
+              <div
+                className="s-seg"
+                role="group"
+                aria-label={t.workspace.addressForm}
+              >
+                {(
+                  [
+                    [
+                      "auto",
+                      t.workspace.addressFormAuto,
+                      t.workspace.addressFormAutoHint,
+                    ],
+                    [
+                      "politeVi",
+                      t.workspace.addressFormVi,
+                      t.workspace.addressFormViHint,
+                    ],
+                    [
+                      "informalTi",
+                      t.workspace.addressFormTi,
+                      t.workspace.addressFormTiHint,
+                    ],
+                  ] as ReadonlyArray<[AddressForm, string, string]>
+                ).map(([value, label, hint]) => {
+                  const active = (jobOptions.addressForm ?? "auto") === value;
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      className={`s-seg-btn js-address-form-btn${
+                        active ? " active-accent" : ""
+                      }`}
+                      data-address-form={value}
+                      aria-pressed={active}
+                      title={hint}
+                      onClick={() => setJobOptions({ addressForm: value })}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 

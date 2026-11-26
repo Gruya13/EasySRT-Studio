@@ -180,14 +180,21 @@ export function transcribeAudio(
   audioPath: string,
   options: JobOptions,
   jobId?: string | null,
+  topicContext?: string | null,
 ): Promise<SubtitleProject> {
   if (!isTauriRuntime()) {
-    return browserFallback.transcribeAudio(audioPath, options, jobId);
+    return browserFallback.transcribeAudio(
+      audioPath,
+      options,
+      jobId,
+      topicContext,
+    );
   }
   return invoke<SubtitleProject>("transcribe_audio", {
     audioPath,
     options,
     jobId: jobId ?? null,
+    topicContext: topicContext ?? null,
   });
 }
 
@@ -232,14 +239,21 @@ export function runFullPipeline(
   audioPath: string,
   options: JobOptions,
   jobId?: string | null,
+  topicContext?: string | null,
 ): Promise<SubtitleProject> {
   if (!isTauriRuntime()) {
-    return browserFallback.runFullPipeline(audioPath, options, jobId);
+    return browserFallback.runFullPipeline(
+      audioPath,
+      options,
+      jobId,
+      topicContext,
+    );
   }
   return invoke<SubtitleProject>("run_full_pipeline", {
     audioPath,
     options,
     jobId: jobId ?? null,
+    topicContext: topicContext ?? null,
   });
 }
 
