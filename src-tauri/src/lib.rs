@@ -8,6 +8,7 @@ pub mod storage;
 
 use pipeline::PipelineState;
 use std::path::PathBuf;
+use tauri::Manager;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -26,6 +27,9 @@ pub fn run() {
         .setup(|app| {
             if let Ok(paths) = storage::resolve_storage_paths(app.handle(), None) {
                 diagnostics::set_app_data_dir(PathBuf::from(paths.data_dir));
+            }
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.maximize();
             }
             Ok(())
         })

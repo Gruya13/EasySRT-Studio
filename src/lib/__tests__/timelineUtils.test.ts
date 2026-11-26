@@ -6,12 +6,18 @@ import {
   MAX_CANVAS_BACKING_WIDTH,
   MAX_TIMELINE_ZOOM_PCT,
   MIN_TIMELINE_ZOOM_PCT,
+  clearMediaSession,
   computeButtonZoomPct,
+  computeFollowPlayheadScrollLeft,
   computeSafeCanvasSize,
   computeWheelZoomPct,
+  findCueForTime,
   formatRulerTimestamp,
   inferAudioMimeType,
+  isAnyModalOpen,
+  isTextEntryElement,
   resolveTimelineMediaState,
+  shouldCaptureTimelineSpace,
 } from "../timelineUtils.ts";
 
 describe("timelineUtils", () => {
@@ -221,5 +227,143 @@ describe("timelineUtils", () => {
     assert.equal(inferAudioMimeType("/a/b/podcast.m4a"), "audio/mp4");
     assert.equal(inferAudioMimeType("/a/b/clip.aac"), "audio/aac");
     assert.equal(inferAudioMimeType("/a/b/clip.webm"), "audio/webm");
+  });
+
+  it("captures Space transport exclusively outside text entry fields and yields to modals (V05-L1)", () => {
+    const closedModals = {
+      isSettingsOpen: false,
+      isExportOpen: false,
+      isSetupOpen: false,
+      isUpdaterOpen: false,
+      isCheckpointsOpen: false,
+      isBugReportOpen: false,
+      onlineConfirm: { open: false },
+    };
+
+    assert.equal(isAnyModalOpen(closedModals), false);
+    assert.equal(
+      isAnyModalOpen({ ...closedModals, onlineConfirm: { open: true } }),
+      true,
+    );
+
+    // Focused <button> / checkbox / range slider are NOT text-entry elements -> Space must trigger transport
+    assert.equal(isTextEntryElement({ tagName: "BUTTON" }), false);
+    assert.equal(
+      isTextEntryElement({ tagName: "INPUT", type: "checkbox" }),
+      false,
+    );
+    assert.equal(
+      isTextEntryElement({ tagName: "INPUT", type: "range" }),
+      false,
+    );
+    assert.equal(isTextEntryElement({ tagName: "TEXTAREA" }), true);
+    assert.equal(
+      isTextEntryElement({ tagName: "INPUT", type: "text" }),
+      true,
+    );
+    assert.equal(isTextEntryElement({ isContentEditable: true }), true);
+
+    assert.equal(
+      shouldCaptureTimelineSpace({
+        code: "Space",
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+        target: { tagName: "BUTTON" },
+        modalState: closedModals,
+      }),
+      true,
+    );
+
+    assert.equal(
+      shouldCaptureTimelineSpace({
+        code: "Space",
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+        target: { tagName: "TEXTAREA" },
+        modalState: closedModals,
+      }),
+      false,
+    );
+
+    assert.equal(
+      shouldCaptureTimelineSpace({
+        code: "Space",
+        ctrlKey: false,
+        metaKey: false,
+        altKey: false,
+        target: { tagName: "BUTTON" },
+        modalState: { ...closedModals, onlineConfirm: { open: true } },
+      }),
+      false,
+    );
+  });
+
+  it("holds nearest preceding cue across breathing gaps and pages viewport during Follow Playhead", () => {
+    const cues = [
+      {
+        id: 1,
+        startMs: 500,
+        endMs: 2000,
+        sourceText: "First",
+        translatedText: "Prvi",
+        cps: 5,
+        warnings: [],
+      },
+      {
+        id: 2,
+        startMs: 2500,
+        endMs: 4000,
+        sourceText: "Second",
+        translatedText: "Drugi",
+        cps: 5,
+        warnings: [],
+      },
+    ];
+
+    assert.equal(findCueForTime(cues, 2200, false), null);
+    assert.equal(findCueForTime(cues, 2200, true)?.id, 1);
+    assert.equal(findCueForTime(cues, 100, true)?.id, 1);
+
+    assert.equal(
+      computeFollowPlayheadScrollLeft({
+        playheadMs: 1000,
+        totalMs: 10000,
+        contentWidthPx: 4000,
+        viewportWidthPx: 1000,
+        currentScrollLeft: 0,
+      }),
+      null,
+    );
+
+    const scrolled = computeFollowPlayheadScrollLeft({
+      playheadMs: 3000,
+      totalMs: 10000,
+      contentWidthPx: 4000,
+      viewportWidthPx: 1000,
+      currentScrollLeft: 0,
+    });
+    assert.equal(scrolled, 1050);
+  });
+
+  it("clears navigator.mediaSession playbackState and all action handlers cleanly (V05-L1)", () => {
+    const clearedActions: string[] = [];
+    const mockSession = {
+      playbackState: "playing",
+      metadata: { title: "clip.mp3" },
+      setActionHandler(action: string, handler: unknown) {
+        if (handler === null) {
+          clearedActions.push(action);
+        }
+      },
+    };
+
+    clearMediaSession(mockSession);
+    assert.equal(mockSession.playbackState, "none");
+    assert.equal(mockSession.metadata, null);
+    assert.ok(clearedActions.includes("play"));
+    assert.ok(clearedActions.includes("pause"));
+    assert.ok(clearedActions.includes("stop"));
   });
 });

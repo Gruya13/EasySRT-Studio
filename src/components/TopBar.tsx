@@ -36,9 +36,12 @@ export function TopBar() {
       return;
     }
     let mounted = true;
-    const syncMax = async () => {
+    let unlistenResize: (() => void) | null = null;
+    const win = getCurrentWindow();
+
+    const syncWindowState = async () => {
       try {
-        const isMax = await setWindowMaximized(true);
+        const isMax = await win.isMaximized();
         if (mounted) {
           setMaximized(isMax);
         }
@@ -46,9 +49,40 @@ export function TopBar() {
         // Ignore in browser/non-window environments
       }
     };
-    void syncMax();
+
+    const ensureInitialMaximize = async () => {
+      try {
+        const isMax = await setWindowMaximized(true);
+        if (mounted) {
+          setMaximized(isMax);
+        }
+      } catch {
+        await syncWindowState();
+      }
+    };
+
+    void ensureInitialMaximize();
+
+    void win
+      .onResized(() => {
+        void syncWindowState();
+      })
+      .then((unlisten) => {
+        if (mounted) {
+          unlistenResize = unlisten;
+        } else {
+          unlisten();
+        }
+      })
+      .catch(() => {
+        // Ignore if resize listener is unavailable
+      });
+
     return () => {
       mounted = false;
+      if (unlistenResize) {
+        unlistenResize();
+      }
     };
   }, []);
 
@@ -86,7 +120,19 @@ export function TopBar() {
   };
 
   return (
-    <header id="titlebar" data-tauri-drag-region>
+    <header
+      id="titlebar"
+      data-tauri-drag-region
+      onDoubleClick={(e) => {
+        if (
+          e.target instanceof Element &&
+          e.target.closest("button, a, input, select, textarea, .tb-toast")
+        ) {
+          return;
+        }
+        void handleToggleMaximize();
+      }}
+    >
       <div className="titlebar-left" data-tauri-drag-region>
         <button
           type="button"
@@ -141,8 +187,10 @@ export function TopBar() {
         )}
       </div>
 
-      <div className="titlebar-center">
-        <span className="app-name">EasySRT Studio</span>
+      <div className="titlebar-center" data-tauri-drag-region>
+        <span className="app-name" data-tauri-drag-region>
+          EasySRT Studio
+        </span>
         <button
           type="button"
           className="app-version"

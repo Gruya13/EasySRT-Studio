@@ -1,4 +1,210 @@
-import type { SubtitleProject } from "../types/models.ts";
+import type { SubtitleCue, SubtitleProject } from "../types/models.ts";
+
+export interface ModalFlagsSnapshot {
+  isSettingsOpen: boolean;
+  isExportOpen: boolean;
+  isSetupOpen: boolean;
+  isUpdaterOpen: boolean;
+  isCheckpointsOpen: boolean;
+  isBugReportOpen: boolean;
+  onlineConfirm: { open: boolean };
+}
+
+export function isAnyModalOpen(st: ModalFlagsSnapshot): boolean {
+  return (
+    st.isSettingsOpen ||
+    st.isExportOpen ||
+    st.isSetupOpen ||
+    st.isUpdaterOpen ||
+    st.isCheckpointsOpen ||
+    st.isBugReportOpen ||
+    st.onlineConfirm.open
+  );
+}
+
+const TEXT_INPUT_TYPES = new Set([
+  "",
+  "text",
+  "search",
+  "url",
+  "tel",
+  "email",
+  "password",
+  "number",
+  "date",
+  "time",
+  "datetime-local",
+  "month",
+  "week",
+]);
+
+export interface TextEntryElementLike {
+  tagName?: string;
+  type?: string;
+  isContentEditable?: boolean;
+  getAttribute?: (name: string) => string | null;
+}
+
+/**
+ * Returns true ONLY for actual text-typing fields (`textarea`, `select`, `contenteditable`,
+ * or text/numeric/search `<input>`), and NEVER `<button>`, `<input type="checkbox">`,
+ * `<input type="range">`, `<input type="radio">`, or `<input type="file">`.
+ */
+export function isTextEntryElement(target: unknown): boolean {
+  if (!target || typeof target !== "object") {
+    return false;
+  }
+  const el = target as TextEntryElementLike;
+  const tag = (el.tagName ?? "").toUpperCase();
+  if (tag === "TEXTAREA" || tag === "SELECT") {
+    return true;
+  }
+  if (el.isContentEditable) {
+    return true;
+  }
+  const ceAttr =
+    typeof el.getAttribute === "function"
+      ? el.getAttribute("contenteditable")
+      : null;
+  if (ceAttr === "true" || ceAttr === "") {
+    return true;
+  }
+  if (tag === "INPUT") {
+    const inputType = (el.type ?? "text").trim().toLowerCase();
+    return TEXT_INPUT_TYPES.has(inputType);
+  }
+  return false;
+}
+
+/**
+ * Returns whether global timeline `Space` / `Shift+Space` capture should hijack
+ * the event (blocking button/checkbox focus activation even when empty).
+ */
+export function shouldCaptureTimelineSpace(input: {
+  code: string;
+  ctrlKey: boolean;
+  metaKey: boolean;
+  altKey: boolean;
+  target: unknown;
+  modalState: ModalFlagsSnapshot;
+}): boolean {
+  if (input.code !== "Space") return false;
+  if (input.ctrlKey || input.metaKey || input.altKey) return false;
+  if (isAnyModalOpen(input.modalState)) return false;
+  if (isTextEntryElement(input.target)) return false;
+  return true;
+}
+
+export function findCueForTime(
+  cueList: SubtitleCue[],
+  ms: number,
+  allowNearestPreceding: boolean,
+): SubtitleCue | null {
+  if (cueList.length === 0) return null;
+  const activeHalfOpen = cueList.find((c) => ms >= c.startMs && ms < c.endMs);
+  if (activeHalfOpen) return activeHalfOpen;
+  const exact = cueList.find((c) => ms >= c.startMs && ms <= c.endMs);
+  if (exact) return exact;
+  if (!allowNearestPreceding) return null;
+  let best: SubtitleCue | null = null;
+  for (const cue of cueList) {
+    if (cue.startMs <= ms && (!best || cue.startMs >= best.startMs)) {
+      best = cue;
+    }
+  }
+  return best ?? cueList[0];
+}
+
+/**
+ * Computes next `scrollLeft` when `Follow Playhead` is active during playback:
+ * returns `null` when playhead stays within `[scrollLeft, scrollLeft + 0.85 * viewportWidth]`,
+ * otherwise scrolls so playhead sits near 15% from the left edge of the viewport.
+ */
+export function computeFollowPlayheadScrollLeft(input: {
+  playheadMs: number;
+  totalMs: number;
+  contentWidthPx: number;
+  viewportWidthPx: number;
+  currentScrollLeft: number;
+}): number | null {
+  const {
+    playheadMs,
+    totalMs,
+    contentWidthPx,
+    viewportWidthPx,
+    currentScrollLeft,
+  } = input;
+  if (totalMs <= 0 || contentWidthPx <= viewportWidthPx || viewportWidthPx <= 0) {
+    return null;
+  }
+  const playheadX = Math.max(
+    0,
+    Math.min(contentWidthPx, (playheadMs / totalMs) * contentWidthPx),
+  );
+  const rightThreshold = currentScrollLeft + viewportWidthPx * 0.85;
+  if (playheadX >= currentScrollLeft && playheadX <= rightThreshold) {
+    return null;
+  }
+  const maxScrollLeft = Math.max(0, contentWidthPx - viewportWidthPx);
+  return Math.max(
+    0,
+    Math.min(maxScrollLeft, Math.round(playheadX - viewportWidthPx * 0.15)),
+  );
+}
+
+const MEDIA_SESSION_ACTIONS = [
+  "play",
+  "pause",
+  "stop",
+  "seekbackward",
+  "seekforward",
+  "previoustrack",
+  "nexttrack",
+  "seekto",
+] as const;
+
+export interface MediaSessionLike {
+  playbackState?: string;
+  metadata?: unknown;
+  setActionHandler?: (action: string, handler: unknown) => void;
+}
+
+/**
+ * Neutralizes `navigator.mediaSession` (`playbackState = "none"`, `metadata = null`,
+ * and `null` action handlers) so external OS events (`playerctl`, headset buttons,
+ * voice dictation resume hooks) cannot hijack idle/paused audio (`V05-L1`).
+ */
+export function clearMediaSession(
+  mediaSession?: MediaSessionLike | null,
+): void {
+  const target =
+    mediaSession !== undefined
+      ? mediaSession
+      : typeof navigator !== "undefined" && "mediaSession" in navigator
+        ? (navigator.mediaSession as unknown as MediaSessionLike)
+        : null;
+  if (!target) return;
+
+  try {
+    target.playbackState = "none";
+  } catch {
+    // Ignore read-only environments
+  }
+  try {
+    target.metadata = null;
+  } catch {
+    // Ignore read-only environments
+  }
+  if (typeof target.setActionHandler === "function") {
+    for (const action of MEDIA_SESSION_ACTIONS) {
+      try {
+        target.setActionHandler(action, null);
+      } catch {
+        // Some WebKitGTK builds throw on unsupported actions like seekto
+      }
+    }
+  }
+}
 
 export const MIN_TIMELINE_ZOOM_PCT = 100;
 export const MAX_TIMELINE_ZOOM_PCT = 2000;
