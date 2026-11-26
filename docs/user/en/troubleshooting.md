@@ -39,8 +39,10 @@ Quick solutions for GPU acceleration, local AI memory limits, API key security, 
 
 ## 4. Audio Playback, Waveforms & Session Recovery
 
-- **Waveform or audio playback does not start on Linux or certain video containers:**
-  - Ensure system `ffmpeg` is installed. EasySRT Studio streams media via scoped local protocols and Web Audio / blob fallbacks without base64 memory bloat, supporting `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.opus`, `.mp4`, `.mkv`, and `.webm`.
+- **Waveform or audio playback does not start or triggers unexpected background resume:**
+  - Ensure system `ffmpeg` is installed. EasySRT Studio uses lazy `<audio>` attachment, clears `navigator.mediaSession` when paused (`MPRIS` / Windows `SMTC` isolation), and suspends its Web `AudioContext` on pause so external media keys or dictation tools cannot resume background audio unexpectedly.
+- **Duplicate titlebars on Windows 10/11:**
+  - Studio uses a frameless custom titlebar (`decorations: false`) maximized into the OS taskbar work area cleanly.
 - **What happens if the app closes or my PC restarts mid-job?**
   - Every transcription and every translated batch is saved atomically to your local `checkpoints/` folder (and manual cue edits autosave after `600 ms`). Reopen EasySRT Studio and resume your project from the **Checkpoints / History** view without re-running finished batches.
 

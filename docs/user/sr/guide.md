@@ -44,14 +44,17 @@ Režim rada možete promeniti u bilo kom trenutku u panelu **Podešavanja / Sett
   - **Profili:** `Standard` (`2 × 42` znaka za TV/film/YouTube), `Reels / Shorts` (`1 × 20` za kratke vertikalne forme) ili `Custom` (`1–4` balansirana reda uz sopstvene granice znakova i CPS brzine).
   - **Novi titl pri promeni govornika:** Akustički detektor automatski započinje nov titl kada progovori drugi sagovornik.
   - **Uklanjanje poštapalica i sečenje na zapeti:** Opciono čisti uzrečice i oklevanja (*ovaj, znači, uh, um…*), drži uvodne veznike vezane za nastavak misli i prirodno deli duge rečenice posle zapete.
-  - **Ispravka izvornog transkripta (`correctSourceAsr`):** Tokom prevođenja ispravlja očigledne fonetske greške prepoznavanja govora u koloni originala bez menjanja smisla.
-  - **Rečnik termina (Glossary):** Unesite stručne nazive, imena brendova ili parove `Izvor => Prevod` kako bi ih i Whisper i prevodilac dosledno poštovali.
+  - **Ispravka izvornog transkripta (`correctSourceAsr`):** Tokom prevođenja ispravlja očigledne fonetske greške prepoznavanja govora u koloni originala bez menjanja smisla (**automatski je uključeno kada je aktivan Cloud API provajder poput DeepSeek ili Custom OpenAI**).
+  - **Rečnik termina i automatski mini-pojmovnik:** Unesite stručne nazive, imena brendova ili parove `Izvor => Prevod` za Whisper (uz detektovani kontekst teme) i prevodioca, uz automatsku pre-prevodnu ekstrakciju domenskih idioma pre prvog paketa.
 
 ---
 
 ## 4. Cinema dvostruki editor, tajmlajn i prečice na tastaturi
 
 Radni prostor spaja paralelni editor za **Original** i **Prevod** (uz nezavisno podešavanje veličine fonta i automatsko čuvanje izmena na svakih `600 ms`) sa trokanalnim striming **Waveform tajmlajnom**:
+
+- **Prati plejhed (`Follow Playhead`) i zadržavanje titla preko pauza:** Podrazumevano aktivno dugme na traci tajmlajna automatski skroluje pregled tokom uvećanja (`100%–2000%`) i zadržava aktivni titl prikazan i preko kratkih pauza bez treperenja na „Nema aktivnog titla“.
+- **Ekskluzivni `Space` transport:** Pritiskom na `Space` / `Shift+Space` van tekstualnih polja uvek pokrećete/zaustavljate tajmlajn (čak i ako je fokus bio na dugmetu), dok modalni dijalozi normalno zadržavaju fokus tastature.
 
 | Prečica / Akcija | Dejstvo |
 | :--- | :--- |
@@ -72,6 +75,7 @@ Radni prostor spaja paralelni editor za **Original** i **Prevod** (uz nezavisno 
 
 ## 5. Srpski jezički alati i izvoz titlova
 
+- **Odvojeni stil i obraćanje (`Auto` / `Persiranje (Vi)` / `Neformalno (ti)`):** Nezavisno birajte govorni ili formalni ton od persiranja (`Vi`) ili obraćanja na `ti` (podrazumevani `Auto` bira `Vi` za intervjue i konferencije, a `ti` za podkaste), uz pravopisna pravila protiv engleskih kalkova i suvišnih zapeta posle početnih veznika (`I,`, `Tako da,`).
 - **Trenutna promena stila `Prirodni` ↔ `Formalni` (`0 ms`):** Uporedite ili jednim klikom prebacite između živog govornog srpskog jezika (`Natural`) i zvaničnog/televizijskog registra (`Formal`). Keširane varijante se menjaju trenutno uz čuvanje vaših ručnih izmena za svaki stil posebno.
 - **Ekavski standard i determinističko preslovljavanje `Latinica ↔ Ćirilica`:** Ugrađeni normalizator osigurava čist ekavski izgovor i preslovljava tekst uz pravilno pisanje digrafa (`Ljubav` ↔ `Љубав`, `LJUBAV` ↔ `ЉУБАВ`), morfološke izuzetke na granici prefiksa (`injekcija` → `инјекција`, `konjugacija` → `конјугација`, `Tanjug` → `Танјуг`) i netaknute HTML/ASS oznake i linkove.
 - **Auto-Fit CPS jednim klikom:** Ciljano sažima samo one titlove koji prelaze dozvoljenu brzinu čitanja (`high_cps` / `line_too_long`), dok ostale titlove ne dira.

@@ -44,14 +44,17 @@ Switch modes anytime from the **Settings** panel (`Processing` / `Cloud API`):
   - **Presets:** `Standard` (`2 × 42` chars for TV/Film/YouTube), `Reels / Shorts` (`1 × 20` punchy captions), or `Custom` (`1–4` balanced lines and custom character/CPS limits).
   - **Speaker-Turn Split:** Automatically starts a new subtitle cue whenever the acoustic diarizer detects a change of speaker.
   - **Clean Spoken Fillers & Comma Splitting:** Optionally strips hesitation fillers (*uh, um, ovaj, znači…*), keeps leading conjunctions attached to the clause that follows, and splits long sentences naturally at commas.
-  - **Source ASR Proofreading (`correctSourceAsr`):** Fixes obvious phonetic speech-to-text slips in the source column during translation without altering speaker wording.
-  - **Glossary Hints:** Add domain names, brands, or `Source => Target` translation pairs so both Whisper and the translator respect exact terminology.
+  - **Source ASR Proofreading (`correctSourceAsr`):** Fixes obvious phonetic speech-to-text slips in the source column during translation without altering speaker wording (**enabled automatically when a Cloud API provider such as DeepSeek or Custom OpenAI is active**).
+  - **Glossary Hints & Pre-Translation Domain Mini-Glossary:** Add domain names, brands, or `Source => Target` pairs so both Whisper (prompted with detected topic context) and the translator respect exact terminology, complemented automatically by a pre-translation domain mini-glossary extracted right before batch 1.
 
 ---
 
 ## 4. Cinema Dual-Pane Editor, Timeline & Keyboard Shortcuts
 
 The workspace combines a side-by-side **Source (`Original`)** and **Translation (`Prevod`)** editor with independent font-size controls, `600 ms` automatic checkpoint saving, and a 3-track streaming **Waveform Timeline**:
+
+- **Follow Playhead (`Prati plejhed`) & Gap-Hold Selection:** Enabled by default in the timeline toolbar, **Follow Playhead** keeps the viewport auto-scrolling when zoomed in (`100%–2000%`) and holds the nearest subtitle selected across inter-cue breathing pauses so editor boxes never flicker to *"No cue selected"*.
+- **Exclusive `Space` Transport:** Pressing `Space` / `Shift+Space` outside text inputs always controls timeline playback (even if a toolbar button was focused), while yielding cleanly whenever a modal dialog is open.
 
 | Shortcut / Action | Effect |
 | :--- | :--- |
@@ -72,6 +75,7 @@ The workspace combines a side-by-side **Source (`Original`)** and **Translation 
 
 ## 5. Serbian Studio Features & Exporting
 
+- **Decoupled Style & Address Register (`Auto` / `Polite Vi` / `Informal ti`):** Choose `Natural` vs. `Formal` linguistic tone independently from polite `Vi` vs. informal `ti` addressing (default `Auto` selects `Vi` for press/TV interviews and `ti` for casual peer podcasts), plus anti-calque rules and Serbian conjunction-comma cleanup (`I,`, `Tako da,`).
 - **Instant `Natural` ↔ `Formal` Style Switch (`0 ms`):** Compare or switch between living spoken Serbian (`Natural`) and broadcast/official phrasing (`Formal`). Cached dual-style variants swap instantaneously while keeping independent manual edits per style.
 - **Ekavian Standard & Deterministic `Latin ↔ Cyrillic`:** Built-in linguistic normalization enforces clean Ekavian forms and converts between Latin and Cyrillic with proper digraph casing (`Ljubav` ↔ `Љубав`, `LJUBAV` ↔ `ЉУБАВ`), prefix-boundary exceptions (`injekcija` → `инјекција`, `konjugacija` → `конјугација`, `Tanjug` → `Танјуг`), and untouched HTML/ASS tags and URLs.
 - **1-Click Auto-Fit CPS:** Tightens only cues flagged for excessive reading speed (`high_cps` / `line_too_long`) while leaving compliant subtitles untouched.

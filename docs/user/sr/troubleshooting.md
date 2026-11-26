@@ -39,8 +39,10 @@ Brza rešenja za GPU ubrzanje, memoriju lokalnih AI modela, bezbednost API klju�
 
 ## 4. Reprodukcija zvuka, zvučni talas i oporavak sesije
 
-- **Zvučni talas ili reprodukcija ne kreću na Linux-u ili kod određenih video formata:**
-  - Proverite da li je instaliran sistemski `ffmpeg`. EasySRT Studio strimuje medije direktno bez opterećenja memorije za `.mp3`, `.wav`, `.m4a`, `.flac`, `.ogg`, `.aac`, `.opus`, `.mp4`, `.mkv` i `.webm` fajlove.
+- **Zvučni talas ili reprodukcija ne kreću, ili se zvuk pokreće u pozadini kada je pauziran:**
+  - Proverite da li je instaliran sistemski `ffmpeg`. EasySRT Studio montira `<audio>` element tek po potrebi, resetuje `navigator.mediaSession` dok je pauziran (`MPRIS` / Windows `SMTC` izolacija) i suspenduje Web `AudioContext` pri pauzi kako sistemski tasteri ili alati za diktiranje ne bi slučajno pokrenuli pauzirani snimak.
+- **Dupli naslovni bar (titlebar) na Windowsu:**
+  - Studio koristi jedinstveni frameless naslovni bar (`decorations: false`) maksimizovan u radnu površinu iznad Windows taskbara.
 - **Šta se dešava ako se program zatvori ili računar restartuje usred posla?**
   - Svaka transkripcija i svaka prevedena grupa titlova automatski se čuvaju u lokalnom folderu `checkpoints/` (dok se ručne izmene u editoru čuvaju posle `600 ms`). Ponovo otvorite program i nastavite rad iz pregleda sačuvanih projekata bez ponavljanja već obrađenih delova.
 
