@@ -3,14 +3,22 @@ import {
   FileDown,
   FolderOpen,
   Loader2,
+  ShieldCheck,
   X,
 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { getDictionary, normalizeUiLanguage } from "../i18n";
 import { isTauriRuntime } from "../lib/subtitleUtils";
-import { openDialogPreservingMaximize } from "../lib/tauri";
+import {
+  getProjectModifiedCueCount,
+  openDialogPreservingMaximize,
+} from "../lib/tauri";
 import { useAppStore } from "../stores/appStore";
-import type { ExportFormat, ExportOptions } from "../types/models";
+import {
+  CURRENT_PRIVACY_CONSENT_VERSION,
+  type ExportFormat,
+  type ExportOptions,
+} from "../types/models";
 
 export function ExportModal() {
   const isOpen = useAppStore((s) => s.isExportOpen);
@@ -22,13 +30,46 @@ export function ExportModal() {
   const [options, setOptions] = useState<ExportOptions>(config.export);
   const [exporting, setExporting] = useState(false);
   const [writtenFiles, setWrittenFiles] = useState<string[]>([]);
+  const [modifiedCueCount, setModifiedCueCount] = useState<number>(0);
+  const [skipTrainingDonation, setSkipTrainingDonation] = useState(false);
+
+  const canDonateTrainingPairs =
+    (config.privacyConsentVersion ?? 0) >= CURRENT_PRIVACY_CONSENT_VERSION &&
+    config.shareAnonymizedTranslationEdits === true;
 
   useEffect(() => {
     if (isOpen) {
       setOptions(config.export);
       setWrittenFiles([]);
+      setSkipTrainingDonation(false);
     }
   }, [isOpen, config.export]);
+
+  useEffect(() => {
+    if (!isOpen || !activeProject || !canDonateTrainingPairs) {
+      setModifiedCueCount(0);
+      return;
+    }
+    let cancelled = false;
+    void getProjectModifiedCueCount(activeProject.jobId)
+      .then((count) => {
+        if (!cancelled) {
+          setModifiedCueCount(
+            typeof count === "number" && Number.isFinite(count)
+              ? Math.max(0, Math.floor(count))
+              : 0,
+          );
+        }
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setModifiedCueCount(0);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isOpen, activeProject?.jobId, canDonateTrainingPairs]);
 
   if (!isOpen || !activeProject) {
     return null;
@@ -71,7 +112,12 @@ export function ExportModal() {
   const handleExport = async () => {
     setExporting(true);
     try {
-      const res = await runExportSubtitles(options);
+      const res = await runExportSubtitles(
+        options,
+        canDonateTrainingPairs && modifiedCueCount > 0
+          ? skipTrainingDonation
+          : undefined,
+      );
       if (res) {
         setWrittenFiles(res.writtenFiles);
       }
@@ -249,6 +295,44 @@ export function ExportModal() {
                   </li>
                 ))}
               </ul>
+            </div>
+          )}
+
+          {/* Level 3 Zero-Click Notice */}
+          {canDonateTrainingPairs && modifiedCueCount > 0 && (
+            <div
+              data-testid="export-training-notice"
+              className="flex flex-wrap items-center justify-between gap-2 rounded-xl border border-slate-800 bg-slate-900/60 px-3 py-2 text-[11px] text-slate-300"
+            >
+              <div className="flex min-w-0 items-center gap-2">
+                <ShieldCheck className="h-3.5 w-3.5 shrink-0 text-cyan-400" />
+                <span
+                  className={
+                    skipTrainingDonation
+                      ? "text-slate-500 line-through"
+                      : "text-slate-300"
+                  }
+                >
+                  {t.export.trainingDonationNotice.replace(
+                    "{count}",
+                    String(modifiedCueCount),
+                  )}
+                </span>
+              </div>
+              <button
+                type="button"
+                data-testid="export-skip-donation-pill"
+                onClick={() => setSkipTrainingDonation((prev) => !prev)}
+                className={`shrink-0 rounded-full border px-2.5 py-0.5 text-[10px] font-semibold transition ${
+                  skipTrainingDonation
+                    ? "border-amber-500/40 bg-amber-500/15 text-amber-200"
+                    : "border-slate-700 bg-slate-800 text-slate-300 hover:border-cyan-500/40 hover:text-cyan-200"
+                }`}
+              >
+                {skipTrainingDonation
+                  ? t.export.skippedForThisExport
+                  : t.export.skipForThisExport}
+              </button>
             </div>
           )}
         </div>

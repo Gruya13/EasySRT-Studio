@@ -23,7 +23,9 @@ import type {
   SetupStatus,
   SubtitleCue,
   SubtitleProject,
+  TelemetrySamplePayloads,
   TranslationProviderKind,
+  UpdateCheckResult,
   WaveformPreviewData,
 } from "../types/models.ts";
 import { browserFallback } from "./browserFallback.ts";
@@ -316,11 +318,20 @@ export function convertCuesScript(
 export function exportSubtitles(
   project: SubtitleProject,
   options: ExportOptions,
+  skipTrainingDonation?: boolean,
 ): Promise<ExportResult> {
   if (!isTauriRuntime()) {
-    return browserFallback.exportSubtitles(project, options);
+    return browserFallback.exportSubtitles(
+      project,
+      options,
+      skipTrainingDonation,
+    );
   }
-  return invoke<ExportResult>("export_subtitles", { project, options });
+  return invoke<ExportResult>("export_subtitles", {
+    project,
+    options,
+    skipTrainingDonation: skipTrainingDonation ?? null,
+  });
 }
 
 export async function readAudioPlaybackBytes(
@@ -436,6 +447,31 @@ export function saveDiagnosticsLocal(): Promise<string> {
     return browserFallback.saveDiagnosticsLocal();
   }
   return invoke<string>("save_diagnostics_local");
+}
+
+// ---------------------------------------------------------------------------
+// Auto-Updater & Privacy-First Telemetry Commands
+// ---------------------------------------------------------------------------
+
+export function checkAppUpdate(force: boolean): Promise<UpdateCheckResult> {
+  if (!isTauriRuntime()) {
+    return browserFallback.checkAppUpdate(force);
+  }
+  return invoke<UpdateCheckResult>("check_app_update", { force });
+}
+
+export function getTelemetrySamplePayloads(): Promise<TelemetrySamplePayloads> {
+  if (!isTauriRuntime()) {
+    return browserFallback.getTelemetrySamplePayloads();
+  }
+  return invoke<TelemetrySamplePayloads>("get_telemetry_sample_payloads");
+}
+
+export function getProjectModifiedCueCount(jobId: string): Promise<number> {
+  if (!isTauriRuntime()) {
+    return browserFallback.getProjectModifiedCueCount(jobId);
+  }
+  return invoke<number>("get_project_modified_cue_count", { jobId });
 }
 
 // ---------------------------------------------------------------------------

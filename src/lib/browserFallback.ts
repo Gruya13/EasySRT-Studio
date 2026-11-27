@@ -22,8 +22,10 @@ import type {
   SetupStatus,
   SubtitleCue,
   SubtitleProject,
+  TelemetrySamplePayloads,
   TranslationProviderKind,
   TranslationStyle,
+  UpdateCheckResult,
   WaveformPreviewData,
 } from "../types/models.ts";
 import {
@@ -276,7 +278,12 @@ let mockConfig: AppConfig = {
     utf8Bom: true,
   },
   hasCompletedSetup: true,
-  autoSendCrashReports: true,
+  privacyConsentVersion: 0,
+  autoSendCrashReports: false,
+  shareAnonymousUsageMetrics: false,
+  shareAnonymizedTranslationEdits: false,
+  autoCheckUpdates: true,
+  lastUpdateCheckEpochSec: 0,
   editorSourceFontSize: 19,
   editorTranslatedFontSize: 22,
   autoProbeOnImport: true,
@@ -1090,6 +1097,7 @@ export const browserFallback = {
   async exportSubtitles(
     project: SubtitleProject,
     options: ExportOptions,
+    _skipTrainingDonation?: boolean,
   ): Promise<ExportResult> {
     const baseDir = options.saveBesideAudio
       ? project.audioPath.replace(/[\\/][^\\/]+$/, "") || "C:/Exports"
@@ -1301,6 +1309,113 @@ export const browserFallback = {
   async saveDiagnosticsLocal(): Promise<string> {
     await new Promise((r) => setTimeout(r, 120));
     return `C:/Users/<user>/AppData/Local/com.easysrt.studio/reports/diagnostics-${APP_VERSION}.txt`;
+  },
+
+  async checkAppUpdate(force: boolean): Promise<UpdateCheckResult> {
+    const nowSec = Math.floor(Date.now() / 1000);
+    const lastSec = mockConfig.lastUpdateCheckEpochSec ?? 0;
+    if (!force && mockConfig.autoCheckUpdates === false) {
+      return {
+        checked: false,
+        skippedReason: "auto_check_disabled",
+        updateAvailable: false,
+        currentVersion: APP_VERSION,
+        latestVersion: null,
+        releaseNotes: null,
+        releaseDate: null,
+        lastUpdateCheckEpochSec: lastSec,
+      };
+    }
+    if (!force && nowSec - lastSec < 86_400) {
+      return {
+        checked: false,
+        skippedReason: "cooldown_24h",
+        updateAvailable: false,
+        currentVersion: APP_VERSION,
+        latestVersion: null,
+        releaseNotes: null,
+        releaseDate: null,
+        lastUpdateCheckEpochSec: lastSec,
+      };
+    }
+    mockConfig = { ...mockConfig, lastUpdateCheckEpochSec: nowSec };
+    return {
+      checked: true,
+      skippedReason: null,
+      updateAvailable: false,
+      currentVersion: APP_VERSION,
+      latestVersion: APP_VERSION,
+      releaseNotes: null,
+      releaseDate: null,
+      lastUpdateCheckEpochSec: nowSec,
+    };
+  },
+
+  async getTelemetrySamplePayloads(): Promise<TelemetrySamplePayloads> {
+    return {
+      telemetryDisabledByEnv: false,
+      crashReport: {
+        appVersion: APP_VERSION,
+        platform: "windows-x64",
+        crashKind: "panic",
+        message: "Sample panic at pipeline/mod.rs:123 (<user> masked)",
+        stackTrace: "0: pipeline::run_stage (path redacted)",
+        source: "rust-panic-hook",
+      },
+      jobAndEditMetrics: {
+        appVersion: APP_VERSION,
+        os: "windows",
+        gpuTier: "vram8Gb",
+        whisperBackend: "cuda",
+        whisperModelId: "whisper-large-v3-turbo-q5_0",
+        llmProvider: "localLlama",
+        llmModelId: "llm-gemma4-e4b-qat",
+        audioDurationMs: 180000,
+        whisperElapsedMs: 9200,
+        llmElapsedMs: 14500,
+        asrRtf: 0.051,
+        llmRtf: 0.081,
+        oomCpuFallback: false,
+        batchSubdivisionRetries: 0,
+        cueCount: 48,
+        sourceLang: "en",
+        targetLang: "sr",
+        translationStyle: "natural",
+        addressForm: "auto",
+        preset: "standard",
+        unchangedCuesCount: 41,
+        textEditedCuesCount: 7,
+        editRatePct: 14.6,
+        encliticReorderedCount: 1,
+        ngramDiffs: [
+          {
+            langPair: "en-sr",
+            oldSpan: "tijekom",
+            newSpan: "tokom",
+            cohortProof: "a1b2c3d4e5f60718293a4b5c",
+          },
+        ],
+      },
+      trainingPair: {
+        sourceLang: "en",
+        targetLang: "sr",
+        style: "natural",
+        addressForm: "auto",
+        sourceText: "We spoke with [NAME] at [NUM] yesterday.",
+        initialAiText: "Razgovarali smo sa [NAME] u [NUM] juče.",
+        finalHumanText: "Juče smo u [NUM] razgovarali sa [NAME].",
+      },
+    };
+  },
+
+  async getProjectModifiedCueCount(jobId: string): Promise<number> {
+    const found = mockCheckpoints.find((c) => c.jobId === jobId);
+    if (!found) return 0;
+    return found.cues.filter(
+      (c) => c.translatedText.trim().length > 0 && c.translatedText !== c.sourceText,
+    ).length > 0
+      ? 2
+      : 0;
   },
 
   async onDownloadProgress(

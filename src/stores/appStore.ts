@@ -4,7 +4,6 @@ import { normalizeUiLanguage, type UiLanguage } from "../lib/i18nUtils.ts";
 import { APP_VERSION } from "../lib/version.ts";
 import {
   calculateCueMetrics,
-  compareSemver,
   computeSplitBoundaries,
   convertSerbianScriptText,
   getPresetSegmentRules,
@@ -19,6 +18,7 @@ import {
 import {
   cancelJob,
   cancelMediaProbe,
+  checkAppUpdate,
   clearApiKey,
   condenseProjectCps,
   convertCuesScript,
@@ -29,7 +29,9 @@ import {
   getApiKeyStatus,
   getCatalog,
   getConfig,
+  getProjectModifiedCueCount,
   getSetupStatus,
+  getTelemetrySamplePayloads,
   importCustomModel,
   importSubtitleFile,
   installComponent,
@@ -52,26 +54,28 @@ import {
   translateProject,
   tryLoadCompanionSubtitles,
 } from "../lib/tauri.ts";
-import type {
-  AddressForm,
-  ApiKeyStatus,
-  AppConfig,
-  CatalogItemKind,
-  CatalogManifest,
-  DownloadProgressEvent,
-  ExportOptions,
-  ExportResult,
-  JobOptions,
-  JobPhase,
-  MediaProbeResult,
-  SegmentPreset,
-  SegmentRules,
-  SerbianScript,
-  SetupStatus,
-  SubtitleCue,
-  SubtitleProject,
-  TranslationProviderKind,
-  TranslationStyle,
+import {
+  CURRENT_PRIVACY_CONSENT_VERSION,
+  type AddressForm,
+  type ApiKeyStatus,
+  type AppConfig,
+  type CatalogItemKind,
+  type CatalogManifest,
+  type DownloadProgressEvent,
+  type ExportOptions,
+  type ExportResult,
+  type JobOptions,
+  type JobPhase,
+  type MediaProbeResult,
+  type SegmentPreset,
+  type SegmentRules,
+  type SerbianScript,
+  type SetupStatus,
+  type SubtitleCue,
+  type SubtitleProject,
+  type TranslationProviderKind,
+  type TranslationStyle,
+  type UpdateCheckResult,
 } from "../types/models.ts";
 
 export interface BatchQueueItem {
@@ -258,6 +262,13 @@ function isSubtitlePath(path: string): boolean {
   return /\.(srt|vtt)$/i.test(path.trim());
 }
 
+export function isEffectiveCrashReportingEnabled(cfg: AppConfig): boolean {
+  return (
+    (cfg.privacyConsentVersion ?? 0) >= CURRENT_PRIVACY_CONSENT_VERSION &&
+    cfg.autoSendCrashReports === true
+  );
+}
+
 const DEFAULT_SEGMENT_RULES: SegmentRules = getPresetSegmentRules("standard");
 
 const DEFAULT_CONFIG: AppConfig = {
@@ -284,7 +295,12 @@ const DEFAULT_CONFIG: AppConfig = {
     utf8Bom: true,
   },
   hasCompletedSetup: false,
-  autoSendCrashReports: true,
+  privacyConsentVersion: 0,
+  autoSendCrashReports: false,
+  shareAnonymousUsageMetrics: false,
+  shareAnonymizedTranslationEdits: false,
+  autoCheckUpdates: true,
+  lastUpdateCheckEpochSec: 0,
   editorSourceFontSize: EDITOR_SOURCE_FONT_DEFAULT,
   editorTranslatedFontSize: EDITOR_TRANSLATED_FONT_DEFAULT,
   autoProbeOnImport: true,
@@ -337,6 +353,9 @@ export interface AppStoreDeps {
   importCustomModel: typeof importCustomModel;
   deleteModel: typeof deleteModel;
   flushPendingCrashReports: typeof flushPendingCrashReports;
+  checkAppUpdate: typeof checkAppUpdate;
+  getTelemetrySamplePayloads: typeof getTelemetrySamplePayloads;
+  getProjectModifiedCueCount: typeof getProjectModifiedCueCount;
   probeMediaFile: typeof probeMediaFile;
   cancelMediaProbe: typeof cancelMediaProbe;
   onDownloadProgress: typeof onDownloadProgress;
@@ -376,6 +395,9 @@ const DEFAULT_STORE_DEPS: AppStoreDeps = {
   importCustomModel,
   deleteModel,
   flushPendingCrashReports,
+  checkAppUpdate,
+  getTelemetrySamplePayloads,
+  getProjectModifiedCueCount,
   probeMediaFile,
   cancelMediaProbe,
   onDownloadProgress,
@@ -430,6 +452,7 @@ export interface AppStoreState {
   banner: BannerNotification | null;
 
   initApp: () => Promise<void>;
+  checkAppUpdate: (force: boolean) => Promise<UpdateCheckResult | null>;
   setBanner: (banner: BannerNotification | null) => void;
   setAvailableUpdateVersion: (version: string | null) => void;
   setUiLanguage: (lang: UiLanguage) => Promise<void>;
@@ -514,7 +537,10 @@ export interface AppStoreState {
   playCueSegment: (cue: SubtitleCue) => void;
   setActiveCueId: (cueId: number | null) => void;
 
-  runExportSubtitles: (options: ExportOptions) => Promise<ExportResult | null>;
+  runExportSubtitles: (
+    options: ExportOptions,
+    skipTrainingDonation?: boolean,
+  ) => Promise<ExportResult | null>;
   quickExportSrt: () => Promise<void>;
 }
 
@@ -568,7 +594,21 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
         fallbackSplitOnSpeakerChange ??
         true,
     }),
-    autoSendCrashReports: loaded.autoSendCrashReports ?? true,
+    privacyConsentVersion:
+      typeof loaded.privacyConsentVersion === "number" &&
+      Number.isFinite(loaded.privacyConsentVersion)
+        ? Math.max(0, Math.floor(loaded.privacyConsentVersion))
+        : 0,
+    autoSendCrashReports: loaded.autoSendCrashReports ?? false,
+    shareAnonymousUsageMetrics: loaded.shareAnonymousUsageMetrics ?? false,
+    shareAnonymizedTranslationEdits:
+      loaded.shareAnonymizedTranslationEdits ?? false,
+    autoCheckUpdates: loaded.autoCheckUpdates ?? true,
+    lastUpdateCheckEpochSec:
+      typeof loaded.lastUpdateCheckEpochSec === "number" &&
+      Number.isFinite(loaded.lastUpdateCheckEpochSec)
+        ? Math.max(0, Math.floor(loaded.lastUpdateCheckEpochSec))
+        : 0,
     editorSourceFontSize: clampEditorFontSize(
       "source",
       loaded.editorSourceFontSize ?? EDITOR_SOURCE_FONT_DEFAULT,
@@ -1000,29 +1040,17 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
           batchQueue: stateBeforeInit.batchQueue,
         });
 
-        // Flush pending Rust panic / crash reports queued on disk (silent, non-blocking)
-        if (config.autoSendCrashReports !== false) {
+        // Flush pending Rust panic / crash reports queued on disk (only when consent v1+ and opted in)
+        if (isEffectiveCrashReportingEnabled(config)) {
           void deps.flushPendingCrashReports().catch(() => {});
         }
 
-        // Background GitHub latest-release version check (silent, non-blocking)
-        if (typeof fetch === "function" && typeof window !== "undefined") {
-          void fetch(
-            "https://api.github.com/repos/Gruya13/EasySRT-Studio/releases/latest",
-            { headers: { Accept: "application/vnd.github+json" } },
-          )
-            .then(async (res) => {
-              if (!res.ok) return;
-              const data = (await res.json()) as { tag_name?: string };
-              const remoteTag = data.tag_name?.trim();
-              if (remoteTag && compareSemver(remoteTag, appVersion) > 0) {
-                set({ availableUpdateVersion: remoteTag.replace(/^v/i, "") });
-              }
-            })
-            .catch(() => {
-              // Offline or GitHub unreachable — ignore silently at startup
-            });
-        }
+        // Background 24h update check via Rust IPC (CSP-safe, zero-PII DAU counter)
+        void get()
+          .checkAppUpdate(false)
+          .catch(() => {
+            // Offline or update endpoint unreachable — ignore silently at startup
+          });
       } catch (err) {
         set({
           initialized: true,
@@ -1032,6 +1060,27 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
           },
         });
       }
+    },
+
+    checkAppUpdate: async (force) => {
+      const res = await deps.checkAppUpdate(force);
+      set((state) => ({
+        availableUpdateVersion:
+          res.updateAvailable && res.latestVersion
+            ? res.latestVersion.replace(/^v/i, "")
+            : res.checked && !res.updateAvailable
+              ? null
+              : state.availableUpdateVersion,
+        config:
+          res.lastUpdateCheckEpochSec >
+          (state.config.lastUpdateCheckEpochSec ?? 0)
+            ? {
+                ...state.config,
+                lastUpdateCheckEpochSec: res.lastUpdateCheckEpochSec,
+              }
+            : state.config,
+      }));
+      return res;
     },
 
     setBanner: (banner) => set({ banner }),
@@ -3653,7 +3702,7 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
 
     setActiveCueId: (cueId) => set({ activeCueId: cueId }),
 
-    runExportSubtitles: async (options) => {
+    runExportSubtitles: async (options, skipTrainingDonation) => {
       const { activeProject } = get();
       if (!activeProject) {
         return null;
@@ -3662,7 +3711,11 @@ export function createAppStore(depsOverrides?: Partial<AppStoreDeps>) {
         await flushCheckpointAutosave();
         await get().updateConfig({ export: options });
         const latestProject = get().activeProject ?? activeProject;
-        const result = await deps.exportSubtitles(latestProject, options);
+        const result = await deps.exportSubtitles(
+          latestProject,
+          options,
+          skipTrainingDonation,
+        );
         set({
           banner: {
             type: "success",
