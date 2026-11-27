@@ -4,6 +4,8 @@ import assert from "node:assert/strict";
 import { readFileSync, readdirSync, statSync } from "node:fs";
 // @ts-ignore Node built-in test runner without @types/node
 import { describe, it } from "node:test";
+// @ts-ignore Node built-in url without @types/node
+import { fileURLToPath } from "node:url";
 import {
   createAppStore,
   isEffectiveCrashReportingEnabled,
@@ -127,7 +129,7 @@ function walkSourceFiles(dir: URL): string[] {
       if (entry === "__tests__" || entry === "node_modules") continue;
       out.push(...walkSourceFiles(new URL(`${entry}/`, dir)));
     } else if (/\.(ts|tsx)$/.test(entry)) {
-      out.push(child.pathname);
+      out.push(fileURLToPath(child));
     }
   }
   return out;
