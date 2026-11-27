@@ -13,6 +13,7 @@
     "version:check": "node scripts/release.mjs check",
     "release:prepare": "node scripts/release.mjs prepare",
     "release:notes": "node scripts/release.mjs notes",
+    "telemetry:digest": "node scripts/telemetry-digest.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -2,10 +2,18 @@
 import { describe, it, afterEach } from "node:test";
 // @ts-ignore Node built-in strict assert without @types/node
 import assert from "node:assert/strict";
+// @ts-ignore Node built-in fs/sqlite without @types/node
+import { readFileSync } from "node:fs";
+// @ts-ignore Node built-in sqlite without @types/node
+import { DatabaseSync } from "node:sqlite";
 
 import worker, {
   MAX_BODY_BYTES,
+  MAX_TELEMETRY_BODY_BYTES,
+  MAX_TRAINING_PAIRS_BODY_BYTES,
+  extractSubnetPrefix,
   neutralizeGitHubMentions,
+  runScheduledCleanup,
   sanitizeText,
   type Env,
 } from "../index.ts";
@@ -69,16 +77,18 @@ function installMockFetch(
   return calls;
 }
 
-function createInMemoryCache(): Cache {
+function createInMemoryCache(recordedKeys?: string[]): Cache {
   const store = new Map<string, Response>();
   return {
     async match(request: RequestInfo | URL): Promise<Response | undefined> {
       const key = typeof request === "string" ? request : request instanceof URL ? request.toString() : request.url;
+      recordedKeys?.push(key);
       const hit = store.get(key);
       return hit ? hit.clone() : undefined;
     },
     async put(request: RequestInfo | URL, response: Response): Promise<void> {
       const key = typeof request === "string" ? request : request instanceof URL ? request.toString() : request.url;
+      recordedKeys?.push(key);
       store.set(key, response.clone());
     },
     async delete(request: RequestInfo | URL): Promise<boolean> {
@@ -86,6 +96,117 @@ function createInMemoryCache(): Cache {
       return store.delete(key);
     },
   } as unknown as Cache;
+}
+
+// @ts-ignore Node runtime import.meta.url without @types/node
+const SCHEMA_SQL = readFileSync(new URL("../../schema.sql", import.meta.url), "utf8");
+
+function createTestD1(): { db: D1Database; sqlite: DatabaseSync } {
+  const sqlite = new DatabaseSync(":memory:");
+  sqlite.exec(SCHEMA_SQL);
+
+  const makeStmt = (sql: string, params: unknown[] = []): D1PreparedStatement => {
+    const runSync = () => {
+      const stmt = sqlite.prepare(sql);
+      const res = stmt.run(...(params as Array<string | number | null | Uint8Array>));
+      return {
+        success: true,
+        meta: {
+          duration: 0,
+          changes: Number(res.changes),
+          last_row_id: Number(res.lastInsertRowid),
+          changed_db: Number(res.changes) > 0,
+          size_after: 0,
+          rows_read: 0,
+          rows_written: Number(res.changes),
+        },
+        results: [],
+      };
+    };
+
+    const allSync = () => {
+      const stmt = sqlite.prepare(sql);
+      const rows = stmt.all(...(params as Array<string | number | null | Uint8Array>));
+      return {
+        success: true,
+        meta: {
+          duration: 0,
+          changes: 0,
+          last_row_id: 0,
+          changed_db: false,
+          size_after: 0,
+          rows_read: rows.length,
+          rows_written: 0,
+        },
+        results: rows.map((row: Record<string, unknown>) => ({ ...row })),
+      };
+    };
+
+    const prepared = {
+      bind(...bound: unknown[]) {
+        return makeStmt(sql, bound);
+      },
+      async first<T = unknown>(colName?: string): Promise<T | null> {
+        const res = allSync();
+        const row = res.results[0] as Record<string, unknown> | undefined;
+        if (!row) return null;
+        if (typeof colName === "string") {
+          return (row[colName] ?? null) as T | null;
+        }
+        return row as T;
+      },
+      async run<T = Record<string, unknown>>() {
+        return runSync() as unknown as D1Result<T>;
+      },
+      async all<T = Record<string, unknown>>() {
+        return allSync() as unknown as D1Result<T>;
+      },
+      async raw() {
+        return [];
+      },
+      _executeForBatch() {
+        const trimmed = sql.trimStart().toUpperCase();
+        if (trimmed.startsWith("SELECT")) {
+          return allSync();
+        }
+        return runSync();
+      },
+    };
+    return prepared as unknown as D1PreparedStatement;
+  };
+
+  const db = {
+    prepare(query: string) {
+      return makeStmt(query);
+    },
+    async batch(statements: D1PreparedStatement[]) {
+      return statements.map((s) =>
+        (s as unknown as { _executeForBatch: () => D1Result<Record<string, unknown>> })._executeForBatch(),
+      );
+    },
+    async exec(query: string) {
+      sqlite.exec(query);
+      return { count: 1, duration: 0 };
+    },
+  } as unknown as D1Database;
+
+  return { db, sqlite };
+}
+
+function createTestExecutionContext(): { ctx: ExecutionContext; flush: () => Promise<void> } {
+  const pending: Promise<unknown>[] = [];
+  const ctx = {
+    waitUntil(promise: Promise<unknown>) {
+      pending.push(promise);
+    },
+    passThroughOnException() {},
+  } as unknown as ExecutionContext;
+  return {
+    ctx,
+    async flush() {
+      await Promise.all(pending.splice(0));
+    },
+  };
 }
 
 describe("Health, Routing, and Origin / CORS Policy", () => {
@@ -849,5 +970,575 @@ describe("Configuration & Upstream Error Handling", () => {
     assert.equal(res.status, 502);
     const json = (await res.json()) as { ok: boolean; error: string };
     assert.equal(json.ok, false);
+  });
+});
+
+function buildSampleExportMetrics(overrides: Record<string, unknown> = {}) {
+  return {
+    totalBaselineCues: 40,
+    totalFinalCues: 41,
+    unchangedCuesCount: 30,
+    textEditedCuesCount: 10,
+    editRatePct: 25.0,
+    initialHighCpsCount: 3,
+    finalHighCpsCount: 0,
+    initialLineTooLongCount: 2,
+    finalLineTooLongCount: 0,
+    avgCpsBefore: 16.4,
+    avgCpsAfter: 14.1,
+    condenseCpsUsed: false,
+    encliticReorderedCount: 2,
+    redundantPossessiveRemovedCount: 1,
+    passiveCalqueRemovedCount: 1,
+    conjunctionCommaFixedCount: 1,
+    missedFillerDeletedCount: 2,
+    inflectionSuffixFixCount: 1,
+    boundaryOrphanShiftedCount: 0,
+    splitCount: 1,
+    splitAfterCommaCount: 1,
+    splitAfterConjunctionCount: 0,
+    avgPreSplitChars: 74,
+    avgPreSplitDurationMs: 5200,
+    mergeCount: 0,
+    avgMergedShortCueDurationMs: 0,
+    avgMergedShortCueChars: 0,
+    avgMergedGapMs: 0,
+    startTrimCount: 2,
+    avgStartDeltaMs: -50,
+    endTrimCount: 3,
+    avgEndDeltaMs: 120,
+    ...overrides,
+  };
+}
+
+describe("Zero-IP Rate Limiting & Subnet Prefix Extraction (V05-H1 / V05-M2)", () => {
+  it("hashes CF-Connecting-IP before constructing Cache API keys (no raw IP in key)", async () => {
+    const cacheKeys: string[] = [];
+    (globalThis as { caches?: { default: Cache } }).caches = {
+      default: createInMemoryCache(cacheKeys),
+    };
+    installMockFetch(() =>
+      new Response(
+        JSON.stringify({ number: 501, html_url: "https://github.com/Gruya13/EasySRT-Studio/issues/501" }),
+        { status: 201, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+
+    const secretIp = "203.0.113.77";
+    const req = new Request("https://telemetry.example.workers.dev/v1/report/bug", {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "CF-Connecting-IP": secretIp,
+      },
+      body: JSON.stringify({
+        appVersion: "0.5.0",
+        title: "Zero IP cache check",
+        description: "Verify raw IP never appears in Cache API URL",
+      }),
+    });
+
+    const res = await worker.fetch(req, { ...TEST_ENV, SUBNET_HMAC_SECRET: "unit-test-hmac-secret" });
+    assert.equal(res.status, 201);
+    assert.ok(cacheKeys.length >= 2);
+    for (const key of cacheKeys) {
+      assert.ok(!key.includes(secretIp), `Raw IP leaked into cache key: ${key}`);
+      assert.match(key, /\/[0-9a-f]{64}\/\d+$/);
+    }
+  });
+
+  it("extracts /24 IPv4, IPv4-mapped IPv6, and /48 IPv6 subnet prefixes accurately", () => {
+    assert.equal(extractSubnetPrefix("203.0.113.42"), "ipv4:203.0.113.0/24");
+    assert.equal(extractSubnetPrefix("::ffff:198.51.100.99"), "ipv4:198.51.100.0/24");
+    assert.equal(extractSubnetPrefix("2001:db8:abcd:0001::1"), "ipv6:2001:0db8:abcd::/48");
+    assert.equal(extractSubnetPrefix("2001:db8:abcd:ffff::99"), "ipv6:2001:0db8:abcd::/48");
+    assert.equal(extractSubnetPrefix("2001:db8:1234::1"), "ipv6:2001:0db8:1234::/48");
+    assert.equal(extractSubnetPrefix("unknown"), "unknown");
+  });
+});
+
+describe("GET /v1/update/latest.json (V05-M1)", () => {
+  it("caches upstream latest.json under a fixed query-free key, returns exact bytes, and allowlists D1 DAU logging", async () => {
+    const cacheKeys: string[] = [];
+    (globalThis as { caches?: { default: Cache } }).caches = {
+      default: createInMemoryCache(cacheKeys),
+    };
+    const { db, sqlite } = createTestD1();
+    const env: Env = { ...TEST_ENV, DB: db };
+
+    // Deliberately non-minified JSON formatting + minisign signature to verify byte-for-byte preservation.
+    const exactManifestBytes =
+      '{\n  "version": "0.5.0",\n  "notes": "Wave 2 release",\n  "platforms": {\n    "windows-x86_64": {\n      "signature": "RWQ_EXACT_MINISIGN_BYTES==",\n      "url": "https://github.com/Gruya13/EasySRT-Studio/releases/download/v0.5.0/setup.exe"\n    }\n  }\n}\n';
+
+    const calls = installMockFetch((call) => {
+      assert.equal(call.url, "https://github.com/Gruya13/EasySRT-Studio/releases/latest/download/latest.json");
+      return new Response(exactManifestBytes, {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    });
+
+    const { ctx: ctx1, flush: flush1 } = createTestExecutionContext();
+    const res1 = await worker.fetch(
+      new Request(
+        "https://telemetry.example.workers.dev/v1/update/latest.json?target=windows&arch=x86_64&current=0.4.0",
+      ),
+      env,
+      ctx1,
+    );
+    await flush1();
+    assert.equal(res1.status, 200);
+    assert.equal(res1.headers.get("X-Cache"), "MISS");
+    assert.equal(res1.headers.get("Cache-Control"), "public, max-age=300");
+    assert.equal(await res1.text(), exactManifestBytes);
+
+    // Second request with different query params must hit the SAME fixed query-free cache key!
+    const { ctx: ctx2, flush: flush2 } = createTestExecutionContext();
+    const res2 = await worker.fetch(
+      new Request(
+        "https://telemetry.example.workers.dev/v1/update/latest.json?target=linux&arch=aarch64&current=v0.4.1",
+      ),
+      env,
+      ctx2,
+    );
+    await flush2();
+    assert.equal(res2.status, 200);
+    assert.equal(res2.headers.get("X-Cache"), "HIT");
+    assert.equal(await res2.text(), exactManifestBytes);
+    assert.equal(calls.length, 1, "Upstream GitHub must only be fetched once during 300s TTL");
+
+    const updateCacheKeys = cacheKeys.filter((k) => k.includes("update-cache.easysrt.internal"));
+    assert.ok(updateCacheKeys.length >= 2);
+    for (const k of updateCacheKeys) {
+      assert.equal(k, "https://update-cache.easysrt.internal/v1/update/latest.json");
+    }
+
+    // Invalid target/arch/semver must NEVER write poisoned rows into D1.
+    const { ctx: ctx3, flush: flush3 } = createTestExecutionContext();
+    const res3 = await worker.fetch(
+      new Request(
+        "https://telemetry.example.workers.dev/v1/update/latest.json?target=evil&arch=x86_64&current=not-semver",
+      ),
+      env,
+      ctx3,
+    );
+    await flush3();
+    assert.equal(res3.status, 200);
+
+    const rows = (
+      sqlite
+        .prepare("SELECT target, arch, current_version, check_count FROM daily_update_checks ORDER BY target")
+        .all() as Array<Record<string, unknown>>
+    ).map((r) => ({ ...r }));
+    assert.deepEqual(rows, [
+      { target: "linux", arch: "aarch64", current_version: "0.4.1", check_count: 1 },
+      { target: "windows", arch: "x86_64", current_version: "0.4.0", check_count: 1 },
+    ]);
+  });
+
+  it("rejects malformed or oversized (>64 KiB) upstream manifests with 502 and blocks Origin with 403", async () => {
+    const { db } = createTestD1();
+    const env: Env = { ...TEST_ENV, DB: db };
+
+    const originRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/update/latest.json", {
+        headers: { Origin: "https://evil.example" },
+      }),
+      env,
+    );
+    assert.equal(originRes.status, 403);
+
+    installMockFetch(() =>
+      new Response(JSON.stringify({ version: "0.5.0" }), { status: 200 }),
+    );
+    const missingPlatforms = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/update/latest.json"),
+      env,
+    );
+    assert.equal(missingPlatforms.status, 502);
+
+    installMockFetch(() =>
+      new Response("x".repeat(70_000), { status: 200 }),
+    );
+    const oversized = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/update/latest.json"),
+      env,
+    );
+    assert.equal(oversized.status, 502);
+  });
+});
+
+describe("Telemetry Ingestion, Sybil Guard (V05-M2), Admin Digest & Cron Purge", () => {
+  it("records Level 1 job metrics and enforces the 32 KiB cap", async () => {
+    const { db, sqlite } = createTestD1();
+    const env: Env = { ...TEST_ENV, DB: db };
+
+    const validRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/telemetry/job-metrics", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          appVersion: "0.5.0",
+          os: "linux",
+          gpuTier: "vram8Gb",
+          whisperBackend: "vulkan",
+          whisperModelId: "whisper-large-v3-turbo-q5_0",
+          llmProvider: "deepSeek",
+          llmModelId: "deepseek-chat",
+          audioDurationMs: 120_000,
+          whisperElapsedMs: 10_000,
+          diarizerElapsedMs: 800,
+          llmElapsedMs: 6_500,
+          asrRtf: 0.083,
+          llmRtf: 0.054,
+          oomCpuFallback: false,
+          batchSubdivisionRetries: 1,
+          cueCount: 35,
+          sourceLang: "en",
+          targetLang: "sr",
+          translationStyle: "natural",
+          addressForm: "auto",
+          preset: "standard",
+        }),
+      }),
+      env,
+    );
+    assert.equal(validRes.status, 201);
+
+    const row = {
+      ...(sqlite
+        .prepare("SELECT event_kind, gpu_tier, whisper_backend, oom_cpu_fallback FROM job_and_edit_metrics")
+        .get() as Record<string, unknown>),
+    };
+    assert.deepEqual(row, {
+      event_kind: "job",
+      gpu_tier: "vram8Gb",
+      whisper_backend: "vulkan",
+      oom_cpu_fallback: 0,
+    });
+
+    const tooLargeRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/telemetry/job-metrics", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(MAX_TELEMETRY_BODY_BYTES + 1),
+        },
+        body: "{}",
+      }),
+      env,
+    );
+    assert.equal(tooLargeRes.status, 413);
+  });
+
+  it("rejects unsafe n-gram diffs containing uppercase, digits, or symbols", async () => {
+    const { db } = createTestD1();
+    const env: Env = { ...TEST_ENV, DB: db, SUBNET_HMAC_SECRET: "sybil-secret" };
+
+    for (const badDiff of [
+      { langPair: "en-sr", oldSpan: "Marko", newSpan: "petar", cohortProof: "a".repeat(24) },
+      { langPair: "en-sr", oldSpan: "godina 2026", newSpan: "letos", cohortProof: "b".repeat(24) },
+      { langPair: "en-sr", oldSpan: "user@example.com", newSpan: "mejl", cohortProof: "c".repeat(24) },
+      { langPair: "en-sr", oldSpan: "jedan dva tri cetiri", newSpan: "pet", cohortProof: "d".repeat(24) },
+    ]) {
+      const res = await worker.fetch(
+        new Request("https://telemetry.example.workers.dev/v1/telemetry/export", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "CF-Connecting-IP": "198.51.100.10",
+          },
+          body: JSON.stringify({
+            appVersion: "0.5.0",
+            os: "windows",
+            sourceLang: "en",
+            targetLang: "sr",
+            translationStyle: "natural",
+            addressForm: "auto",
+            metrics: buildSampleExportMetrics(),
+            ngramDiffs: [badDiff],
+          }),
+        }),
+        env,
+      );
+      assert.equal(res.status, 400, `Expected 400 for unsafe n-gram ${badDiff.oldSpan}`);
+    }
+  });
+
+  it("enforces K>=5 cohorts AND >=3 distinct /24 or /48 subnets (Sybil Guard) before exposing in /v1/admin/digest", async () => {
+    const { db } = createTestD1();
+    const env: Env = {
+      ...TEST_ENV,
+      DB: db,
+      SUBNET_HMAC_SECRET: "test-sybil-hmac-secret",
+      TELEMETRY_ADMIN_TOKEN: "super-secret-admin-token-42",
+    };
+
+    const sendExport = (ip: string, ngramDiffs: Array<{ langPair: string; oldSpan: string; newSpan: string; cohortProof: string }>) =>
+      worker.fetch(
+        new Request("https://telemetry.example.workers.dev/v1/telemetry/export", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "CF-Connecting-IP": ip,
+          },
+          body: JSON.stringify({
+            appVersion: "0.5.0",
+            os: "windows",
+            sourceLang: "en",
+            targetLang: "sr",
+            translationStyle: "natural",
+            addressForm: "auto",
+            metrics: buildSampleExportMetrics(),
+            ngramDiffs,
+          }),
+        }),
+        env,
+      );
+
+    // 1. Sybil cluster: 5 distinct cohortProofs all from the SAME /24 IPv4 subnet (198.51.100.x).
+    for (let i = 1; i <= 5; i++) {
+      const res = await sendExport(`198.51.100.${i}`, [
+        {
+          langPair: "en-sr",
+          oldSpan: "sybil fraza",
+          newSpan: "lazna zamena",
+          cohortProof: `${String(i).repeat(24)}`,
+        },
+      ]);
+      assert.equal(res.status, 201);
+    }
+
+    // 2. IPv6 /48 Sybil cluster: 5 distinct cohorts from only 2 distinct /48 prefixes.
+    const ipv6Ips = [
+      "2001:db8:aaaa:0001::1",
+      "2001:db8:aaaa:0002::1",
+      "2001:db8:aaaa:0003::1",
+      "2001:db8:bbbb:0001::1",
+      "2001:db8:bbbb:0002::1",
+    ];
+    for (let i = 0; i < ipv6Ips.length; i++) {
+      const res = await sendExport(ipv6Ips[i], [
+        {
+          langPair: "en-sr",
+          oldSpan: "mreza nedovoljno",
+          newSpan: "samo dve podmreze",
+          cohortProof: `a${String(i + 1).repeat(23)}`,
+        },
+      ]);
+      assert.equal(res.status, 201);
+    }
+
+    // 3. Legitimate organic phrase: 5 distinct cohorts across 3 distinct /24 subnets + 1 replay.
+    const organicSubmissions = [
+      { ip: "192.0.2.10", proof: "f1".repeat(12) },
+      { ip: "192.0.2.10", proof: "f1".repeat(12) }, // duplicate replay must be ignored
+      { ip: "192.0.2.25", proof: "f2".repeat(12) },
+      { ip: "198.51.100.50", proof: "f3".repeat(12) },
+      { ip: "203.0.113.11", proof: "f4".repeat(12) },
+      { ip: "203.0.113.99", proof: "f5".repeat(12) },
+    ];
+    for (const sub of organicSubmissions) {
+      const res = await sendExport(sub.ip, [
+        {
+          langPair: "en-sr",
+          oldSpan: "tijekom",
+          newSpan: "tokom",
+          cohortProof: sub.proof,
+        },
+      ]);
+      assert.equal(res.status, 201);
+    }
+
+    // Unauthorized digest requests must fail with 401.
+    const unauthRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/admin/digest"),
+      env,
+    );
+    assert.equal(unauthRes.status, 401);
+
+    const wrongTokenRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/admin/digest", {
+        headers: { Authorization: "Bearer wrong-token" },
+      }),
+      env,
+    );
+    assert.equal(wrongTokenRes.status, 401);
+
+    // Authorized digest must expose ONLY "tijekom -> tokom" (5 cohorts, 3 subnets).
+    const digestRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/admin/digest?days=999", {
+        headers: { Authorization: "Bearer super-secret-admin-token-42" },
+      }),
+      env,
+    );
+    assert.equal(digestRes.status, 200);
+    const digest = (await digestRes.json()) as {
+      ok: boolean;
+      windowDays: number;
+      promotedNgrams: Array<{
+        lang_pair: string;
+        old_span: string;
+        new_span: string;
+        cohort_count: number;
+        subnet_count: number;
+      }>;
+    };
+    assert.equal(digest.ok, true);
+    assert.equal(digest.windowDays, 365);
+    assert.equal(digest.promotedNgrams.length, 1);
+    assert.equal(digest.promotedNgrams[0].old_span, "tijekom");
+    assert.equal(digest.promotedNgrams[0].new_span, "tokom");
+    assert.equal(digest.promotedNgrams[0].cohort_count, 5);
+    assert.equal(digest.promotedNgrams[0].subnet_count, 3);
+  });
+
+  it("sanitizes Level 3 training pairs, enforces 64 KiB / 25-pair limits, and exports JSONL", async () => {
+    const { db } = createTestD1();
+    const env: Env = {
+      ...TEST_ENV,
+      DB: db,
+      TELEMETRY_ADMIN_TOKEN: "admin-token-jsonl",
+    };
+
+    const tooManyPairs = Array.from({ length: 26 }, () => ({
+      sourceLang: "en",
+      targetLang: "sr",
+      style: "natural",
+      addressForm: "auto",
+      sourceText: "Hello",
+      initialAiText: "Zdravo",
+      finalHumanText: "Ćao",
+    }));
+    const reject26 = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/telemetry/training-pairs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ appVersion: "0.5.0", pairs: tooManyPairs }),
+      }),
+      env,
+    );
+    assert.equal(reject26.status, 400);
+
+    const oversized = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/telemetry/training-pairs", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "Content-Length": String(MAX_TRAINING_PAIRS_BODY_BYTES + 1),
+        },
+        body: "{}",
+      }),
+      env,
+    );
+    assert.equal(oversized.status, 413);
+
+    const saveRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/telemetry/training-pairs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          appVersion: "0.5.0",
+          pairs: [
+            {
+              sourceLang: "en",
+              targetLang: "sr",
+              style: "natural",
+              addressForm: "politeVi",
+              sourceText: "Check /home/marko/doc.txt with sk-secret12345678",
+              initialAiText: "Proveri sa ključem sk-secret12345678",
+              finalHumanText: "Proverite dokument sa [REDACTED_API_KEY]",
+            },
+          ],
+        }),
+      }),
+      env,
+    );
+    assert.equal(saveRes.status, 201);
+
+    const jsonlRes = await worker.fetch(
+      new Request("https://telemetry.example.workers.dev/v1/admin/digest?format=jsonl", {
+        headers: { Authorization: "Bearer admin-token-jsonl" },
+      }),
+      env,
+    );
+    assert.equal(jsonlRes.status, 200);
+    assert.equal(jsonlRes.headers.get("Content-Type"), "application/x-ndjson; charset=utf-8");
+    const lines = (await jsonlRes.text()).trim().split("\n");
+    assert.equal(lines.length, 1);
+    const parsed = JSON.parse(lines[0]) as { sourceText: string; initialAiText: string };
+    assert.ok(!parsed.sourceText.includes("marko"));
+    assert.ok(!parsed.sourceText.includes("sk-secret12345678"));
+    assert.ok(!parsed.initialAiText.includes("sk-secret12345678"));
+  });
+
+  it("purges unpromoted n-grams older than 30 days and training pairs older than 90 days in scheduled()", async () => {
+    const { db, sqlite } = createTestD1();
+    const env: Env = { ...TEST_ENV, DB: db };
+    const nowMs = Date.parse("2026-11-27T03:00:00Z");
+    const dayMs = 86_400_000;
+    const old40d = new Date(nowMs - 40 * dayMs).toISOString();
+    const fresh10d = new Date(nowMs - 10 * dayMs).toISOString();
+    const old100d = new Date(nowMs - 100 * dayMs).toISOString();
+
+    sqlite
+      .prepare(
+        `INSERT INTO ngram_candidates (pair_hash, lang_pair, old_span, new_span, cohort_count, subnet_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("hash_old_unpromoted", "en-sr", "retko", "drugo", 3, 2, old40d, old40d);
+    sqlite
+      .prepare(
+        `INSERT INTO ngram_cohorts (pair_hash, cohort_proof, subnet_hash, created_at)
+         VALUES (?, ?, ?, ?)`,
+      )
+      .run("hash_old_unpromoted", "proof1", "sub1", old40d);
+    sqlite
+      .prepare(
+        `INSERT INTO ngram_candidates (pair_hash, lang_pair, old_span, new_span, cohort_count, subnet_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("hash_old_promoted", "en-sr", "cesto", "bolje", 7, 4, old40d, old40d);
+    sqlite
+      .prepare(
+        `INSERT INTO ngram_candidates (pair_hash, lang_pair, old_span, new_span, cohort_count, subnet_count, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run("hash_fresh_unpromoted", "en-sr", "novo", "novije", 2, 2, fresh10d, fresh10d);
+
+    sqlite
+      .prepare(
+        `INSERT INTO training_edit_pairs (created_at, app_version, source_lang, target_lang, style, address_form, source_text, initial_ai_text, final_human_text)
+         VALUES (?, '0.5.0', 'en', 'sr', 'natural', 'auto', 'old', 'stari', 'novi')`,
+      )
+      .run(old100d);
+    sqlite
+      .prepare(
+        `INSERT INTO training_edit_pairs (created_at, app_version, source_lang, target_lang, style, address_form, source_text, initial_ai_text, final_human_text)
+         VALUES (?, '0.5.0', 'en', 'sr', 'natural', 'auto', 'fresh', 'sveze', 'bolje')`,
+      )
+      .run(fresh10d);
+
+    await runScheduledCleanup(env, nowMs);
+
+    const remainingCandidates = sqlite
+      .prepare("SELECT pair_hash FROM ngram_candidates ORDER BY pair_hash")
+      .all() as Array<{ pair_hash: string }>;
+    assert.deepEqual(
+      remainingCandidates.map((r) => r.pair_hash),
+      ["hash_fresh_unpromoted", "hash_old_promoted"],
+    );
+
+    const remainingCohorts = sqlite
+      .prepare("SELECT pair_hash FROM ngram_cohorts")
+      .all() as Array<{ pair_hash: string }>;
+    assert.equal(remainingCohorts.length, 0);
+
+    const remainingPairs = (
+      sqlite
+        .prepare("SELECT source_text FROM training_edit_pairs")
+        .all() as Array<Record<string, unknown>>
+    ).map((r) => ({ ...r }));
+    assert.deepEqual(remainingPairs, [{ source_text: "fresh" }]);
   });
 });

@@ -23,9 +23,10 @@ yarn-error.log*
 pnpm-debug.log*
 
 # Environment & secrets
-.env
-.env.local
-.env.*.local
+.env*
+!.env.example
+worker/.env*
+!worker/.env.example
 *.key
 *.pem
 
