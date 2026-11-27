@@ -60,6 +60,7 @@
     "updater": {
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IEJBNTJEMDNFQjRFQjAzREUKUldUZUErdTBQdEJTdW02aXhrMFRONUNBWnhKOC9WV2pmbFJYNENieTBNREFKRFQrcGpqdEU0eloK",
       "endpoints": [
+        "https://easysrt-telemetry.ig-systems.rs/v1/update/latest.json?target={{target}}&arch={{arch}}&current={{current_version}}",
         "https://github.com/Gruya13/EasySRT-Studio/releases/latest/download/latest.json"
       ]
     }

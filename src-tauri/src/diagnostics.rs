@@ -4,8 +4,10 @@
 use crate::hardware;
 use crate::models::{
     AppConfig, BugReportRequest, CatalogManifest, CrashReportRequest, CustomModelEntry,
-    DiagnosticsPreview, GpuInfo, ReportSubmitResult, StoragePaths,
+    DiagnosticsPreview, GpuInfo, JobMetricsPayload, ReportSubmitResult, StoragePaths,
+    TelemetrySamplePayloads,
 };
+use crate::pipeline::telemetry_diff::{ExportDiffMetrics, SafeNgramDiff, TrainingCuePair};
 use crate::{setup_manager, storage};
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
@@ -96,15 +98,28 @@ fn normalize_endpoint_override(raw: &str) -> Option<String> {
     }
 }
 
-/// Pure testable telemetry endpoint resolver:
-/// 1. Runtime env `EASYSRT_TELEMETRY_URL` (if set, even empty/`off` to explicitly disable)
-/// 2. Compile-time `option_env!("EASYSRT_TELEMETRY_URL")`
-/// 3. `default_url` (`DEFAULT_TELEMETRY_URL`)
-pub fn resolve_telemetry_endpoint_from(
+fn is_do_not_track_enabled(raw: Option<&str>) -> bool {
+    raw.map(|v| {
+        let t = v.trim();
+        t == "1" || t.eq_ignore_ascii_case("true")
+    })
+    .unwrap_or(false)
+}
+
+/// Pure testable telemetry endpoint resolver with `DO_NOT_TRACK` support:
+/// 1. `DO_NOT_TRACK=1` / `true` -> `None`
+/// 2. Runtime env `EASYSRT_TELEMETRY_URL` (if set, even empty/`off` to explicitly disable)
+/// 3. Compile-time `option_env!("EASYSRT_TELEMETRY_URL")`
+/// 4. `default_url` (`DEFAULT_TELEMETRY_URL`)
+pub fn resolve_telemetry_endpoint_with_dnt(
+    do_not_track: Option<&str>,
     runtime_env: Option<&str>,
     compile_env: Option<&str>,
     default_url: &str,
 ) -> Option<String> {
+    if is_do_not_track_enabled(do_not_track) {
+        return None;
+    }
     if let Some(val) = runtime_env {
         return normalize_endpoint_override(val);
     }
@@ -114,15 +129,36 @@ pub fn resolve_telemetry_endpoint_from(
     normalize_endpoint_override(default_url)
 }
 
-/// Resolve telemetry worker base URL from:
-/// 1. Runtime env `EASYSRT_TELEMETRY_URL`
+/// Pure testable telemetry endpoint resolver:
+/// 1. Runtime env `EASYSRT_TELEMETRY_URL` (if set, even empty/`off` to explicitly disable)
 /// 2. Compile-time `option_env!("EASYSRT_TELEMETRY_URL")`
-/// 3. `DEFAULT_TELEMETRY_URL`
+/// 3. `default_url` (`DEFAULT_TELEMETRY_URL`)
+pub fn resolve_telemetry_endpoint_from(
+    runtime_env: Option<&str>,
+    compile_env: Option<&str>,
+    default_url: &str,
+) -> Option<String> {
+    resolve_telemetry_endpoint_with_dnt(None, runtime_env, compile_env, default_url)
+}
+
+/// Returns `true` when telemetry is globally disabled via `DO_NOT_TRACK=1`
+/// or `EASYSRT_TELEMETRY_URL=off` / empty.
+pub fn is_telemetry_disabled_by_env() -> bool {
+    resolve_telemetry_endpoint().is_none()
+}
+
+/// Resolve telemetry worker base URL from:
+/// 1. `DO_NOT_TRACK=1`
+/// 2. Runtime env `EASYSRT_TELEMETRY_URL`
+/// 3. Compile-time `option_env!("EASYSRT_TELEMETRY_URL")`
+/// 4. `DEFAULT_TELEMETRY_URL`
 ///
 /// Returns `None` when explicitly disabled or unconfigured.
 pub fn resolve_telemetry_endpoint() -> Option<String> {
+    let dnt_env = std::env::var("DO_NOT_TRACK").ok();
     let runtime_env = std::env::var("EASYSRT_TELEMETRY_URL").ok();
-    resolve_telemetry_endpoint_from(
+    resolve_telemetry_endpoint_with_dnt(
+        dnt_env.as_deref(),
         runtime_env.as_deref(),
         option_env!("EASYSRT_TELEMETRY_URL"),
         DEFAULT_TELEMETRY_URL,
@@ -961,14 +997,11 @@ pub async fn submit_crash_report(
     );
 
     let data_dir = PathBuf::from(&paths.data_dir);
-    let prefix = if config.auto_send_crash_reports {
-        "pending"
-    } else {
-        "local"
-    };
+    let can_send = config.can_send_crash_reports();
+    let prefix = if can_send { "pending" } else { "local" };
     let saved_path = write_crash_report_json(&data_dir, prefix, &payload)?;
 
-    if config.auto_send_crash_reports {
+    if can_send {
         if let Some(endpoint) = resolve_telemetry_endpoint() {
             let url = format!("{endpoint}/v1/report/crash");
             match post_report_json(&url, &payload, Duration::from_secs(10)).await {
@@ -1025,10 +1058,10 @@ fn sanitize_crash_payload(mut payload: WorkerCrashReportPayload) -> WorkerCrashR
 }
 
 /// Flush any `crashes/pending-*.json` reports left from previous runs when
-/// `config.auto_send_crash_reports` is true and a telemetry endpoint is configured.
+/// `config.can_send_crash_reports()` is true and a telemetry endpoint is configured.
 pub async fn flush_pending_crash_reports(app: &AppHandle) -> Result<u32> {
     let config = storage::load_config(app)?;
-    if !config.auto_send_crash_reports {
+    if !config.can_send_crash_reports() {
         return Ok(0);
     }
     let Some(endpoint) = resolve_telemetry_endpoint() else {
@@ -1129,8 +1162,8 @@ pub fn install_panic_hook() {
                 let data_dir = current_app_data_dir();
                 let config_path = current_config_path_from_data_dir(&data_dir);
                 let auto_send = storage::load_config_from_path(&config_path)
-                    .map(|c| c.auto_send_crash_reports)
-                    .unwrap_or(true);
+                    .map(|c| c.can_send_crash_reports())
+                    .unwrap_or(false);
 
                 let log_excerpt = collect_sanitized_log_excerpt(&data_dir);
                 let req = CrashReportRequest {
@@ -1269,8 +1302,8 @@ pub fn record_subprocess_failure_async(tool: &str, detail: &str) {
 
     let task = async move {
         let auto_send = storage::load_config_from_path(&config_path)
-            .map(|c| c.auto_send_crash_reports)
-            .unwrap_or(true);
+            .map(|c| c.can_send_crash_reports())
+            .unwrap_or(false);
 
         let Ok((saved_path, payload)) = write_subprocess_failure_report_to_data_dir(
             &data_dir,
@@ -1306,6 +1339,255 @@ pub fn record_subprocess_failure_async(tool: &str, detail: &str) {
             }
         });
     }
+}
+
+// ---------------------------------------------------------------------------
+// Rotating Monthly Cohort Salt & Opt-In Telemetry Senders (Levels 1-3)
+// ---------------------------------------------------------------------------
+
+/// Ensure `config.telemetry_cohort_salt` is populated with a random 32-char hex
+/// UUID v4 secret and rotated whenever the UTC `"YYYY-MM"` calendar month changes.
+/// Returns `true` only when `config` was modified.
+pub fn ensure_monthly_cohort_salt_for_month(config: &mut AppConfig, current_month: &str) -> bool {
+    if config.telemetry_cohort_month != current_month || config.telemetry_cohort_salt.trim().is_empty() {
+        config.telemetry_cohort_salt = Uuid::new_v4().simple().to_string();
+        config.telemetry_cohort_month = current_month.to_string();
+        true
+    } else {
+        false
+    }
+}
+
+/// Ensure `config.telemetry_cohort_salt` is generated and rotated for the current UTC month.
+/// Never derived from hardware, MAC, or OS machine identifiers.
+pub fn ensure_monthly_cohort_salt(config: &mut AppConfig) -> bool {
+    let current_month = Utc::now().format("%Y-%m").to_string();
+    ensure_monthly_cohort_salt_for_month(config, &current_month)
+}
+
+async fn post_telemetry_json_silent<T: Serialize>(url: String, payload: T) {
+    let Ok(client) = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .connect_timeout(Duration::from_secs(5))
+        .timeout(Duration::from_secs(5))
+        .build()
+    else {
+        return;
+    };
+
+    match client.post(&url).json(&payload).send().await {
+        Ok(resp) if !resp.status().is_success() => {
+            tracing::debug!(
+                target: "easysrt::telemetry",
+                status = %resp.status(),
+                "Non-2xx telemetry response from {url}"
+            );
+        }
+        Err(err) => {
+            tracing::debug!(
+                target: "easysrt::telemetry",
+                "Telemetry upload skipped/failed for {url}: {err}"
+            );
+        }
+        Ok(_) => {}
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerExportTelemetryPayload {
+    pub app_version: String,
+    pub os: String,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub translation_style: String,
+    pub address_form: String,
+    pub metrics: ExportDiffMetrics,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ngram_diffs: Vec<SafeNgramDiff>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerTrainingPairsPayload {
+    pub app_version: String,
+    pub pairs: Vec<TrainingCuePair>,
+}
+
+pub fn current_app_version() -> &'static str {
+    APP_VERSION
+}
+
+/// Emit Level 1 pipeline performance metrics (`POST /v1/telemetry/job-metrics`)
+/// asynchronously and fail-silently with a <= 5s timeout.
+pub fn send_job_metrics_async(payload: JobMetricsPayload) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(endpoint) = resolve_telemetry_endpoint() else {
+        return;
+    };
+    let url = format!("{endpoint}/v1/telemetry/job-metrics");
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(post_telemetry_json_silent(url, payload));
+    }
+}
+
+/// Emit Level 2A/2B export diff metrics and K-anonymous n-gram diffs (`POST /v1/telemetry/export`)
+/// asynchronously and fail-silently with a <= 5s timeout.
+pub fn send_export_telemetry_async(payload: WorkerExportTelemetryPayload) {
+    if cfg!(test) {
+        return;
+    }
+    let Some(endpoint) = resolve_telemetry_endpoint() else {
+        return;
+    };
+    let url = format!("{endpoint}/v1/telemetry/export");
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(post_telemetry_json_silent(url, payload));
+    }
+}
+
+/// Emit Level 3 anonymized edit-pair corpus (`POST /v1/telemetry/training-pairs`, max 25 pairs)
+/// asynchronously and fail-silently with a <= 5s timeout.
+pub fn send_training_pairs_async(mut pairs: Vec<TrainingCuePair>) {
+    if cfg!(test) || pairs.is_empty() {
+        return;
+    }
+    pairs.truncate(25);
+    let Some(endpoint) = resolve_telemetry_endpoint() else {
+        return;
+    };
+    let url = format!("{endpoint}/v1/telemetry/training-pairs");
+    let payload = WorkerTrainingPairsPayload {
+        app_version: APP_VERSION.to_string(),
+        pairs,
+    };
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(post_telemetry_json_silent(url, payload));
+    }
+}
+
+/// Build anonymized, realistic JSON sample payloads for the live Privacy Payload Inspector UI.
+pub fn build_telemetry_sample_payloads_with_env(
+    telemetry_disabled_by_env: bool,
+) -> TelemetrySamplePayloads {
+    let platform = setup_manager::current_platform_tag();
+    let os = std::env::consts::OS;
+
+    let crash_report = serde_json::json!({
+        "appVersion": APP_VERSION,
+        "crashKind": "subprocess_crash",
+        "fingerprint": "9f4c2a1b8e7d6c50",
+        "message": "whisper-cli: failed to allocate CUDA buffer",
+        "stackTrace": "at C:\\Users\\<USER>\\AppData\\Local\\com.easysrt.studio\\bin\\whisper-cli.exe",
+        "source": "whisper-cli",
+        "platform": platform,
+        "gpu": "NVIDIA GeForce RTX 4060 (8188 MB VRAM, driver 555.85, CUDA 12.4: supported, tier Vram8Gb)",
+        "diagnostics": "## System Diagnostics\n- **App Version**: ..."
+    });
+
+    let job_and_edit_metrics = serde_json::json!({
+        "jobMetrics": {
+            "appVersion": APP_VERSION,
+            "os": os,
+            "gpuTier": "vram8Gb",
+            "whisperBackend": "cuda",
+            "whisperModelId": "whisper-large-v3-turbo-q5_0",
+            "llmProvider": "localLlama",
+            "llmModelId": "llm-gemma3-4b-q4km",
+            "audioDurationMs": 180000,
+            "whisperElapsedMs": 14200,
+            "diarizerElapsedMs": 650,
+            "llmElapsedMs": 22400,
+            "asrRtf": 0.079,
+            "llmRtf": 0.124,
+            "oomCpuFallback": false,
+            "batchSubdivisionRetries": 0,
+            "cueCount": 42,
+            "sourceLang": "en",
+            "targetLang": "sr",
+            "translationStyle": "natural",
+            "addressForm": "auto",
+            "preset": "standard"
+        },
+        "exportDiff": {
+            "appVersion": APP_VERSION,
+            "os": os,
+            "sourceLang": "en",
+            "targetLang": "sr",
+            "translationStyle": "natural",
+            "addressForm": "auto",
+            "metrics": {
+                "totalBaselineCues": 42,
+                "totalFinalCues": 43,
+                "unchangedCuesCount": 31,
+                "textEditedCuesCount": 11,
+                "editRatePct": 26.2,
+                "initialHighCpsCount": 4,
+                "finalHighCpsCount": 0,
+                "initialLineTooLongCount": 2,
+                "finalLineTooLongCount": 0,
+                "avgCpsBefore": 15.8,
+                "avgCpsAfter": 14.2,
+                "condenseCpsUsed": false,
+                "encliticReorderedCount": 2,
+                "redundantPossessiveRemovedCount": 1,
+                "passiveCalqueRemovedCount": 0,
+                "conjunctionCommaFixedCount": 1,
+                "missedFillerDeletedCount": 1,
+                "inflectionSuffixFixCount": 3,
+                "boundaryOrphanShiftedCount": 1,
+                "splitCount": 1,
+                "splitAfterCommaCount": 1,
+                "splitAfterConjunctionCount": 0,
+                "avgPreSplitChars": 78.0,
+                "avgPreSplitDurationMs": 5400.0,
+                "mergeCount": 0,
+                "avgMergedShortCueDurationMs": 0.0,
+                "avgMergedShortCueChars": 0.0,
+                "avgMergedGapMs": 0.0,
+                "startTrimCount": 2,
+                "avgStartDeltaMs": -60.0,
+                "endTrimCount": 3,
+                "avgEndDeltaMs": 140.0
+            },
+            "ngramDiffs": [
+                {
+                    "langPair": "en->sr",
+                    "oldSpan": "tijekom",
+                    "newSpan": "tokom",
+                    "cohortProof": "a3f19c8e4b2d017a9e6c12f4"
+                }
+            ]
+        }
+    });
+
+    let training_pair = serde_json::json!({
+        "appVersion": APP_VERSION,
+        "pairs": [
+            {
+                "sourceLang": "en",
+                "targetLang": "sr",
+                "style": "natural",
+                "addressForm": "auto",
+                "sourceText": "We spoke with [NAME] for [NUM] minutes yesterday.",
+                "initialAiText": "Razgovarali smo sa [NAME] [NUM] minuta juče.",
+                "finalHumanText": "Juče smo [NUM] minuta razgovarali sa [NAME]."
+            }
+        ]
+    });
+
+    TelemetrySamplePayloads {
+        crash_report,
+        job_and_edit_metrics,
+        training_pair,
+        telemetry_disabled_by_env,
+    }
+}
+
+pub fn build_telemetry_sample_payloads() -> TelemetrySamplePayloads {
+    build_telemetry_sample_payloads_with_env(is_telemetry_disabled_by_env())
 }
 
 #[cfg(test)]
@@ -1553,5 +1835,71 @@ mod tests {
             ),
             Some("https://custom.example.org".to_string())
         );
+        // DO_NOT_TRACK=1 or true disables endpoint regardless of default/override
+        assert_eq!(
+            resolve_telemetry_endpoint_with_dnt(Some("1"), None, None, DEFAULT_TELEMETRY_URL),
+            None
+        );
+        assert_eq!(
+            resolve_telemetry_endpoint_with_dnt(
+                Some("true"),
+                Some("https://custom.example.org"),
+                None,
+                DEFAULT_TELEMETRY_URL
+            ),
+            None
+        );
+        assert_eq!(
+            resolve_telemetry_endpoint_with_dnt(Some("0"), None, None, DEFAULT_TELEMETRY_URL),
+            Some("https://easysrt-telemetry.ig-systems.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn monthly_cohort_salt_generates_and_rotates_by_month() {
+        let mut cfg = AppConfig::default();
+        assert!(cfg.telemetry_cohort_salt.is_empty());
+
+        assert!(ensure_monthly_cohort_salt_for_month(&mut cfg, "2026-11"));
+        assert_eq!(cfg.telemetry_cohort_month, "2026-11");
+        assert_eq!(cfg.telemetry_cohort_salt.len(), 32);
+        assert!(cfg.telemetry_cohort_salt.chars().all(|c| c.is_ascii_hexdigit()));
+
+        let first_salt = cfg.telemetry_cohort_salt.clone();
+        assert!(!ensure_monthly_cohort_salt_for_month(&mut cfg, "2026-11"));
+        assert_eq!(cfg.telemetry_cohort_salt, first_salt);
+
+        assert!(ensure_monthly_cohort_salt_for_month(&mut cfg, "2026-12"));
+        assert_eq!(cfg.telemetry_cohort_month, "2026-12");
+        assert_ne!(cfg.telemetry_cohort_salt, first_salt);
+        assert_eq!(cfg.telemetry_cohort_salt.len(), 32);
+    }
+
+    #[test]
+    fn sample_payloads_contain_expected_anonymized_sections() {
+        let samples = build_telemetry_sample_payloads_with_env(true);
+        assert!(samples.telemetry_disabled_by_env);
+        assert_eq!(
+            samples.crash_report.get("crashKind").and_then(|v| v.as_str()),
+            Some("subprocess_crash")
+        );
+        assert!(samples
+            .job_and_edit_metrics
+            .get("jobMetrics")
+            .and_then(|v| v.get("asrRtf"))
+            .is_some());
+        assert!(samples
+            .job_and_edit_metrics
+            .get("exportDiff")
+            .and_then(|v| v.get("ngramDiffs"))
+            .is_some());
+        let src = samples
+            .training_pair
+            .get("pairs")
+            .and_then(|v| v.get(0))
+            .and_then(|v| v.get("sourceText"))
+            .and_then(|v| v.as_str())
+            .unwrap();
+        assert!(src.contains("[NAME]") && src.contains("[NUM]"));
     }
 }

@@ -277,7 +277,13 @@ impl Default for ExportOptions {
     }
 }
 
+pub const CURRENT_PRIVACY_CONSENT_VERSION: u32 = 1;
+
 fn default_auto_send_crash_reports() -> bool {
+    false
+}
+
+fn default_auto_check_updates() -> bool {
     true
 }
 
@@ -318,8 +324,22 @@ pub struct AppConfig {
     pub default_script: SerbianScript,
     pub export: ExportOptions,
     pub has_completed_setup: bool,
+    #[serde(default)]
+    pub privacy_consent_version: u32,
     #[serde(default = "default_auto_send_crash_reports")]
     pub auto_send_crash_reports: bool,
+    #[serde(default)]
+    pub share_anonymous_usage_metrics: bool,
+    #[serde(default)]
+    pub share_anonymized_translation_edits: bool,
+    #[serde(default = "default_auto_check_updates")]
+    pub auto_check_updates: bool,
+    #[serde(default)]
+    pub last_update_check_epoch_sec: u64,
+    #[serde(default)]
+    pub telemetry_cohort_salt: String,
+    #[serde(default)]
+    pub telemetry_cohort_month: String,
     #[serde(default = "default_editor_source_font_size")]
     pub editor_source_font_size: u32,
     #[serde(default = "default_editor_translated_font_size")]
@@ -332,6 +352,24 @@ pub struct AppConfig {
     pub follow_playhead: bool,
     #[serde(default)]
     pub allow_local_encrypted_vault: bool,
+}
+
+impl AppConfig {
+    pub fn has_valid_privacy_consent(&self) -> bool {
+        self.privacy_consent_version >= CURRENT_PRIVACY_CONSENT_VERSION
+    }
+
+    pub fn can_send_crash_reports(&self) -> bool {
+        self.has_valid_privacy_consent() && self.auto_send_crash_reports
+    }
+
+    pub fn can_share_usage_metrics(&self) -> bool {
+        self.has_valid_privacy_consent() && self.share_anonymous_usage_metrics
+    }
+
+    pub fn can_share_translation_edits(&self) -> bool {
+        self.has_valid_privacy_consent() && self.share_anonymized_translation_edits
+    }
 }
 
 impl Default for AppConfig {
@@ -347,7 +385,14 @@ impl Default for AppConfig {
             default_script: SerbianScript::Latin,
             export: ExportOptions::default(),
             has_completed_setup: false,
+            privacy_consent_version: 0,
             auto_send_crash_reports: default_auto_send_crash_reports(),
+            share_anonymous_usage_metrics: false,
+            share_anonymized_translation_edits: false,
+            auto_check_updates: default_auto_check_updates(),
+            last_update_check_epoch_sec: 0,
+            telemetry_cohort_salt: String::new(),
+            telemetry_cohort_month: String::new(),
             editor_source_font_size: default_editor_source_font_size(),
             editor_translated_font_size: default_editor_translated_font_size(),
             auto_probe_on_import: default_auto_probe_on_import(),
@@ -552,6 +597,54 @@ pub struct DiagnosticsPreview {
     pub telemetry_endpoint: Option<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct JobMetricsPayload {
+    pub app_version: String,
+    pub os: String,
+    pub gpu_tier: String,
+    pub whisper_backend: String,
+    pub whisper_model_id: String,
+    pub llm_provider: String,
+    pub llm_model_id: String,
+    pub audio_duration_ms: u64,
+    pub whisper_elapsed_ms: u64,
+    pub diarizer_elapsed_ms: u64,
+    pub llm_elapsed_ms: u64,
+    pub asr_rtf: f64,
+    pub llm_rtf: f64,
+    pub oom_cpu_fallback: bool,
+    pub batch_subdivision_retries: u32,
+    pub cue_count: u32,
+    pub source_lang: String,
+    pub target_lang: String,
+    pub translation_style: String,
+    pub address_form: String,
+    pub preset: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct UpdateCheckResult {
+    pub checked: bool,
+    pub skipped_reason: Option<String>,
+    pub update_available: bool,
+    pub current_version: String,
+    pub latest_version: Option<String>,
+    pub release_notes: Option<String>,
+    pub release_date: Option<String>,
+    pub last_update_check_epoch_sec: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TelemetrySamplePayloads {
+    pub crash_report: serde_json::Value,
+    pub job_and_edit_metrics: serde_json::Value,
+    pub training_pair: serde_json::Value,
+    pub telemetry_disabled_by_env: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -741,7 +834,8 @@ mod tests {
             formal_opts
         );
 
-        // Legacy AppConfig JSON without `autoSendCrashReports` must deserialize with true
+        // Legacy AppConfig JSON without `autoSendCrashReports` or `privacyConsentVersion`
+        // must deserialize with both disabled (`false` / `0`) for GDPR explicit opt-in compliance
         let legacy_cfg_json = json!({
             "uiLanguage": "sr",
             "modelsDirOverride": null,
@@ -755,9 +849,50 @@ mod tests {
             "hasCompletedSetup": true
         });
         let legacy_cfg: AppConfig = serde_json::from_value(legacy_cfg_json).unwrap();
-        assert!(legacy_cfg.auto_send_crash_reports);
+        assert_eq!(legacy_cfg.privacy_consent_version, 0);
+        assert!(!legacy_cfg.auto_send_crash_reports);
+        assert!(!legacy_cfg.share_anonymous_usage_metrics);
+        assert!(!legacy_cfg.share_anonymized_translation_edits);
+        assert!(legacy_cfg.auto_check_updates);
+        assert_eq!(legacy_cfg.last_update_check_epoch_sec, 0);
+        assert!(!legacy_cfg.can_send_crash_reports());
+        assert!(!legacy_cfg.can_share_usage_metrics());
+        assert!(!legacy_cfg.can_share_translation_edits());
         let cfg_val = serde_json::to_value(&legacy_cfg).unwrap();
-        assert_eq!(cfg_val.get("autoSendCrashReports"), Some(&json!(true)));
+        assert_eq!(cfg_val.get("privacyConsentVersion"), Some(&json!(0)));
+        assert_eq!(cfg_val.get("autoSendCrashReports"), Some(&json!(false)));
+        assert_eq!(cfg_val.get("shareAnonymousUsageMetrics"), Some(&json!(false)));
+        assert_eq!(cfg_val.get("shareAnonymizedTranslationEdits"), Some(&json!(false)));
+        assert_eq!(cfg_val.get("autoCheckUpdates"), Some(&json!(true)));
+        assert_eq!(cfg_val.get("lastUpdateCheckEpochSec"), Some(&json!(0)));
+
+        // v0.4.0 upgrader with autoSendCrashReports: true but privacyConsentVersion: 0
+        // MUST NOT be allowed to send crash reports until confirming consent in v0.5.0
+        let v040_upgrader_cfg: AppConfig = serde_json::from_value(json!({
+            "uiLanguage": "en",
+            "modelsDirOverride": null,
+            "activeWhisperModelId": null,
+            "activeLlmModelId": null,
+            "customModels": [],
+            "translation": TranslationConfig::default(),
+            "defaultSegmentRules": SegmentRules::default(),
+            "defaultScript": "latin",
+            "export": ExportOptions::default(),
+            "hasCompletedSetup": true,
+            "autoSendCrashReports": true
+        }))
+        .unwrap();
+        assert!(v040_upgrader_cfg.auto_send_crash_reports);
+        assert_eq!(v040_upgrader_cfg.privacy_consent_version, 0);
+        assert!(!v040_upgrader_cfg.can_send_crash_reports());
+
+        let mut consented_cfg = v040_upgrader_cfg;
+        consented_cfg.privacy_consent_version = CURRENT_PRIVACY_CONSENT_VERSION;
+        consented_cfg.share_anonymous_usage_metrics = true;
+        consented_cfg.share_anonymized_translation_edits = true;
+        assert!(consented_cfg.can_send_crash_reports());
+        assert!(consented_cfg.can_share_usage_metrics());
+        assert!(consented_cfg.can_share_translation_edits());
 
         // Legacy GpuInfo JSON without new CUDA fields must deserialize cleanly
         let legacy_gpu_json = json!({

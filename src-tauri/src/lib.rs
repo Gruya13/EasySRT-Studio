@@ -76,6 +76,9 @@ pub fn run() {
             commands::submit_crash_report,
             commands::flush_pending_crash_reports,
             commands::save_diagnostics_local,
+            commands::get_telemetry_sample_payloads,
+            commands::check_app_update,
+            commands::get_project_modified_cue_count,
         ])
         .run(tauri::generate_context!())
         .expect("error while running EasySRT Studio");

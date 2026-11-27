@@ -4,14 +4,15 @@ use crate::models::{
     ApiKeyStatus, AppConfig, BugReportRequest, CatalogItemKind, CatalogManifest,
     CrashReportRequest, CustomModelEntry, DiagnosticsPreview, ExportOptions, ExportResult,
     InstalledComponentStatus, JobOptions, MediaProbeResult, ReportSubmitResult, SegmentRules,
-    SerbianScript, SetupStatus, SubtitleCue, SubtitleProject, TranslationProviderKind,
-    WaveformPreviewData,
+    SerbianScript, SetupStatus, SubtitleCue, SubtitleProject, TelemetrySamplePayloads,
+    TranslationProviderKind, UpdateCheckResult, WaveformPreviewData,
 };
 use crate::pipeline::{self, PipelineState};
 use crate::{diagnostics, setup_manager, storage};
 use std::path::{Path, PathBuf};
 use std::sync::{atomic::AtomicBool, Arc};
 use tauri::{AppHandle, Manager, State};
+use tauri_plugin_updater::UpdaterExt;
 
 const DEFAULT_WAVEFORM_BUCKETS: u32 = 2_000;
 const MAX_WAVEFORM_BUCKETS: u32 = 16_384;
@@ -299,12 +300,22 @@ pub async fn convert_cues_script(
 }
 
 #[tauri::command]
+pub async fn get_project_modified_cue_count(
+    app: AppHandle,
+    job_id: String,
+) -> Result<usize, String> {
+    run_blocking(move || pipeline::get_project_modified_cue_count(&app, &job_id)).await
+}
+
+#[tauri::command]
 pub async fn export_subtitles(
     app: AppHandle,
     project: SubtitleProject,
     options: ExportOptions,
+    skip_training_donation: Option<bool>,
 ) -> Result<ExportResult, String> {
-    run_blocking(move || pipeline::export_subtitles(&app, project, options)).await
+    run_blocking(move || pipeline::export_subtitles(&app, project, options, skip_training_donation))
+        .await
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +553,136 @@ pub async fn flush_pending_crash_reports(app: AppHandle) -> Result<u32, String> 
 #[tauri::command]
 pub async fn save_diagnostics_local(app: AppHandle) -> Result<String, String> {
     run_blocking(move || diagnostics::save_diagnostics_local(&app)).await
+}
+
+#[tauri::command]
+pub async fn get_telemetry_sample_payloads() -> Result<TelemetrySamplePayloads, String> {
+    Ok(diagnostics::build_telemetry_sample_payloads())
+}
+
+const DIRECT_GITHUB_UPDATER_ENDPOINT: &str =
+    "https://github.com/Gruya13/EasySRT-Studio/releases/latest/download/latest.json";
+const AUTO_UPDATE_CHECK_INTERVAL_SECS: u64 = 86_400;
+
+/// Checks for application updates via the Rust HTTP updater client (`tauri-plugin-updater`)
+/// so the WebView CSP (`connect-src`) never needs external domains.
+///
+/// Respects `auto_check_updates`, the 24-hour rate limit, and `DO_NOT_TRACK=1` /
+/// `EASYSRT_TELEMETRY_URL=off` on automatic (`!force`) checks. When `force == true` and
+/// telemetry is disabled by env, uses ONLY the direct GitHub fallback endpoint.
+#[tauri::command]
+pub async fn check_app_update(app: AppHandle, force: bool) -> Result<UpdateCheckResult, String> {
+    let current_version = env!("CARGO_PKG_VERSION").to_string();
+    let now_sec = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+
+    let app_for_cfg = app.clone();
+    let config = run_blocking(move || storage::load_config(&app_for_cfg)).await?;
+    let disabled_by_env = diagnostics::is_telemetry_disabled_by_env();
+
+    if !force {
+        if disabled_by_env {
+            return Ok(UpdateCheckResult {
+                checked: false,
+                skipped_reason: Some("telemetry_disabled_by_env".to_string()),
+                update_available: false,
+                current_version,
+                latest_version: None,
+                release_notes: None,
+                release_date: None,
+                last_update_check_epoch_sec: config.last_update_check_epoch_sec,
+            });
+        }
+        if !config.auto_check_updates {
+            return Ok(UpdateCheckResult {
+                checked: false,
+                skipped_reason: Some("auto_check_disabled".to_string()),
+                update_available: false,
+                current_version,
+                latest_version: None,
+                release_notes: None,
+                release_date: None,
+                last_update_check_epoch_sec: config.last_update_check_epoch_sec,
+            });
+        }
+        if config.last_update_check_epoch_sec > 0
+            && now_sec.saturating_sub(config.last_update_check_epoch_sec)
+                < AUTO_UPDATE_CHECK_INTERVAL_SECS
+        {
+            return Ok(UpdateCheckResult {
+                checked: false,
+                skipped_reason: Some("checked_recently".to_string()),
+                update_available: false,
+                current_version,
+                latest_version: None,
+                release_notes: None,
+                release_date: None,
+                last_update_check_epoch_sec: config.last_update_check_epoch_sec,
+            });
+        }
+    }
+
+    let recorded_epoch_sec = if !disabled_by_env {
+        let app_for_save = app.clone();
+        run_blocking(move || {
+            storage::update_config(&app_for_save, |cfg| {
+                cfg.last_update_check_epoch_sec = now_sec;
+            })
+        })
+        .await?;
+        now_sec
+    } else {
+        config.last_update_check_epoch_sec
+    };
+
+    let updater = if disabled_by_env {
+        let fallback_url = reqwest::Url::parse(DIRECT_GITHUB_UPDATER_ENDPOINT)
+            .map_err(|e| format!("Invalid fallback updater URL: {e}"))?;
+        app.updater_builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .endpoints(vec![fallback_url])
+            .map_err(|e| e.to_string())?
+            .build()
+            .map_err(|e| e.to_string())?
+    } else {
+        app.updater_builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .map_err(|e| e.to_string())?
+    };
+
+    match updater.check().await {
+        Ok(Some(update)) => {
+            let latest_version = update.version.trim().trim_start_matches(['v', 'V']).to_string();
+            let release_date = update.date.and_then(|d| {
+                chrono::DateTime::from_timestamp(d.unix_timestamp(), d.nanosecond())
+                    .map(|dt| dt.to_rfc3339())
+            });
+            Ok(UpdateCheckResult {
+                checked: true,
+                skipped_reason: None,
+                update_available: true,
+                current_version,
+                latest_version: Some(latest_version),
+                release_notes: update.body,
+                release_date,
+                last_update_check_epoch_sec: recorded_epoch_sec,
+            })
+        }
+        Ok(None) => Ok(UpdateCheckResult {
+            checked: true,
+            skipped_reason: None,
+            update_available: false,
+            current_version: current_version.clone(),
+            latest_version: Some(current_version),
+            release_notes: None,
+            release_date: None,
+            last_update_check_epoch_sec: recorded_epoch_sec,
+        }),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 #[cfg(test)]
