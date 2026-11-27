@@ -6,6 +6,8 @@ export default defineConfig({
     name: "easysrt-telemetry",
     entrypoint: "./src/index.ts",
     compatibilityDate: "2026-11-23",
+    workersDev: false,
+    domains: ["easysrt-telemetry.ig-systems.rs"],
     // Zero-IP / PRIVACY.md alignment: disable automatic HTTP invocation logs and traces
     // (which can capture client metadata/headers) and redact URL query strings.
     // Only explicit PII-free JSON console events emitted by src/index.ts are recorded.
