@@ -8,13 +8,13 @@
 
 *Pretvorite bilo koji audio ili video snimak u čiste, televizijski spremne titlove u dvostrukom Cinema editoru — uz instalaciju u jednom koraku, 100% oflajn privatnost ili hibridnu brzinu do **28x brže od realnog vremena**.*
 
-[![Izdanje v0.4.0](https://img.shields.io/badge/izdanje-v0.4.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+[![Izdanje v0.5.0](https://img.shields.io/badge/izdanje-v0.5.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 [![Licenca: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-10b981?style=for-the-badge)](LICENSE)
 [![Platforme](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-6366f1?style=for-the-badge)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
-### [Preuzmi EasySRT Studio v0.4.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+### [Preuzmi EasySRT Studio v0.5.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
-[Korisnički vodič](docs/user/sr/guide.md) · [Rešavanje problema i FAQ](docs/user/sr/troubleshooting.md) · [Istorija izdanja](CHANGELOG.md)
+[Korisnički vodič](docs/user/sr/guide.md) · [Rešavanje problema i FAQ](docs/user/sr/troubleshooting.md) · [Politika privatnosti](PRIVACY.md) · [Istorija izdanja](CHANGELOG.md)
 
 </div>
 
@@ -52,7 +52,11 @@ Trebaju vam prečice na tastaturi, saveti za grafičku karticu ili pomoć oko po
 
 ## Privatnost, bezbednost i ažuriranja
 
-Vaši audio i video snimci nikada ne napuštaju vaš računar. API ključevi se čuvaju u bezbednom sistemskom trezoru (OS Keyring ili šifrovani lokalni trezor), potpisana ugrađena ažuriranja održavaju program aktuelnim jednim klikom, a predloge ili prijave grešaka bez ličnih podataka možete poslati direktno iz podnožja aplikacije.
+- **Zero-PII oflajn osnova:** Audio i video snimci, kompletni transkripti i API ključevi nikada se ne šalju ka IG-Systems serverima. API ključevi se čuvaju u sistemskom trezoru (OS Keyring ili opcioni šifrovani lokalni trezor).
+- **Izričita GDPR i ZZPL dobrovoljna telemetrija:** Izveštaji o padovima, metrike brzine i strukture titlova, K-anonimne (`k >= 5`) leksičke izmene malim slovima i `[NAME]`/`[NUM]` maskirani parovi za obuku su **podrazumevano isključeni**, uz ugrađen pregled tačnog JSON sadržaja pre pristanka (kao i globalne prekidače `DO_NOT_TRACK=1` i `EASYSRT_TELEMETRY_URL=off`).
+- **Potpisano 24h automatsko ažuriranje:** Ugrađena provera `minisign`-potpisanih izdanja radi jednom u 24 sata preko proksija bez čuvanja IP adresa (`easysrt-telemetry.ig-systems.rs`, uz automatski rezervu na GitHub Releases) i može se isključiti u Podešavanjima.
+
+Pročitajte kompletnu **[Politiku privatnosti (`PRIVACY.md`)](PRIVACY.md)** za tačne JSON šeme, rokove čuvanja i kontrole privatnosti.
 
 ---
 

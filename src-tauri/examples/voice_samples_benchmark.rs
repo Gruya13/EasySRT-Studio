@@ -297,6 +297,7 @@ async fn main() -> Result<()> {
                 } else {
                     TranslationProviderKind::LocalLlama
                 }),
+                ..JobOptions::default()
             },
             words: whisper_out.words,
             cues,

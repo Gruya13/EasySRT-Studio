@@ -4,6 +4,7 @@
 use crate::models::{
     ApiKeyStatus, AppConfig, StorageMode, StoragePaths, SubtitleProject, TranslationProviderKind,
 };
+use crate::pipeline::telemetry_diff::AiBaselineCue;
 use anyhow::{anyhow, Context, Result};
 use serde::{Deserialize, Serialize};
 #[cfg(any(not(windows), test))]
@@ -1248,6 +1249,88 @@ fn checkpoint_file_path(data_dir: &Path, job_id: &str) -> Result<PathBuf> {
     Ok(candidate)
 }
 
+fn baseline_file_path(data_dir: &Path, job_id: &str) -> Result<PathBuf> {
+    validate_job_id(job_id)?;
+    let checkpoints_dir = data_dir.join("checkpoints");
+    let candidate = checkpoints_dir.join(format!("{}.baseline.json", job_id));
+    if candidate.parent() != Some(checkpoints_dir.as_path()) {
+        return Err(anyhow!(
+            "Invalid baseline path outside checkpoints directory for job '{}'",
+            job_id
+        ));
+    }
+    Ok(candidate)
+}
+
+/// Save AI baseline cues atomically inside `<data_dir>/checkpoints/<job_id>.baseline.json`.
+pub fn save_baseline_cues_to_data_dir(
+    data_dir: &Path,
+    job_id: &str,
+    cues: &[AiBaselineCue],
+) -> Result<()> {
+    let path = baseline_file_path(data_dir, job_id)?;
+    let bytes = serde_json::to_vec(cues)
+        .with_context(|| format!("Failed to serialize baseline cues for job {job_id}"))?;
+    atomic_write_bytes(&path, &bytes)
+}
+
+/// Load AI baseline cues from `<data_dir>/checkpoints/<job_id>.baseline.json` (returns empty vec if absent).
+pub fn load_baseline_cues_from_data_dir(
+    data_dir: &Path,
+    job_id: &str,
+) -> Result<Vec<AiBaselineCue>> {
+    let path = baseline_file_path(data_dir, job_id)?;
+    if !path.is_file() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(&path)
+        .with_context(|| format!("Failed to read baseline cues file: {}", path.display()))?;
+    let cues: Vec<AiBaselineCue> = serde_json::from_str(&raw)
+        .with_context(|| format!("Failed to parse baseline cues JSON: {}", path.display()))?;
+    Ok(cues)
+}
+
+/// Delete `<data_dir>/checkpoints/<job_id>.baseline.json` if it exists.
+pub fn delete_baseline_cues_from_data_dir(data_dir: &Path, job_id: &str) -> Result<()> {
+    let path = baseline_file_path(data_dir, job_id)?;
+    if path.is_file() {
+        fs::remove_file(&path)
+            .with_context(|| format!("Failed to delete baseline cues file: {}", path.display()))?;
+    }
+    Ok(())
+}
+
+/// Save AI baseline cues sidecar using resolved `StoragePaths`.
+pub fn save_baseline_cues_for_paths(
+    paths: &StoragePaths,
+    job_id: &str,
+    cues: &[AiBaselineCue],
+) -> Result<()> {
+    validate_job_id(job_id)?;
+    save_baseline_cues_to_data_dir(Path::new(&paths.data_dir), job_id, cues)
+}
+
+/// Load AI baseline cues sidecar using resolved `StoragePaths`.
+pub fn load_baseline_cues_for_paths(
+    paths: &StoragePaths,
+    job_id: &str,
+) -> Result<Vec<AiBaselineCue>> {
+    validate_job_id(job_id)?;
+    load_baseline_cues_from_data_dir(Path::new(&paths.data_dir), job_id)
+}
+
+/// Save AI baseline cues sidecar for `job_id`.
+pub fn save_baseline_cues(app: &AppHandle, job_id: &str, cues: &[AiBaselineCue]) -> Result<()> {
+    let paths = resolve_storage_paths(app, None)?;
+    save_baseline_cues_for_paths(&paths, job_id, cues)
+}
+
+/// Load AI baseline cues sidecar for `job_id`.
+pub fn load_baseline_cues(app: &AppHandle, job_id: &str) -> Result<Vec<AiBaselineCue>> {
+    let paths = resolve_storage_paths(app, None)?;
+    load_baseline_cues_for_paths(&paths, job_id)
+}
+
 /// Save a `SubtitleProject` checkpoint atomically inside `<data_dir>/checkpoints/<job_id>.easysrt.json`.
 pub fn save_checkpoint_to_data_dir(data_dir: &Path, project: &SubtitleProject) -> Result<()> {
     let path = checkpoint_file_path(data_dir, &project.job_id)?;
@@ -1351,13 +1434,14 @@ pub fn load_checkpoint_for_paths(paths: &StoragePaths, job_id: &str) -> Result<S
     load_checkpoint_from_data_dir(Path::new(&paths.data_dir), job_id)
 }
 
-/// Delete a specific `SubtitleProject` checkpoint by `job_id` from `<data_dir>/checkpoints/`.
+/// Delete a specific `SubtitleProject` checkpoint (and any `.baseline.json` sidecar) by `job_id` from `<data_dir>/checkpoints/`.
 pub fn delete_checkpoint_from_data_dir(data_dir: &Path, job_id: &str) -> Result<()> {
     let path = checkpoint_file_path(data_dir, job_id)?;
     if path.is_file() {
         fs::remove_file(&path)
             .with_context(|| format!("Failed to delete checkpoint file: {}", path.display()))?;
     }
+    delete_baseline_cues_from_data_dir(data_dir, job_id)?;
     Ok(())
 }
 
@@ -2032,6 +2116,47 @@ mod tests {
                 .map(String::as_str),
             Some("Dobro jutro.")
         );
+
+        let _ = fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn baseline_sidecar_crud_ignored_by_checkpoint_list_and_deleted_with_checkpoint() {
+        let base = make_temp_dir("baseline_sidecar");
+        let paths = resolve_storage_paths_from_root(&base, StorageMode::Installed, None).unwrap();
+        let data_dir = Path::new(&paths.data_dir);
+
+        let proj = sample_project("job-baseline-01");
+        save_checkpoint_for_paths(&paths, &proj).unwrap();
+
+        // Missing sidecar returns empty Vec
+        assert!(load_baseline_cues_for_paths(&paths, "job-baseline-01")
+            .unwrap()
+            .is_empty());
+
+        let baseline = vec![AiBaselineCue {
+            id: 1,
+            start_ms: 0,
+            end_ms: 1500,
+            source_text: "Hello world".to_string(),
+            translated_text: "Zdravo svete".to_string(),
+        }];
+        save_baseline_cues_for_paths(&paths, "job-baseline-01", &baseline).unwrap();
+
+        let loaded_baseline = load_baseline_cues_for_paths(&paths, "job-baseline-01").unwrap();
+        assert_eq!(loaded_baseline, baseline);
+
+        // `list_checkpoints_in_data_dir` must ignore `<job_id>.baseline.json`
+        let listed = list_checkpoints_in_data_dir(data_dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].job_id, "job-baseline-01");
+
+        // Deleting checkpoint must clean up `.baseline.json` sidecar too
+        delete_checkpoint_for_paths(&paths, "job-baseline-01").unwrap();
+        assert!(!baseline_file_path(data_dir, "job-baseline-01")
+            .unwrap()
+            .exists());
+        assert!(save_baseline_cues_for_paths(&paths, "../escape", &baseline).is_err());
 
         let _ = fs::remove_dir_all(&base);
     }

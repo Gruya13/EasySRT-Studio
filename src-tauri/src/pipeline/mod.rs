@@ -10,24 +10,28 @@ pub mod llama_server;
 pub mod probe;
 pub mod segmenter;
 pub mod sr_script;
+pub mod telemetry_diff;
 pub mod translator;
 pub mod whisper;
 
 use crate::models::{
-    CatalogItemKind, ExportOptions, ExportResult, JobOptions, JobPhase, JobProgressEvent,
-    SegmentRules, SerbianScript, SubtitleCue, SubtitleProject, TranslationProviderKind,
+    AddressForm, AppConfig, CatalogItemKind, ExportOptions, ExportResult, JobMetricsPayload,
+    JobOptions, JobPhase, JobProgressEvent, SegmentPreset, SegmentRules, SerbianScript,
+    SubtitleCue, SubtitleProject, TranslationProviderKind, TranslationStyle, VramTier,
     EVENT_JOB_PROGRESS,
 };
 use crate::pipeline::translator::{BatchOperation, LlmEndpointConfig};
-use crate::{setup_manager, storage};
+use crate::{diagnostics, hardware, setup_manager, storage};
 use anyhow::{anyhow, Result};
-use std::collections::HashMap;
+use sha2::{Digest, Sha256};
+use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::Path;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    Arc,
+    Arc, Mutex as StdMutex, OnceLock,
 };
+use std::time::Instant;
 use tauri::{AppHandle, Emitter};
 use tokio::sync::{watch, Mutex};
 
@@ -172,6 +176,227 @@ impl PipelineState {
     }
 }
 
+#[derive(Debug, Clone)]
+struct WhisperStageStats {
+    whisper_elapsed_ms: u64,
+    diarizer_elapsed_ms: u64,
+    whisper_backend: String,
+}
+
+type ExportDedupeSet = StdMutex<HashSet<(String, String, &'static str)>>;
+static EXPORT_TELEMETRY_DEDUPE: OnceLock<ExportDedupeSet> = OnceLock::new();
+static CONDENSED_JOBS: OnceLock<StdMutex<HashSet<String>>> = OnceLock::new();
+
+fn detect_whisper_backend(whisper_bin: &Path) -> &'static str {
+    if let Some(dir) = whisper_bin.parent() {
+        if dir.join("ggml-cuda.dll").is_file() {
+            return "cuda";
+        }
+        if dir.join("ggml-vulkan.dll").is_file() || dir.join("libggml-vulkan.so").is_file() {
+            return "vulkan";
+        }
+    }
+    let lowered = whisper_bin.to_string_lossy().to_ascii_lowercase();
+    if lowered.contains("cuda") {
+        "cuda"
+    } else if lowered.contains("vulkan") {
+        "vulkan"
+    } else {
+        "cpu"
+    }
+}
+
+fn gpu_tier_label(tier: VramTier) -> &'static str {
+    match tier {
+        VramTier::CpuOnly => "cpuOnly",
+        VramTier::Vram4Gb => "vram4Gb",
+        VramTier::Vram8Gb => "vram8Gb",
+        VramTier::Vram12GbPlus => "vram12GbPlus",
+    }
+}
+
+fn llm_provider_label(provider: TranslationProviderKind) -> &'static str {
+    match provider {
+        TranslationProviderKind::LocalLlama => "localLlama",
+        TranslationProviderKind::DeepSeek => "deepSeek",
+        TranslationProviderKind::CustomOpenAi => "customOpenAi",
+    }
+}
+
+fn translation_style_label(style: TranslationStyle) -> &'static str {
+    match style {
+        TranslationStyle::Natural => "natural",
+        TranslationStyle::Formal => "formal",
+    }
+}
+
+fn address_form_label(addr: AddressForm) -> &'static str {
+    match addr {
+        AddressForm::Auto => "auto",
+        AddressForm::PoliteVi => "politeVi",
+        AddressForm::InformalTi => "informalTi",
+    }
+}
+
+fn segment_preset_label(preset: SegmentPreset) -> &'static str {
+    match preset {
+        SegmentPreset::Standard => "standard",
+        SegmentPreset::Reels => "reels",
+        SegmentPreset::Custom => "custom",
+    }
+}
+
+fn is_custom_model_id(config: &AppConfig, model_id: &str) -> bool {
+    model_id.starts_with("custom")
+        || config.custom_models.iter().any(|m| m.id == model_id)
+}
+
+fn resolve_whisper_model_label(config: &AppConfig) -> String {
+    match config.active_whisper_model_id.as_deref().map(str::trim) {
+        Some(id) if !id.is_empty() => {
+            if is_custom_model_id(config, id) {
+                "custom".to_string()
+            } else {
+                id.to_string()
+            }
+        }
+        _ => "unknown".to_string(),
+    }
+}
+
+fn resolve_llm_model_label(
+    config: &AppConfig,
+    provider: TranslationProviderKind,
+) -> String {
+    match provider {
+        TranslationProviderKind::LocalLlama => {
+            match config.active_llm_model_id.as_deref().map(str::trim) {
+                Some(id) if !id.is_empty() => {
+                    if is_custom_model_id(config, id) {
+                        "custom".to_string()
+                    } else {
+                        id.to_string()
+                    }
+                }
+                _ => "unknown".to_string(),
+            }
+        }
+        TranslationProviderKind::DeepSeek => {
+            let trimmed = config.translation.deepseek_model.trim();
+            if trimmed.is_empty() {
+                "deepseek-chat".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        }
+        TranslationProviderKind::CustomOpenAi => "custom".to_string(),
+    }
+}
+
+fn save_baseline_sidecar_quiet(app: &AppHandle, project: &SubtitleProject) {
+    let baseline = telemetry_diff::snapshot_baseline_cues(&project.cues);
+    if let Err(err) = storage::save_baseline_cues(app, &project.job_id, &baseline) {
+        tracing::warn!(
+            job_id = %project.job_id,
+            "Failed to save AI baseline sidecar: {err:#}"
+        );
+    }
+}
+
+fn mark_job_condensed(job_id: &str) {
+    let lock = CONDENSED_JOBS.get_or_init(|| StdMutex::new(HashSet::new()));
+    let mut set = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if set.len() >= 512 {
+        set.clear();
+    }
+    set.insert(job_id.to_string());
+}
+
+fn is_job_condensed(job_id: &str) -> bool {
+    let lock = CONDENSED_JOBS.get_or_init(|| StdMutex::new(HashSet::new()));
+    let set = lock.lock().unwrap_or_else(|e| e.into_inner());
+    set.contains(job_id)
+}
+
+fn emit_job_metrics_if_consented(
+    config: &AppConfig,
+    project: &SubtitleProject,
+    whisper_stats: Option<&WhisperStageStats>,
+    llm_elapsed_ms: u64,
+) {
+    if cfg!(test)
+        || !config.can_share_usage_metrics()
+        || diagnostics::resolve_telemetry_endpoint().is_none()
+    {
+        return;
+    }
+
+    let provider = project
+        .options
+        .provider_override
+        .unwrap_or(config.translation.provider);
+    let (src_lang, target_lang) = resolved_source_and_target_lang(project);
+    let audio_duration_ms = project.duration_ms;
+    let whisper_elapsed_ms = whisper_stats.map(|s| s.whisper_elapsed_ms).unwrap_or(0);
+    let diarizer_elapsed_ms = whisper_stats.map(|s| s.diarizer_elapsed_ms).unwrap_or(0);
+    let whisper_backend = whisper_stats
+        .map(|s| s.whisper_backend.clone())
+        .unwrap_or_else(|| "none".to_string());
+    let asr_rtf = if audio_duration_ms > 0 && whisper_elapsed_ms > 0 {
+        whisper_elapsed_ms as f64 / audio_duration_ms as f64
+    } else {
+        0.0
+    };
+    let llm_rtf = if audio_duration_ms > 0 && llm_elapsed_ms > 0 {
+        llm_elapsed_ms as f64 / audio_duration_ms as f64
+    } else {
+        0.0
+    };
+
+    let whisper_model_id = resolve_whisper_model_label(config);
+    let llm_model_id = resolve_llm_model_label(config, provider);
+    let cue_count = u32::try_from(project.cues.len()).unwrap_or(u32::MAX);
+    let translation_style = translation_style_label(project.options.translation_style).to_string();
+    let address_form = address_form_label(project.options.address_form).to_string();
+    let preset = segment_preset_label(project.options.segment_rules.preset).to_string();
+    let llm_provider = llm_provider_label(provider).to_string();
+
+    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+        handle.spawn(async move {
+            let gpu_tier = tokio::task::spawn_blocking(|| {
+                gpu_tier_label(hardware::detect_gpu().recommended_tier).to_string()
+            })
+            .await
+            .unwrap_or_else(|_| "cpuOnly".to_string());
+
+            let payload = JobMetricsPayload {
+                app_version: diagnostics::current_app_version().to_string(),
+                os: std::env::consts::OS.to_string(),
+                gpu_tier,
+                whisper_backend,
+                whisper_model_id,
+                llm_provider,
+                llm_model_id,
+                audio_duration_ms,
+                whisper_elapsed_ms,
+                diarizer_elapsed_ms,
+                llm_elapsed_ms,
+                asr_rtf,
+                llm_rtf,
+                oom_cpu_fallback: false,
+                batch_subdivision_retries: 0,
+                cue_count,
+                source_lang: src_lang,
+                target_lang,
+                translation_style,
+                address_form,
+                preset,
+            };
+            diagnostics::send_job_metrics_async(payload);
+        });
+    }
+}
+
 fn emit_job_progress(
     app: &AppHandle,
     job_id: &str,
@@ -215,10 +440,12 @@ async fn transcribe_audio_with_flag(
     job_id: &str,
     audio_path: &str,
     options: JobOptions,
+    topic_context: Option<String>,
     cancel_flag: &Arc<AtomicBool>,
-) -> Result<SubtitleProject> {
+) -> Result<(SubtitleProject, WhisperStageStats)> {
     let ffmpeg_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::Ffmpeg)?;
     let whisper_bin = setup_manager::resolve_binary_path(app, CatalogItemKind::WhisperBin)?;
+    let whisper_backend = detect_whisper_backend(&whisper_bin).to_string();
     let whisper_model = setup_manager::resolve_active_whisper_model_path(app)?;
     let vad_model = setup_manager::resolve_vad_model_path(app)?;
     let storage_paths = storage::resolve_storage_paths(app, None)?;
@@ -253,23 +480,35 @@ async fn transcribe_audio_with_flag(
         "Running Whisper ASR transcription...",
     );
 
-    let whisper_res = whisper::run_whisper_cli(
+    let clean_topic_context = topic_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string);
+
+    let whisper_started = Instant::now();
+    let whisper_res = whisper::run_whisper_cli_with_topic(
         &whisper_bin,
         &whisper_model,
         vad_model.as_deref(),
         &converted.wav_path,
         &options.source_language,
         &options.glossary,
+        clean_topic_context.as_deref(),
         cancel_flag,
         |pct, detail| {
             emit_job_progress(app, job_id, JobPhase::Transcribing, pct, detail);
         },
     )
     .await;
+    let whisper_elapsed_ms = whisper_started.elapsed().as_millis() as u64;
 
+    let mut diarizer_elapsed_ms = 0u64;
     let whisper_res = match whisper_res {
         Ok(mut whisper_out) => {
+            let diarizer_started = Instant::now();
             annotate_speaker_changes(&converted.wav_path, &mut whisper_out);
+            diarizer_elapsed_ms = diarizer_started.elapsed().as_millis() as u64;
             Ok(whisper_out)
         }
         Err(err) => Err(err),
@@ -325,7 +564,7 @@ async fn transcribe_audio_with_flag(
         cues,
         phase: JobPhase::Completed,
         completed_translation_batches: 0,
-        topic_context: None,
+        topic_context: clean_topic_context,
         completed_translation_style: None,
         error_message: None,
         updated_at: chrono::Utc::now().to_rfc3339(),
@@ -333,7 +572,14 @@ async fn transcribe_audio_with_flag(
 
     storage::save_checkpoint(app, &project)?;
 
-    Ok(project)
+    Ok((
+        project,
+        WhisperStageStats {
+            whisper_elapsed_ms,
+            diarizer_elapsed_ms,
+            whisper_backend,
+        },
+    ))
 }
 
 fn resolved_source_and_target_lang(project: &SubtitleProject) -> (String, String) {
@@ -445,11 +691,86 @@ pub(crate) fn resolve_cloud_endpoint(
     }
 }
 
-async fn run_project_llm_stage(
+async fn execute_llm_operation_with_brief(
+    app: &AppHandle,
+    project: &mut SubtitleProject,
+    operation: BatchOperation,
+    phase: JobPhase,
+    endpoint: &LlmEndpointConfig,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<()> {
+    let job_id = project.job_id.clone();
+    let remove_fillers = project.options.remove_fillers;
+    let mut merged_glossary: Option<std::collections::BTreeMap<String, String>> = None;
+    let mut inferred_address: Option<AddressForm> = None;
+
+    if matches!(
+        operation,
+        BatchOperation::Translate | BatchOperation::PolishSerbian
+    ) && project.completed_translation_batches == 0
+        && !project.cues.is_empty()
+    {
+        let (eff_src, _) = resolved_source_and_target_lang(project);
+        match translator::build_translation_context_brief(
+            endpoint,
+            &project.cues,
+            &eff_src,
+            &project.options.target_language,
+            project.topic_context.as_deref(),
+            cancel_flag,
+        )
+        .await
+        {
+            Ok(brief) => {
+                if project.topic_context.is_none() && brief.topic.is_some() {
+                    project.topic_context = brief.topic;
+                }
+                if !brief.domain_glossary.is_empty() {
+                    merged_glossary = Some(translator::merge_glossaries(
+                        &project.options.glossary,
+                        &brief.domain_glossary,
+                    ));
+                }
+                if project.options.address_form == AddressForm::Auto {
+                    inferred_address = brief.suggested_address;
+                }
+            }
+            Err(err) => {
+                if cancel_flag.load(Ordering::SeqCst) {
+                    return Err(err);
+                }
+                tracing::warn!(
+                    job_id = %job_id,
+                    "Pre-translation domain brief skipped due to error: {err:#}"
+                );
+            }
+        }
+    }
+
+    let topic_context = project.topic_context.clone();
+    translator::run_batch_operation_with_overrides(
+        project,
+        operation,
+        endpoint,
+        cancel_flag,
+        |proj| storage::save_checkpoint(app, proj),
+        |pct, detail| {
+            emit_job_progress(app, &job_id, phase, pct, detail);
+        },
+        remove_fillers,
+        topic_context.as_deref(),
+        merged_glossary.as_ref(),
+        inferred_address,
+    )
+    .await
+}
+
+async fn run_project_llm_stage_with_asr_stats(
     app: &AppHandle,
     project: &mut SubtitleProject,
     operation: BatchOperation,
     cancel_flag: &Arc<AtomicBool>,
+    asr_stats: Option<&WhisperStageStats>,
 ) -> Result<()> {
     let config = storage::load_config(app)?;
     let provider = project
@@ -480,6 +801,7 @@ async fn run_project_llm_stage(
         },
     );
 
+    let llm_started = Instant::now();
     let mut llama_guard = None;
     let op_res: Result<()> = async {
         let endpoint = match provider {
@@ -510,23 +832,10 @@ async fn run_project_llm_stage(
             other => resolve_cloud_endpoint(app, &config, other)?,
         };
 
-        let remove_fillers = project.options.remove_fillers;
-        let topic_context = project.topic_context.clone();
-        translator::run_batch_operation_with_options(
-            project,
-            operation,
-            &endpoint,
-            cancel_flag,
-            |proj| storage::save_checkpoint(app, proj),
-            |pct, detail| {
-                emit_job_progress(app, &job_id, phase, pct, detail);
-            },
-            remove_fillers,
-            topic_context.as_deref(),
-        )
-        .await
+        execute_llm_operation_with_brief(app, project, operation, phase, &endpoint, cancel_flag).await
     }
     .await;
+    let llm_elapsed_ms = llm_started.elapsed().as_millis() as u64;
 
     // Guarantee local llama-server is stopped immediately after batch operation completes
     if let Some(mut guard) = llama_guard.take() {
@@ -539,6 +848,15 @@ async fn run_project_llm_stage(
             project.error_message = None;
             project.updated_at = chrono::Utc::now().to_rfc3339();
             storage::save_checkpoint(app, project)?;
+            if matches!(
+                operation,
+                BatchOperation::Translate | BatchOperation::PolishSerbian
+            ) {
+                save_baseline_sidecar_quiet(app, project);
+            } else if operation == BatchOperation::CondenseCps {
+                mark_job_condensed(&project.job_id);
+            }
+            emit_job_metrics_if_consented(&config, project, asr_stats, llm_elapsed_ms);
             Ok(())
         }
         Err(err) => {
@@ -555,6 +873,15 @@ async fn run_project_llm_stage(
             Err(err)
         }
     }
+}
+
+async fn run_project_llm_stage(
+    app: &AppHandle,
+    project: &mut SubtitleProject,
+    operation: BatchOperation,
+    cancel_flag: &Arc<AtomicBool>,
+) -> Result<()> {
+    run_project_llm_stage_with_asr_stats(app, project, operation, cancel_flag, None).await
 }
 
 pub fn import_subtitle_file(
@@ -580,6 +907,7 @@ pub async fn transcribe_audio(
     audio_path: String,
     options: JobOptions,
     job_id: Option<String>,
+    topic_context: Option<String>,
 ) -> Result<SubtitleProject> {
     let _ = state.cancel_active_probe(None).await;
 
@@ -589,12 +917,23 @@ pub async fn transcribe_audio(
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
 
     let cancel_flag = state.register_job(&resolved_job_id).await;
-    let res =
-        transcribe_audio_with_flag(app, &resolved_job_id, &audio_path, options, &cancel_flag).await;
+    let res = transcribe_audio_with_flag(
+        app,
+        &resolved_job_id,
+        &audio_path,
+        options,
+        topic_context,
+        &cancel_flag,
+    )
+    .await;
     state.finish_job(&resolved_job_id).await;
 
     match res {
-        Ok(project) => {
+        Ok((project, stats)) => {
+            save_baseline_sidecar_quiet(app, &project);
+            if let Ok(config) = storage::load_config(app) {
+                emit_job_metrics_if_consented(&config, &project, Some(&stats), 0);
+            }
             emit_job_progress(
                 app,
                 &resolved_job_id,
@@ -756,6 +1095,7 @@ pub async fn run_full_pipeline(
     audio_path: String,
     options: JobOptions,
     job_id: Option<String>,
+    topic_context: Option<String>,
 ) -> Result<SubtitleProject> {
     let _ = state.cancel_active_probe(None).await;
 
@@ -767,11 +1107,12 @@ pub async fn run_full_pipeline(
     let cancel_flag = state.register_job(&resolved_job_id).await;
 
     let run_res: Result<SubtitleProject> = async {
-        let mut project = transcribe_audio_with_flag(
+        let (mut project, asr_stats) = transcribe_audio_with_flag(
             app,
             &resolved_job_id,
             &audio_path,
             options,
+            topic_context,
             &cancel_flag,
         )
         .await?;
@@ -780,13 +1121,29 @@ pub async fn run_full_pipeline(
             Some(operation) => {
                 project.completed_translation_batches = 0;
                 project.completed_translation_style = None;
-                run_project_llm_stage(app, &mut project, operation, &cancel_flag).await?;
+                run_project_llm_stage_with_asr_stats(
+                    app,
+                    &mut project,
+                    operation,
+                    &cancel_flag,
+                    Some(&asr_stats),
+                )
+                .await?;
             }
             None => {
                 let (src_lang, target_lang) = resolved_source_and_target_lang(&project);
                 if target_lang == "sr" || src_lang == "sr" {
                     project.cues = convert_cues_script(project.cues, project.options.script)?;
                 }
+                project.phase = JobPhase::Completed;
+                project.error_message = None;
+                project.updated_at = chrono::Utc::now().to_rfc3339();
+                storage::save_checkpoint(app, &project)?;
+                save_baseline_sidecar_quiet(app, &project);
+                if let Ok(config) = storage::load_config(app) {
+                    emit_job_metrics_if_consented(&config, &project, Some(&asr_stats), 0);
+                }
+                return Ok(project);
             }
         }
 
@@ -963,21 +1320,17 @@ pub async fn run_local_llm_batch(
                     },
                 );
 
-                let remove_fillers = project.options.remove_fillers;
-                let topic_context = project.topic_context.clone();
-                let res = translator::run_batch_operation_with_options(
+                let llm_started = Instant::now();
+                let res = execute_llm_operation_with_brief(
+                    app,
                     project,
                     operation,
+                    phase,
                     &endpoint,
                     cancel_flag,
-                    |proj| storage::save_checkpoint(app, proj),
-                    |pct, detail| {
-                        emit_job_progress(app, &job_id, phase, pct, detail);
-                    },
-                    remove_fillers,
-                    topic_context.as_deref(),
                 )
                 .await;
+                let llm_elapsed_ms = llm_started.elapsed().as_millis() as u64;
 
                 if let Err(err) = res {
                     let is_cancelled = cancel_flag.load(Ordering::SeqCst);
@@ -992,6 +1345,16 @@ pub async fn run_local_llm_batch(
                     emit_job_progress(app, &job_id, project.phase, 0.0, err.to_string());
                     return Err(err);
                 }
+
+                if matches!(
+                    operation,
+                    BatchOperation::Translate | BatchOperation::PolishSerbian
+                ) {
+                    save_baseline_sidecar_quiet(app, project);
+                } else if operation == BatchOperation::CondenseCps {
+                    mark_job_condensed(&project.job_id);
+                }
+                emit_job_metrics_if_consented(&config, project, None, llm_elapsed_ms);
             } else {
                 let (src_lang, target_lang) = resolved_source_and_target_lang(project);
                 if target_lang == "sr" || src_lang == "sr" {
@@ -1050,12 +1413,122 @@ pub fn convert_cues_script(
     Ok(cues)
 }
 
+pub fn compute_cues_export_hash(cues: &[SubtitleCue]) -> String {
+    let mut hasher = Sha256::new();
+    for cue in cues {
+        hasher.update(cue.id.to_le_bytes());
+        hasher.update(cue.start_ms.to_le_bytes());
+        hasher.update(cue.end_ms.to_le_bytes());
+        hasher.update(cue.source_text.as_bytes());
+        hasher.update(b"\0");
+        hasher.update(cue.translated_text.as_bytes());
+        hasher.update(b"\n");
+    }
+    hex::encode(hasher.finalize())
+}
+
+fn mark_export_telemetry_channel(job_id: &str, cue_hash: &str, channel: &'static str) -> bool {
+    let lock = EXPORT_TELEMETRY_DEDUPE.get_or_init(|| StdMutex::new(HashSet::new()));
+    let mut set = lock.lock().unwrap_or_else(|e| e.into_inner());
+    if set.len() >= 512 {
+        set.clear();
+    }
+    set.insert((job_id.to_string(), cue_hash.to_string(), channel))
+}
+
+pub fn get_project_modified_cue_count(app: &AppHandle, job_id: &str) -> Result<usize> {
+    storage::validate_job_id(job_id)?;
+    let baseline = storage::load_baseline_cues(app, job_id)?;
+    if baseline.is_empty() {
+        return Ok(0);
+    }
+    let project = match storage::load_checkpoint(app, job_id) {
+        Ok(p) => p,
+        Err(_) => return Ok(0),
+    };
+    Ok(telemetry_diff::count_modified_training_cues(
+        &baseline,
+        &project.cues,
+    ))
+}
+
 pub fn export_subtitles(
-    _app: &AppHandle,
+    app: &AppHandle,
     project: SubtitleProject,
     options: ExportOptions,
+    skip_training_donation: Option<bool>,
 ) -> Result<ExportResult> {
-    exporter::export_project_files(&project, &options)
+    let result = exporter::export_project_files(&project, &options)?;
+
+    if cfg!(test) || diagnostics::resolve_telemetry_endpoint().is_none() {
+        return Ok(result);
+    }
+
+    let Ok(mut config) = storage::load_config(app) else {
+        return Ok(result);
+    };
+    let share_metrics = config.can_share_usage_metrics();
+    let share_training =
+        config.can_share_translation_edits() && !skip_training_donation.unwrap_or(false);
+    if !share_metrics && !share_training {
+        return Ok(result);
+    }
+
+    let Ok(baseline) = storage::load_baseline_cues(app, &project.job_id) else {
+        return Ok(result);
+    };
+    if baseline.is_empty() {
+        return Ok(result);
+    }
+
+    let cue_hash = compute_cues_export_hash(&project.cues);
+    let send_metrics =
+        share_metrics && mark_export_telemetry_channel(&project.job_id, &cue_hash, "export");
+    let send_training =
+        share_training && mark_export_telemetry_channel(&project.job_id, &cue_hash, "training");
+    if !send_metrics && !send_training {
+        return Ok(result);
+    }
+
+    if send_metrics && diagnostics::ensure_monthly_cohort_salt(&mut config) {
+        let salt = config.telemetry_cohort_salt.clone();
+        let month = config.telemetry_cohort_month.clone();
+        let _ = storage::update_config(app, move |cfg| {
+            cfg.telemetry_cohort_salt = salt;
+            cfg.telemetry_cohort_month = month;
+        });
+    }
+
+    let report = telemetry_diff::analyze_export_diff(
+        &baseline,
+        &project.cues,
+        &project.options,
+        &config.telemetry_cohort_salt,
+        send_metrics,
+        send_training,
+        is_job_condensed(&project.job_id),
+    );
+
+    if send_metrics {
+        let (src_lang, target_lang) = resolved_source_and_target_lang(&project);
+        diagnostics::send_export_telemetry_async(diagnostics::WorkerExportTelemetryPayload {
+            app_version: diagnostics::current_app_version().to_string(),
+            os: std::env::consts::OS.to_string(),
+            source_lang: src_lang,
+            target_lang,
+            translation_style: translation_style_label(project.options.translation_style)
+                .to_string(),
+            address_form: address_form_label(project.options.address_form).to_string(),
+            metrics: report.metrics,
+            ngram_diffs: report.ngram_diffs,
+        });
+    }
+
+    if send_training && !report.training_pairs.is_empty() {
+        diagnostics::send_training_pairs_async(report.training_pairs);
+    }
+
+    Ok(result)
 }
 
 #[cfg(test)]
@@ -1431,6 +1904,7 @@ EOF
                 polish_serbian: true,
                 correct_source_asr: false,
                 translation_style: TranslationStyle::default(),
+                address_form: AddressForm::Auto,
                 remove_fillers: true,
                 provider_override: Some(TranslationProviderKind::CustomOpenAi),
             },
@@ -1997,5 +2471,61 @@ http.server.HTTPServer(("127.0.0.1", port), Handler).serve_forever()
 
         let verbatim = resegment_project(mk_proj(false), SegmentRules::default()).unwrap();
         assert_eq!(verbatim.cues[0].source_text, "Um, hello world.");
+    }
+
+    #[test]
+    fn export_dedupe_and_model_label_helpers_behave_deterministically() {
+        let cues = vec![SubtitleCue {
+            id: 1,
+            start_ms: 0,
+            end_ms: 1500,
+            source_text: "Hello".to_string(),
+            translated_text: "Zdravo".to_string(),
+            translated_variants: BTreeMap::new(),
+            cps: 4.0,
+            warnings: vec![],
+        }];
+        let h1 = compute_cues_export_hash(&cues);
+        let h2 = compute_cues_export_hash(&cues);
+        assert_eq!(h1, h2);
+        assert_eq!(h1.len(), 64);
+
+        let job = format!("dedupe-test-{}", uuid::Uuid::new_v4());
+        assert!(mark_export_telemetry_channel(&job, &h1, "export"));
+        assert!(!mark_export_telemetry_channel(&job, &h1, "export"));
+        assert!(mark_export_telemetry_channel(&job, &h1, "training"));
+        assert!(!mark_export_telemetry_channel(&job, &h1, "training"));
+
+        assert_eq!(
+            detect_whisper_backend(Path::new("/tmp/whisper-win-cuda/whisper-cli.exe")),
+            "cuda"
+        );
+        assert_eq!(
+            detect_whisper_backend(Path::new("/tmp/whisper-linux-vulkan/whisper-cli")),
+            "vulkan"
+        );
+        assert_eq!(
+            detect_whisper_backend(Path::new("/usr/bin/whisper-cli")),
+            "cpu"
+        );
+
+        let cfg = AppConfig {
+            active_whisper_model_id: Some("whisper-large-v3-turbo-q5_0".to_string()),
+            active_llm_model_id: Some("custom-local-gguf".to_string()),
+            ..AppConfig::default()
+        };
+        assert_eq!(resolve_whisper_model_label(&cfg), "whisper-large-v3-turbo-q5_0");
+        assert_eq!(
+            resolve_llm_model_label(&cfg, TranslationProviderKind::LocalLlama),
+            "custom"
+        );
+        assert_eq!(
+            resolve_llm_model_label(&cfg, TranslationProviderKind::CustomOpenAi),
+            "custom"
+        );
+        assert_eq!(
+            resolve_llm_model_label(&cfg, TranslationProviderKind::DeepSeek),
+            "deepseek-chat"
+        );
     }
 }

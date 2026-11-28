@@ -43,8 +43,22 @@
 
   input,
   textarea,
-  select {
+  select,
+  [contenteditable="true"] {
+    -webkit-user-select: text;
     user-select: text;
+  }
+
+  .window-shell,
+  #titlebar,
+  .editor-card-head,
+  .editor-card-foot,
+  #timeline-panel,
+  .tl-headers-col,
+  .tl-corner-cell,
+  .tl-track-header {
+    -webkit-user-select: none;
+    user-select: none;
   }
 }
 
@@ -202,7 +216,7 @@
   align-items: baseline;
   justify-content: center;
   gap: 7px;
-  pointer-events: none;
+  pointer-events: auto;
   white-space: nowrap;
 }
 
@@ -2168,6 +2182,36 @@ input:checked + .s-switch::after {
   font-variant-numeric: tabular-nums;
   font-size: 10.5px;
   color: #7d8799;
+}
+
+.tl-follow-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 22px;
+  padding: 0 8px;
+  margin-left: 4px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 5px;
+  background: #121722;
+  color: #8f9bb0;
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color 110ms ease, border-color 110ms ease, color 110ms ease;
+}
+
+.tl-follow-btn:hover:not(:disabled) {
+  background: #1a2130;
+  border-color: rgba(255, 255, 255, 0.18);
+  color: #eef2f6;
+}
+
+.tl-follow-btn.active {
+  background: rgba(16, 185, 129, 0.14);
+  border-color: rgba(16, 185, 129, 0.4);
+  color: #6ee7b7;
 }
 
 /* Timeline Body (198px = 24px ruler + 3 * 58px tracks) */

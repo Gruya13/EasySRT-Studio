@@ -1,7 +1,7 @@
 {
   "name": "easysrt-studio",
   "private": true,
-  "version": "0.4.0",
+  "version": "0.5.0",
   "license": "Apache-2.0",
   "type": "module",
   "scripts": {
@@ -13,6 +13,7 @@
     "version:check": "node scripts/release.mjs check",
     "release:prepare": "node scripts/release.mjs prepare",
     "release:notes": "node scripts/release.mjs notes",
+    "telemetry:digest": "node scripts/telemetry-digest.mjs",
     "tauri": "tauri"
   },
   "dependencies": {

@@ -103,6 +103,8 @@ export type SerbianScript = "latin" | "cyrillic";
 
 export type TranslationStyle = "natural" | "formal";
 
+export type AddressForm = "auto" | "politeVi" | "informalTi";
+
 export type TranslationProviderKind =
   | "localLlama"
   | "deepSeek"
@@ -135,6 +137,8 @@ export interface ExportOptions {
   utf8Bom: boolean;
 }
 
+export const CURRENT_PRIVACY_CONSENT_VERSION = 1;
+
 export interface AppConfig {
   uiLanguage: string;
   modelsDirOverride: string | null;
@@ -146,12 +150,38 @@ export interface AppConfig {
   defaultScript: SerbianScript;
   export: ExportOptions;
   hasCompletedSetup: boolean;
+  privacyConsentVersion?: number;
   autoSendCrashReports?: boolean;
+  shareAnonymousUsageMetrics?: boolean;
+  shareAnonymizedTranslationEdits?: boolean;
+  autoCheckUpdates?: boolean;
+  lastUpdateCheckEpochSec?: number;
+  telemetryCohortSalt?: string;
+  telemetryCohortMonth?: string;
   editorSourceFontSize?: number;
   editorTranslatedFontSize?: number;
   autoProbeOnImport?: boolean;
   autoCheckpoints?: boolean;
+  followPlayhead?: boolean;
   allowLocalEncryptedVault?: boolean;
+}
+
+export interface UpdateCheckResult {
+  checked: boolean;
+  skippedReason: string | null;
+  updateAvailable: boolean;
+  currentVersion: string;
+  latestVersion: string | null;
+  releaseNotes: string | null;
+  releaseDate: string | null;
+  lastUpdateCheckEpochSec: number;
+}
+
+export interface TelemetrySamplePayloads {
+  crashReport: unknown;
+  jobAndEditMetrics: unknown;
+  trainingPair: unknown;
+  telemetryDisabledByEnv: boolean;
 }
 
 export interface TimedWord {
@@ -182,6 +212,7 @@ export interface JobOptions {
   polishSerbian: boolean;
   correctSourceAsr?: boolean;
   translationStyle?: TranslationStyle;
+  addressForm?: AddressForm;
   removeFillers?: boolean;
   providerOverride: TranslationProviderKind | null;
 }
@@ -255,6 +286,7 @@ export interface MediaProbeResult {
   detectedLanguage: string | null;
   topic: string | null;
   suggestedStyle: TranslationStyle | null;
+  suggestedAddress?: AddressForm | null;
   error: string | null;
 }
 

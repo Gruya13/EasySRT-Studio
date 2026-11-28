@@ -6,15 +6,24 @@ import {
   isTauriRuntime,
   normalizeTranslationStyle,
 } from "../lib/subtitleUtils";
-import { openDialogPreservingMaximize } from "../lib/tauri";
-import { useAppStore } from "../stores/appStore";
-import type {
-  CatalogItemKind,
-  ExportFormat,
-  SegmentPreset,
-  SerbianScript,
-  TranslationProviderKind,
-  TranslationStyle,
+import {
+  getTelemetrySamplePayloads,
+  openDialogPreservingMaximize,
+} from "../lib/tauri";
+import {
+  isEffectiveCrashReportingEnabled,
+  useAppStore,
+} from "../stores/appStore";
+import {
+  CURRENT_PRIVACY_CONSENT_VERSION,
+  type AddressForm,
+  type CatalogItemKind,
+  type ExportFormat,
+  type SegmentPreset,
+  type SerbianScript,
+  type TelemetrySamplePayloads,
+  type TranslationProviderKind,
+  type TranslationStyle,
 } from "../types/models";
 
 type SettingsTabId = "obrada" | "titlovi" | "modeli" | "izvoz" | "opste";
@@ -164,6 +173,13 @@ export function SettingsPanel() {
   );
   const [selectedCheckpointId, setSelectedCheckpointId] = useState<string>(
     checkpoints[0]?.jobId ?? "",
+  );
+  const [showPayloadInspector, setShowPayloadInspector] = useState(false);
+  const [samplePayloads, setSamplePayloads] =
+    useState<TelemetrySamplePayloads | null>(null);
+  const [loadingPayloads, setLoadingPayloads] = useState(false);
+  const [sampleTab, setSampleTab] = useState<"crash" | "metrics" | "training">(
+    "metrics",
   );
 
   const segFlashTimerRef = useRef<number | null>(null);
@@ -652,6 +668,52 @@ export function SettingsPanel() {
                     {t.workspace.translationStyleFormal}
                   </button>
                 </div>
+              </div>
+            </div>
+
+            <div className="s-field">
+              <span className="s-label">{t.workspace.addressForm}</span>
+              <div
+                className="s-seg"
+                role="group"
+                aria-label={t.workspace.addressForm}
+              >
+                {(
+                  [
+                    [
+                      "auto",
+                      t.workspace.addressFormAuto,
+                      t.workspace.addressFormAutoHint,
+                    ],
+                    [
+                      "politeVi",
+                      t.workspace.addressFormVi,
+                      t.workspace.addressFormViHint,
+                    ],
+                    [
+                      "informalTi",
+                      t.workspace.addressFormTi,
+                      t.workspace.addressFormTiHint,
+                    ],
+                  ] as ReadonlyArray<[AddressForm, string, string]>
+                ).map(([value, label, hint]) => {
+                  const active = (jobOptions.addressForm ?? "auto") === value;
+                  return (
+                    <button
+                      key={value}
+                      type="button"
+                      className={`s-seg-btn js-address-form-btn${
+                        active ? " active-accent" : ""
+                      }`}
+                      data-address-form={value}
+                      aria-pressed={active}
+                      title={hint}
+                      onClick={() => setJobOptions({ addressForm: value })}
+                    >
+                      {label}
+                    </button>
+                  );
+                })}
               </div>
             </div>
 
@@ -1780,28 +1842,236 @@ export function SettingsPanel() {
               </div>
             )}
 
-            <label className="s-toggle-card">
-              <span className="s-toggle-meta">
-                <span className="s-toggle-title">
-                  {t.settings.autoSendCrashReports}
-                </span>
-                <span className="s-toggle-hint">
-                  {t.settings.autoSendCrashReportsHint}
-                </span>
-              </span>
-              <input
-                id="s-auto-crash-reports"
-                type="checkbox"
-                checked={config.autoSendCrashReports !== false}
-                onChange={(e) =>
-                  void updateConfig({
-                    autoSendCrashReports: e.target.checked,
-                  })
+            {
+              /* Privacy & Telemetry Opt-In (v0.5.0 GDPR / ZZPL) */
+            }
+            {(() => {
+              const hasConsent =
+                (config.privacyConsentVersion ?? 0) >=
+                CURRENT_PRIVACY_CONSENT_VERSION;
+              const effectiveCrash = isEffectiveCrashReportingEnabled(config);
+              const effectiveMetrics =
+                hasConsent && Boolean(config.shareAnonymousUsageMetrics);
+              const effectiveTraining =
+                hasConsent && Boolean(config.shareAnonymizedTranslationEdits);
+              const needsUpgradeConfirmation =
+                config.hasCompletedSetup && !hasConsent;
+
+              const handleTogglePayloadInspector = () => {
+                const nextOpen = !showPayloadInspector;
+                setShowPayloadInspector(nextOpen);
+                if (nextOpen && !samplePayloads && !loadingPayloads) {
+                  setLoadingPayloads(true);
+                  void getTelemetrySamplePayloads()
+                    .then((res) => setSamplePayloads(res))
+                    .catch(() => {})
+                    .finally(() => setLoadingPayloads(false));
                 }
-                hidden
-              />
-              <span className="s-switch" aria-hidden="true" />
-            </label>
+              };
+
+              return (
+                <>
+                  {needsUpgradeConfirmation && (
+                    <div
+                      id="s-privacy-upgrade-banner"
+                      className="s-keyring-banner"
+                      role="status"
+                    >
+                      <div className="flex items-center justify-between gap-2">
+                        <div className="s-keyring-banner-title">
+                          {t.privacy.upgradeBannerTitle}
+                        </div>
+                        <button
+                          type="button"
+                          id="s-btn-confirm-privacy"
+                          className="s-mini-btn compact accent"
+                          onClick={() =>
+                            void updateConfig({
+                              privacyConsentVersion:
+                                CURRENT_PRIVACY_CONSENT_VERSION,
+                              autoSendCrashReports: effectiveCrash,
+                              shareAnonymousUsageMetrics: effectiveMetrics,
+                              shareAnonymizedTranslationEdits: effectiveTraining,
+                            })
+                          }
+                        >
+                          {t.privacy.upgradeConfirmBtn}
+                        </button>
+                      </div>
+                      <div className="s-keyring-banner-hint">
+                        {t.privacy.upgradeBannerBody}
+                      </div>
+                    </div>
+                  )}
+
+                  <div className="s-glossary-box">
+                    <div className="s-glossary-top">
+                      <span className="s-label">{t.privacy.sectionTitle}</span>
+                      <button
+                        id="s-btn-inspect-payload"
+                        type="button"
+                        className="s-mini-btn compact info"
+                        onClick={handleTogglePayloadInspector}
+                      >
+                        {showPayloadInspector
+                          ? t.privacy.hidePayloadBtn
+                          : t.privacy.inspectPayloadBtn}
+                      </button>
+                    </div>
+                    <p className="text-[10.5px] leading-snug text-slate-400">
+                      {t.privacy.offlineGuarantee}
+                    </p>
+
+                    <label className="s-toggle-card">
+                      <span className="s-toggle-meta">
+                        <span className="s-toggle-title">
+                          {t.privacy.autoSendCrashReports}
+                        </span>
+                        <span className="s-toggle-hint">
+                          {t.privacy.autoSendCrashReportsHint}
+                        </span>
+                      </span>
+                      <input
+                        id="s-auto-crash-reports"
+                        type="checkbox"
+                        checked={effectiveCrash}
+                        onChange={(e) =>
+                          void updateConfig({
+                            privacyConsentVersion:
+                              CURRENT_PRIVACY_CONSENT_VERSION,
+                            autoSendCrashReports: e.target.checked,
+                          })
+                        }
+                        hidden
+                      />
+                      <span className="s-switch" aria-hidden="true" />
+                    </label>
+
+                    <label className="s-toggle-card">
+                      <span className="s-toggle-meta">
+                        <span className="s-toggle-title">
+                          {t.privacy.shareAnonymousUsageMetrics}
+                        </span>
+                        <span className="s-toggle-hint">
+                          {t.privacy.shareAnonymousUsageMetricsHint}
+                        </span>
+                      </span>
+                      <input
+                        id="s-share-usage-metrics"
+                        type="checkbox"
+                        checked={effectiveMetrics}
+                        onChange={(e) =>
+                          void updateConfig({
+                            privacyConsentVersion:
+                              CURRENT_PRIVACY_CONSENT_VERSION,
+                            shareAnonymousUsageMetrics: e.target.checked,
+                          })
+                        }
+                        hidden
+                      />
+                      <span className="s-switch" aria-hidden="true" />
+                    </label>
+
+                    <label className="s-toggle-card">
+                      <span className="s-toggle-meta">
+                        <span className="s-toggle-title">
+                          {t.privacy.shareAnonymizedTranslationEdits}
+                        </span>
+                        <span className="s-toggle-hint">
+                          {t.privacy.shareAnonymizedTranslationEditsHint}
+                        </span>
+                      </span>
+                      <input
+                        id="s-share-training-edits"
+                        type="checkbox"
+                        checked={effectiveTraining}
+                        onChange={(e) =>
+                          void updateConfig({
+                            privacyConsentVersion:
+                              CURRENT_PRIVACY_CONSENT_VERSION,
+                            shareAnonymizedTranslationEdits: e.target.checked,
+                          })
+                        }
+                        hidden
+                      />
+                      <span className="s-switch" aria-hidden="true" />
+                    </label>
+
+                    <label className="s-toggle-card">
+                      <span className="s-toggle-meta">
+                        <span className="s-toggle-title">
+                          {t.privacy.autoCheckUpdates}
+                        </span>
+                        <span className="s-toggle-hint">
+                          {t.privacy.autoCheckUpdatesHint}
+                        </span>
+                      </span>
+                      <input
+                        id="s-auto-check-updates"
+                        type="checkbox"
+                        checked={config.autoCheckUpdates !== false}
+                        onChange={(e) =>
+                          void updateConfig({
+                            autoCheckUpdates: e.target.checked,
+                          })
+                        }
+                        hidden
+                      />
+                      <span className="s-switch" aria-hidden="true" />
+                    </label>
+
+                    {showPayloadInspector && (
+                      <div className="mt-1 space-y-2 rounded-md border border-slate-800 bg-slate-950 p-2.5">
+                        {loadingPayloads ? (
+                          <div className="text-[11px] text-slate-400">
+                            {t.privacy.loadingPayload}
+                          </div>
+                        ) : (
+                          <>
+                            {samplePayloads?.telemetryDisabledByEnv && (
+                              <div className="rounded border border-amber-500/40 bg-amber-950/35 px-2.5 py-1 text-[10.5px] text-amber-200">
+                                {t.privacy.envDisabledNotice}
+                              </div>
+                            )}
+                            <div className="flex flex-wrap gap-1">
+                              {(
+                                [
+                                  ["crash", t.privacy.sampleCrashTab],
+                                  ["metrics", t.privacy.sampleMetricsTab],
+                                  ["training", t.privacy.sampleTrainingTab],
+                                ] as const
+                              ).map(([tabKey, label]) => (
+                                <button
+                                  key={tabKey}
+                                  type="button"
+                                  className={`s-mini-btn compact${
+                                    sampleTab === tabKey ? " info" : ""
+                                  }`}
+                                  onClick={() => setSampleTab(tabKey)}
+                                >
+                                  {label}
+                                </button>
+                              ))}
+                            </div>
+                            <pre className="max-h-44 overflow-auto rounded border border-slate-800 bg-slate-900/70 p-2 font-mono text-[10.5px] leading-relaxed text-emerald-200">
+                              {JSON.stringify(
+                                sampleTab === "crash"
+                                  ? samplePayloads?.crashReport
+                                  : sampleTab === "training"
+                                    ? samplePayloads?.trainingPair
+                                    : samplePayloads?.jobAndEditMetrics,
+                                null,
+                                2,
+                              )}
+                            </pre>
+                          </>
+                        )}
+                      </div>
+                    )}
+                  </div>
+                </>
+              );
+            })()}
 
             <div className="s-action-row">
               <span id="s-bug-report-status" className="s-note">

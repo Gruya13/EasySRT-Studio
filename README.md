@@ -8,13 +8,13 @@
 
 *Turn any audio or video into clean, broadcast-ready subtitles in a dual-pane cinema workspace — with 1-click setup, 100% offline AI privacy, or up to **28x real-time** hybrid speed.*
 
-[![Release v0.4.0](https://img.shields.io/badge/release-v0.4.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+[![Release v0.5.0](https://img.shields.io/badge/release-v0.5.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-10b981?style=for-the-badge)](LICENSE)
 [![Platforms](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-6366f1?style=for-the-badge)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
-### [Download EasySRT Studio v0.4.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+### [Download EasySRT Studio v0.5.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
-[User Guide](docs/user/en/guide.md) · [Troubleshooting & FAQ](docs/user/en/troubleshooting.md) · [Changelog](CHANGELOG.md)
+[User Guide](docs/user/en/guide.md) · [Troubleshooting & FAQ](docs/user/en/troubleshooting.md) · [Privacy Policy](PRIVACY.md) · [Changelog](CHANGELOG.md)
 
 </div>
 
@@ -52,7 +52,11 @@ Need keyboard shortcuts, GPU tips, or setup help? Read the **[User Guide](docs/u
 
 ## Privacy, Security & Updates
 
-Your audio and video recordings never leave your computer. API keys are protected via your operating system keyring (or an optional encrypted local vault), built-in signed updates keep the app current in one click, and privacy-sanitized bug reports or feature ideas are available right from the footer.
+- **Zero-PII Offline-First Core:** Audio, video, raw transcripts, and API keys never leave your computer to IG-Systems. API keys are protected via your OS keyring (or an optional encrypted local vault).
+- **Explicit GDPR & Serbian ZZPL Opt-In Telemetry:** Crash reporting, performance/structural metrics, K-anonymous (`k >= 5`) lowercase lexical diffs, and `[NAME]`/`[NUM]`-masked edit-pair donations are **off by default** and include a live **"View Exact JSON Sample"** inspector in the Setup Wizard and Settings (plus `DO_NOT_TRACK=1` / `EASYSRT_TELEMETRY_URL=off` kill-switches).
+- **Signed 24h Auto-Updater:** Built-in `minisign`-verified updates check once every 24 hours via our zero-IP proxy (`easysrt-telemetry.ig-systems.rs` with GitHub Releases fallback) and can be toggled anytime in Settings.
+
+Read the full **[Privacy Policy (`PRIVACY.md`)](PRIVACY.md)** for exact schemas, retention periods, and opt-out controls.
 
 ---
 

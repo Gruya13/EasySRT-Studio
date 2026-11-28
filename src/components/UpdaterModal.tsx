@@ -19,17 +19,9 @@ import {
 } from "../lib/subtitleUtils";
 import { toSafeExternalHttpsUrl } from "../lib/urlSafety";
 import { useAppStore } from "../stores/appStore";
-
-interface GitHubLatestRelease {
-  version: string;
-  htmlUrl: string;
-  body: string;
-  publishedAt: string;
-}
+import type { UpdateCheckResult } from "../types/models";
 
 const GITHUB_RELEASES_URL = "https://github.com/Gruya13/EasySRT-Studio/releases";
-const GITHUB_LATEST_API_URL =
-  "https://api.github.com/repos/Gruya13/EasySRT-Studio/releases/latest";
 
 export function UpdaterModal() {
   const isOpen = useAppStore((s) => s.isUpdaterOpen);
@@ -39,12 +31,12 @@ export function UpdaterModal() {
   const setAvailableUpdateVersion = useAppStore(
     (s) => s.setAvailableUpdateVersion,
   );
+  const checkAppUpdate = useAppStore((s) => s.checkAppUpdate);
 
   const [checking, setChecking] = useState(false);
   const [checkedOnce, setCheckedOnce] = useState(false);
   const [updateObj, setUpdateObj] = useState<Update | null>(null);
-  const [githubRelease, setGithubRelease] =
-    useState<GitHubLatestRelease | null>(null);
+  const [ipcResult, setIpcResult] = useState<UpdateCheckResult | null>(null);
   const [downloading, setDownloading] = useState(false);
   const [downloadedBytes, setDownloadedBytes] = useState(0);
   const [totalBytes, setTotalBytes] = useState(0);
@@ -56,49 +48,26 @@ export function UpdaterModal() {
     setErrorMessage(null);
 
     try {
-      const ghPromise = fetch(GITHUB_LATEST_API_URL, {
-        headers: { Accept: "application/vnd.github+json" },
-      })
+      const ipcPromise = checkAppUpdate(true)
         .then(
-          async (
-            res,
-          ): Promise<{
-            release: GitHubLatestRelease | null;
+          (
+            result,
+          ): {
+            result: UpdateCheckResult | null;
             error: string | null;
-          }> => {
-            if (res.status === 404) {
-              return { release: null, error: null };
-            }
-            if (!res.ok) {
-              return { release: null, error: `GitHub HTTP ${res.status}` };
-            }
-            const data = (await res.json()) as {
-              tag_name?: string;
-              html_url?: string;
-              body?: string;
-              published_at?: string;
-            };
-            const tag = data.tag_name?.trim();
-            if (!tag) {
-              return { release: null, error: null };
-            }
-            return {
-              release: {
-                version: tag.replace(/^v/i, ""),
-                htmlUrl:
-                  toSafeExternalHttpsUrl(data.html_url) ?? GITHUB_RELEASES_URL,
-                body: data.body || "",
-                publishedAt: data.published_at || "",
-              },
-              error: null,
-            };
-          },
+          } => ({
+            result,
+            error: null,
+          }),
         )
         .catch(
           (
             err,
-          ): { release: GitHubLatestRelease | null; error: string | null } => ({
-            release: null,
+          ): {
+            result: UpdateCheckResult | null;
+            error: string | null;
+          } => ({
+            result: null,
             error: err instanceof Error ? err.message : String(err),
           }),
         );
@@ -122,44 +91,48 @@ export function UpdaterModal() {
             error: null,
           });
 
-      const [ghResult, tauriResult] = await Promise.all([
-        ghPromise,
+      const [ipcCheck, tauriResult] = await Promise.all([
+        ipcPromise,
         tauriPromise,
       ]);
-      const latestGh = ghResult.release;
+      const latestIpc = ipcCheck.result;
       const tauriUpdate = tauriResult.update;
       const tauriCheckErr = tauriResult.error;
-      const ghErr = ghResult.error;
+      const ipcErr = ipcCheck.error;
 
-      setGithubRelease(latestGh);
+      setIpcResult(latestIpc);
       setUpdateObj(tauriUpdate);
       setCheckedOnce(true);
 
+      const ipcVersion = latestIpc?.latestVersion?.replace(/^v/i, "") ?? null;
+      const ipcHasUpdate = Boolean(
+        latestIpc?.updateAvailable &&
+          ipcVersion &&
+          compareSemver(ipcVersion, appVersion) > 0,
+      );
+
       if (tauriUpdate) {
         setAvailableUpdateVersion(tauriUpdate.version.replace(/^v/i, ""));
-      } else if (latestGh && compareSemver(latestGh.version, appVersion) > 0) {
-        setAvailableUpdateVersion(latestGh.version);
+      } else if (ipcHasUpdate && ipcVersion) {
+        setAvailableUpdateVersion(ipcVersion);
       } else {
         setAvailableUpdateVersion(null);
-        if (tauriCheckErr && ghErr) {
+        if (tauriCheckErr && ipcErr) {
           setErrorMessage(tauriCheckErr);
         } else if (
           tauriCheckErr &&
           !tauriCheckErr.toLowerCase().includes("up to date") &&
-          latestGh !== null
+          !tauriCheckErr.toLowerCase().includes("valid release json")
         ) {
-          const lowerErr = tauriCheckErr.toLowerCase();
-          if (!lowerErr.includes("valid release json")) {
-            setErrorMessage(tauriCheckErr);
-          }
-        } else if (ghErr && !isTauriRuntime()) {
-          setErrorMessage(ghErr);
+          setErrorMessage(tauriCheckErr);
+        } else if (ipcErr && !isTauriRuntime()) {
+          setErrorMessage(ipcErr);
         }
       }
     } finally {
       setChecking(false);
     }
-  }, [appVersion, setAvailableUpdateVersion]);
+  }, [appVersion, checkAppUpdate, setAvailableUpdateVersion]);
 
   useEffect(() => {
     if (isOpen) {
@@ -174,12 +147,16 @@ export function UpdaterModal() {
   const lang = normalizeUiLanguage(config.uiLanguage);
   const t = getDictionary(lang);
 
-  const githubHasNewer = Boolean(
+  const ipcLatestVersion = ipcResult?.latestVersion?.replace(/^v/i, "") ?? null;
+  const ipcHasNewer = Boolean(
     !updateObj &&
-      githubRelease &&
-      compareSemver(githubRelease.version, appVersion) > 0,
+      ipcResult?.updateAvailable &&
+      ipcLatestVersion &&
+      compareSemver(ipcLatestVersion, appVersion) > 0,
   );
-  const isUpToDate = Boolean(!updateObj && !githubHasNewer && checkedOnce && !errorMessage);
+  const isUpToDate = Boolean(
+    !updateObj && !ipcHasNewer && checkedOnce && !errorMessage,
+  );
 
   const handleDownloadAndInstall = async () => {
     if (!updateObj) {
@@ -219,16 +196,21 @@ export function UpdaterModal() {
     totalBytes > 0
       ? Math.min(100, Math.round((downloadedBytes / totalBytes) * 100))
       : 0;
-  const safeGithubReleaseUrl = toSafeExternalHttpsUrl(githubRelease?.htmlUrl);
+  const displayLatestVersion =
+    updateObj?.version.replace(/^v/i, "") ?? ipcLatestVersion;
+  const releaseNotes = updateObj?.body || ipcResult?.releaseNotes || "";
+  const safeTagReleaseUrl = displayLatestVersion
+    ? toSafeExternalHttpsUrl(
+        `${GITHUB_RELEASES_URL}/tag/v${encodeURIComponent(displayLatestVersion)}`,
+      )
+    : null;
   const safeLatestReleaseUrl =
-    safeGithubReleaseUrl ?? toSafeExternalHttpsUrl(GITHUB_RELEASES_URL);
+    safeTagReleaseUrl ?? toSafeExternalHttpsUrl(GITHUB_RELEASES_URL);
   const latestReleaseLabel = checking
     ? "..."
-    : githubRelease
-      ? `v${githubRelease.version}`
-      : lang === "en"
-        ? "No release yet"
-        : "Još nema release-a";
+    : displayLatestVersion
+      ? `v${displayLatestVersion}`
+      : t.updater.noReleaseYet;
 
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/75 p-4 backdrop-blur-sm">
@@ -266,9 +248,7 @@ export function UpdaterModal() {
           </div>
 
           <div className="flex items-center justify-between rounded-xl border border-slate-800 bg-slate-900/40 px-3.5 py-2.5">
-            <span className="text-slate-400">
-              {lang === "en" ? "Latest on GitHub" : "Najnovije na GitHub-u"}
-            </span>
+            <span className="text-slate-400">{t.updater.latestRelease}</span>
             {safeLatestReleaseUrl ? (
               <a
                 href={safeLatestReleaseUrl}
@@ -299,25 +279,24 @@ export function UpdaterModal() {
             </div>
           )}
 
-          {(updateObj || githubHasNewer) && (
+          {(updateObj || ipcHasNewer) && (
             <div className="space-y-3 rounded-xl border border-cyan-500/30 bg-cyan-950/20 p-3.5">
               <div className="flex items-center justify-between">
                 <span className="inline-flex items-center gap-1.5 font-bold text-cyan-300">
                   <Sparkles className="h-4 w-4" />
                   <span>
-                    {t.updater.updateAvailable}: v
-                    {updateObj?.version ?? githubRelease?.version}
+                    {t.updater.updateAvailable}: v{displayLatestVersion}
                   </span>
                 </span>
               </div>
 
-              {(updateObj?.body || githubRelease?.body) && (
+              {releaseNotes && (
                 <div className="space-y-1">
                   <div className="text-[11px] font-semibold text-slate-400">
                     {t.updater.releaseNotes}:
                   </div>
                   <div className="max-h-32 overflow-y-auto whitespace-pre-wrap rounded-lg border border-slate-800 bg-slate-950 p-2.5 text-[11px] text-slate-300">
-                    {updateObj?.body || githubRelease?.body}
+                    {releaseNotes}
                   </div>
                 </div>
               )}
@@ -368,20 +347,15 @@ export function UpdaterModal() {
                   )}
                 </>
               ) : (
-                githubRelease &&
-                safeGithubReleaseUrl && (
+                safeLatestReleaseUrl && (
                   <a
-                    href={safeGithubReleaseUrl}
+                    href={safeLatestReleaseUrl}
                     target="_blank"
                     rel="noopener noreferrer"
                     className="flex w-full items-center justify-center gap-2 rounded-xl bg-gradient-to-r from-emerald-500 to-cyan-500 py-2.5 text-xs font-bold text-slate-950 shadow"
                   >
                     <ExternalLink className="h-4 w-4" />
-                    <span>
-                      {lang === "en"
-                        ? "Open Release on GitHub"
-                        : "Otvori Release na GitHub-u"}
-                    </span>
+                    <span>{t.updater.openOnGitHub}</span>
                   </a>
                 )
               )}

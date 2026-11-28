@@ -11,7 +11,7 @@ Everything you need to install EasySRT Studio, choose the right AI workflow for 
 ### Windows 10 / 11 (x64)
 1. Download **`EasySRT.Studio_<version>_x64-setup.exe`** from [GitHub Releases](https://github.com/Gruya13/EasySRT-Studio/releases/latest) and run the installer.
 2. During setup, EasySRT Studio automatically provisions FFmpeg, hardware-matched Whisper speech binaries (CUDA 12.4 GPU or CPU), Silero VAD, and the default **Whisper Large V3 Turbo (Q5_0)** transcription model.
-3. On first launch, the **Setup Wizard** detects your GPU VRAM and lets you either download a recommended free local translation model or connect a Cloud API key.
+3. On first launch, the **Setup Wizard** detects your GPU VRAM, lets you download a free local translation model or connect a Cloud API key, and presents an explicit **Privacy & Telemetry Opt-In** step (all telemetry toggles unchecked by default, with a live JSON sample inspector).
 
 ### Linux (x64)
 1. Download **`EasySRT.Studio_<version>_amd64.AppImage`**, mark it executable (`chmod +x EasySRT.Studio_*.AppImage`), and launch it.
@@ -44,14 +44,17 @@ Switch modes anytime from the **Settings** panel (`Processing` / `Cloud API`):
   - **Presets:** `Standard` (`2 × 42` chars for TV/Film/YouTube), `Reels / Shorts` (`1 × 20` punchy captions), or `Custom` (`1–4` balanced lines and custom character/CPS limits).
   - **Speaker-Turn Split:** Automatically starts a new subtitle cue whenever the acoustic diarizer detects a change of speaker.
   - **Clean Spoken Fillers & Comma Splitting:** Optionally strips hesitation fillers (*uh, um, ovaj, znači…*), keeps leading conjunctions attached to the clause that follows, and splits long sentences naturally at commas.
-  - **Source ASR Proofreading (`correctSourceAsr`):** Fixes obvious phonetic speech-to-text slips in the source column during translation without altering speaker wording.
-  - **Glossary Hints:** Add domain names, brands, or `Source => Target` translation pairs so both Whisper and the translator respect exact terminology.
+  - **Source ASR Proofreading (`correctSourceAsr`):** Fixes obvious phonetic speech-to-text slips in the source column during translation without altering speaker wording (**enabled automatically when a Cloud API provider such as DeepSeek or Custom OpenAI is active**).
+  - **Glossary Hints & Pre-Translation Domain Mini-Glossary:** Add domain names, brands, or `Source => Target` pairs so both Whisper (prompted with detected topic context) and the translator respect exact terminology, complemented automatically by a pre-translation domain mini-glossary extracted right before batch 1.
 
 ---
 
 ## 4. Cinema Dual-Pane Editor, Timeline & Keyboard Shortcuts
 
 The workspace combines a side-by-side **Source (`Original`)** and **Translation (`Prevod`)** editor with independent font-size controls, `600 ms` automatic checkpoint saving, and a 3-track streaming **Waveform Timeline**:
+
+- **Follow Playhead (`Prati plejhed`) & Gap-Hold Selection:** Enabled by default in the timeline toolbar, **Follow Playhead** keeps the viewport auto-scrolling when zoomed in (`100%–2000%`) and holds the nearest subtitle selected across inter-cue breathing pauses so editor boxes never flicker to *"No cue selected"*.
+- **Exclusive `Space` Transport:** Pressing `Space` / `Shift+Space` outside text inputs always controls timeline playback (even if a toolbar button was focused), while yielding cleanly whenever a modal dialog is open.
 
 | Shortcut / Action | Effect |
 | :--- | :--- |
@@ -72,7 +75,19 @@ The workspace combines a side-by-side **Source (`Original`)** and **Translation 
 
 ## 5. Serbian Studio Features & Exporting
 
+- **Decoupled Style & Address Register (`Auto` / `Polite Vi` / `Informal ti`):** Choose `Natural` vs. `Formal` linguistic tone independently from polite `Vi` vs. informal `ti` addressing (default `Auto` selects `Vi` for press/TV interviews and `ti` for casual peer podcasts), plus anti-calque rules and Serbian conjunction-comma cleanup (`I,`, `Tako da,`).
 - **Instant `Natural` ↔ `Formal` Style Switch (`0 ms`):** Compare or switch between living spoken Serbian (`Natural`) and broadcast/official phrasing (`Formal`). Cached dual-style variants swap instantaneously while keeping independent manual edits per style.
 - **Ekavian Standard & Deterministic `Latin ↔ Cyrillic`:** Built-in linguistic normalization enforces clean Ekavian forms and converts between Latin and Cyrillic with proper digraph casing (`Ljubav` ↔ `Љубав`, `LJUBAV` ↔ `ЉУБАВ`), prefix-boundary exceptions (`injekcija` → `инјекција`, `konjugacija` → `конјугација`, `Tanjug` → `Танјуг`), and untouched HTML/ASS tags and URLs.
 - **1-Click Auto-Fit CPS:** Tightens only cues flagged for excessive reading speed (`high_cps` / `line_too_long`) while leaving compliant subtitles untouched.
-- **Multi-Format Export:** Export **`.SRT`**, **`.VTT`**, or plain **`.TXT`** transcripts, with optional **UTF-8 BOM** (for legacy Windows NLE editors) and optional dual export (translated `.srt` + source `.srt` in one pass).
+- **Multi-Format Export:** Export **`.SRT`**, **`.VTT`**, or plain **`.TXT`** transcripts, with optional **UTF-8 BOM** (for legacy Windows NLE editors) and optional dual export (translated `.srt` + source `.srt` in one pass). If you opted into anonymized edit-pair sharing, the Export modal shows how many modified cues will be shared (`[NAME]`/`[NUM]`-masked) along with a 1-click **"Skip for this export"** pill.
+
+---
+
+## 6. Privacy, Opt-In Telemetry & Automatic Updates
+
+EasySRT Studio keeps audio, video, full transcripts, and API keys strictly on your device (see [`PRIVACY.md`](../../../PRIVACY.md) for complete schemas and retention limits):
+
+- **Setup Wizard & `v0.4.0` Upgrade Consent:** All three optional telemetry toggles (**Crash Reports**, **Anonymous Usage & Quality Metrics**, and **Anonymized Translation Edit Pairs**) start **off by default**. Users upgrading from `v0.4.0` must explicitly confirm their preferences in **Settings → General** before any crash reports are sent.
+- **Settings (`General`) & Live JSON Payload Inspector:** Adjust the three telemetry toggles or the **24-hour automatic update check** toggle anytime in **Settings → General**. Click **"View Exact JSON Sample"** to inspect the exact sanitized JSON format sent for each tier (and verify whether `DO_NOT_TRACK=1` or `EASYSRT_TELEMETRY_URL=off` is active).
+- **Per-Export Skip Pill:** Even if you opt into Level 3 anonymized edit-pair donation, you can click **"Skip for this export"** inside the **Export Modal** whenever working on NDA or confidential client files.
+- **24h Signed Auto-Updater:** Checks once every 24 hours from the Rust backend (`easysrt-telemetry.ig-systems.rs/v1/update/latest.json` with automatic GitHub Releases fallback) using `minisign` signature verification and zero IP storage.

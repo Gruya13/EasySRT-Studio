@@ -429,7 +429,13 @@ export function FilesPanel() {
             id="btn-add-file"
             className="files-add-btn"
             type="button"
-            onClick={() => void handleAddFilesClick()}
+            onClick={(e) => {
+              const btn = e.currentTarget;
+              btn.blur();
+              void handleAddFilesClick().finally(() => {
+                btn.blur();
+              });
+            }}
           >
             {lang === "en" ? "+ Add File" : "+ Dodaj fajl"}
           </button>

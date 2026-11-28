@@ -51,7 +51,12 @@ function makeBaseConfig(overrides?: Partial<AppConfig>): AppConfig {
       utf8Bom: true,
     },
     hasCompletedSetup: true,
+    privacyConsentVersion: 1,
     autoSendCrashReports: true,
+    shareAnonymousUsageMetrics: false,
+    shareAnonymizedTranslationEdits: false,
+    autoCheckUpdates: true,
+    lastUpdateCheckEpochSec: 0,
     editorSourceFontSize: 19,
     editorTranslatedFontSize: 22,
     autoProbeOnImport: true,
@@ -168,6 +173,16 @@ function makeNoopDeps(overrides?: Partial<AppStoreDeps>): Partial<AppStoreDeps> 
     saveProjectCheckpoint: async () => {},
     tryLoadCompanionSubtitles: async () => null,
     flushPendingCrashReports: async () => 0,
+    checkAppUpdate: async () => ({
+      checked: false,
+      skippedReason: "cooldown_24h",
+      updateAvailable: false,
+      currentVersion: "0.4.0",
+      latestVersion: null,
+      releaseNotes: null,
+      releaseDate: null,
+      lastUpdateCheckEpochSec: 0,
+    }),
     probeMediaFile: async (jobId, audioPath) => ({
       jobId,
       audioPath,
@@ -1095,5 +1110,46 @@ describe("appStore v0.4.0 behaviors", () => {
       "Failed project resume must preserve completedTranslationBatches",
     );
     assert.equal(store.getState().isRunningBatch, false);
+  });
+
+  it("defaults followPlayhead to true and auto-enables correctSourceAsr when switching to Cloud providers", async () => {
+    const store = createAppStore(
+      makeNoopDeps({
+        getConfig: async () =>
+          makeBaseConfig({
+            translation: {
+              provider: "deepSeek",
+              deepseekModel: "deepseek-chat",
+              customBaseUrl: "https://api.openai.com/v1",
+              customModel: "gpt-4o-mini",
+              batchSize: 20,
+              contextWindow: 4096,
+            },
+          }),
+      }),
+    );
+
+    await store.getState().initApp();
+    assert.equal(store.getState().config.followPlayhead, true);
+    assert.equal(store.getState().jobOptions.addressForm, "auto");
+    assert.equal(
+      store.getState().jobOptions.correctSourceAsr,
+      true,
+      "Cloud provider active on startup should auto-enable correctSourceAsr",
+    );
+
+    await store.getState().setEffectiveProvider("localLlama");
+    assert.equal(
+      store.getState().jobOptions.correctSourceAsr,
+      false,
+      "Switching back to localLlama should default correctSourceAsr off",
+    );
+
+    await store.getState().setEffectiveProvider("customOpenAi");
+    assert.equal(
+      store.getState().jobOptions.correctSourceAsr,
+      true,
+      "Switching to customOpenAi should auto-enable correctSourceAsr",
+    );
   });
 });
