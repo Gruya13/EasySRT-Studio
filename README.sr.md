@@ -8,11 +8,11 @@
 
 *Pretvorite bilo koji audio ili video snimak u čiste, televizijski spremne titlove u dvostrukom Cinema editoru — uz instalaciju u jednom koraku, 100% oflajn privatnost ili hibridnu brzinu do **28x brže od realnog vremena**.*
 
-[![Izdanje v0.4.0](https://img.shields.io/badge/izdanje-v0.4.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+[![Izdanje v0.5.0](https://img.shields.io/badge/izdanje-v0.5.0-38bdf8?style=for-the-badge&logo=github)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 [![Licenca: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-10b981?style=for-the-badge)](LICENSE)
 [![Platforme](https://img.shields.io/badge/platform-Windows%2010%2F11%20%7C%20Linux-6366f1?style=for-the-badge)](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
-### [Preuzmi EasySRT Studio v0.4.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
+### [Preuzmi EasySRT Studio v0.5.0](https://github.com/Gruya13/EasySRT-Studio/releases/latest)
 
 [Korisnički vodič](docs/user/sr/guide.md) · [Rešavanje problema i FAQ](docs/user/sr/troubleshooting.md) · [Politika privatnosti](PRIVACY.md) · [Istorija izdanja](CHANGELOG.md)
 

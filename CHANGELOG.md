@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-11-28
+
+### Added
+- **Serbian Linguistic Engine & Phonetic ASR Recovery:** Separated `AddressForm` (`Auto`, `Polite 'Vi'`, `Informal 'ti'`) from tone style, added pre-translation domain mini-glossaries (`contextBrief`), domain-neutral Serbian anti-calque rules, Serbian *Pravopis* conjunction-comma hygiene, Whisper topic-context `--prompt` seeding, and automatic source ASR correction when switching to Cloud AI providers (`cb1d1cf`).
+- **Timeline `Follow Playhead` & Gap-Hold Selection:** Added a persisted `Follow Playhead` toggle (`#tl-btn-follow`) with smooth viewport auto-scrolling and gap-hold subtitle display so editor panels stay active across inter-cue breathing pauses (`cb1d1cf`).
+- **Privacy-First GDPR / ZZPL Telemetry & 24h Auto-Updater:** Added explicit opt-in consent toggles (all defaults off, with a live JSON payload inspector in Setup Wizard and Settings, `v0.4.0` upgrade migration prompt, and `DO_NOT_TRACK=1` / `EASYSRT_TELEMETRY_URL=off` kill-switches), once-per-24h Rust-driven update checks via our cached Cloudflare proxy, zero-click export-time structural diff analysis with optional per-export opt-out pill, and `k >= 5` / subnet-guarded D1 learning analytics (`f7af1fa`, `b52fcf9`, `7578b80`, `5bed69c`, `7f573ce`).
+
+### Fixed
+- **Windows Frameless Window & Drag Ergonomics:** Removed the duplicate native Windows OS titlebar (`decorations: false` with startup maximize) and refined `data-tauri-drag-region`, double-click maximize, and resize state syncing (`6f2e42c`).
+- **Exclusive `Space` Transport & WebKitGTK Chrome Selection:** Fixed `Space` / `Shift+Space` reopening focused toolbar buttons or file dialogs by adding capture-phase transport guards, and prevented accidental blue text selection on studio headers during timeline scrubbing (`6f2e42c`).
+- **Phantom Background Audio Fix & Whisper UTF-8 BPE Decoding:** Replaced eager hidden `<audio>` attachment with lazy fallback loading, `AudioContext.suspend()` on pause, and `MediaSession` neutralization so external OS events never resume paused audio, while fixing split UTF-8 BPE decoding and bounding Whisper JSON size (`cb1d1cf`, `fcbb2f8`).
+
+### Security
+- **CSP-Preserving Updater, Opt-In Gates & PII Sanitization:** Routed update checks through Rust without widening browser CSP `connect-src`, enforced opt-in consent on crash/panic paths, bounded/sanitized glossary & Whisper prompt inputs, added sidecar `<job_id>.baseline.json` storage, and enforced sentence-initial `[NAME]` / `[NUM]` redaction, Zero-IP rate limiting, and `k >= 5` / subnet Sybil protection in the telemetry backend (`b52fcf9`, `7578b80`, `5bed69c`, `cb1d1cf`).
+
+### Documentation
+- **Privacy Policy & Updated EN/SR Guides:** Added [`PRIVACY.md`](PRIVACY.md) and updated English/Serbian READMEs, user guides, troubleshooting guides, and `ARCHITECTURE.md` with full Wave 1 & Wave 2 coverage (`7e9d74c`, `569d950`, `54e0b9f`).
+
 ## [0.4.0] - 2026-11-25
 
 ### Added
@@ -56,7 +74,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Automatic one-step setup for core AI runtime (FFmpeg, Whisper, llama.cpp) and Windows VC++ runtime DLLs (`49408f9`).
 - Dynamic runtime version display and GitHub signed in-app updater (`c3fa2f8`).
 
-[Unreleased]: https://github.com/Gruya13/EasySRT-Studio/compare/v0.4.0...HEAD
+[Unreleased]: https://github.com/Gruya13/EasySRT-Studio/compare/v0.5.0...HEAD
+[0.5.0]: https://github.com/Gruya13/EasySRT-Studio/compare/v0.4.0...v0.5.0
 [0.4.0]: https://github.com/Gruya13/EasySRT-Studio/compare/v0.3.2...v0.4.0
 [0.3.2]: https://github.com/Gruya13/EasySRT-Studio/releases/tag/v0.3.2
 [0.3.1]: https://github.com/Gruya13/EasySRT-Studio/commit/c1066f6
